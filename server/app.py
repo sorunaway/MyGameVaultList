@@ -306,6 +306,55 @@ class Handler(BaseHTTPRequestHandler):
                 return v
         return default
 
+    def _read_body(self, limit=64 * 1024):
+        """读请求体。超过上限直接当空 —— 这几个接口的请求体只有几十字节，
+        没有理由为它开一个可以被塞爆的读循环。"""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 0 or n > limit:
+            return b""
+        try:
+            return self.rfile.read(n)
+        except Exception:
+            return b""
+
+    def _desktop_guard(self):
+        """
+        桌面版的**回环守卫**（只在 `GV_DESKTOP=1` 时生效；线上完全不走这段）。
+
+        🔴 防的是 DNS rebinding。桌面版服务**没有任何鉴权** —— 它默认「能连上本机的
+           就是本机用户」。但浏览器不是这么回事：恶意网页可以把自己的域名解析到
+           127.0.0.1，然后 `fetch('http://127.0.0.1:8765/api/local/library')`；
+           随机端口能挡一阵，但本机端口范围有限、扫一遍成本很低。
+           真挡住它的是**校验 `Host`**：桌面版只会被本机回环访问到，
+           Host 不是 127.0.0.1 / localhost / ::1 的，一律拒。
+           （请求发得出去、但 Host 会是那个恶意域名 —— 于是这里就拦住了。）
+
+        POST 再加一道 `Origin` 检查：跨站来源直接拒。
+        """
+        if not config.DESKTOP_MODE:
+            return True
+
+        host = (self.headers.get("Host") or "").strip().lower()
+        name = (host.rsplit(":", 1)[0] if ":" in host else host).strip("[]")
+        if name not in ("127.0.0.1", "localhost", "::1"):
+            log("拒绝非回环 Host：%r" % host)
+            return False
+
+        if self.command not in ("GET", "HEAD"):
+            origin = (self.headers.get("Origin") or "").strip()
+            if origin:
+                try:
+                    oh = urllib.parse.urlparse(origin).hostname or ""
+                except Exception:
+                    oh = ""
+                if oh not in ("127.0.0.1", "localhost", "::1"):
+                    log("拒绝跨站 Origin：%r" % origin)
+                    return False
+        return True
+
     def _guard_steam_key(self):
         if not config.STEAM_API_KEY:
             self._json({"error": "服务端未配置 STEAM_API_KEY"}, 500)
@@ -315,6 +364,9 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- 路由 ----------
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
+        if not self._desktop_guard():
+            return self._json({"error": "non_loopback_host",
+                               "hint": "桌面版只接受来自本机回环地址的请求"}, 403)
 
         if path == "/api/health":
             return self._json({
@@ -356,30 +408,57 @@ class Handler(BaseHTTPRequestHandler):
 
         if config.DESKTOP_MODE:
             # 本机模式（Windows 桌面版）。线上 GV_DESKTOP 未设 → 这里永不进入，
-            # 下面三个路径落到 _static 得到 404。
+            # 下面这些路径落到 _static 得到 404。
             if path == "/api/local/status":
                 return self._api_local_status()
             if path == "/api/local/library":
                 return self._api_local_library()
             if path == "/api/local/cover":
                 return self._api_local_cover()
+            # 用户填的目录先探一下再说（不落盘）；扫盘只在用户点按钮时走
+            if path == "/api/local/probe":
+                return self._api_local_probe()
+            if path == "/api/local/scan":
+                return self._api_local_scan()
 
         return self._static(path)
+
+    def do_POST(self):
+        """
+        桌面版目前**只有**一个 POST：保存用户指定的 Steam 目录。
+
+        ⚠️ 这是本服务端唯一的写接口。守卫 `_desktop_guard()` 对它尤其重要 ——
+           其余接口最坏是被读走数据，这个可以被跨站写进一个目录去。
+        """
+        path = urllib.parse.urlparse(self.path).path
+        if not self._desktop_guard():
+            return self._json({"error": "non_loopback_host",
+                               "hint": "桌面版只接受来自本机回环地址的请求"}, 403)
+        if config.DESKTOP_MODE and path == "/api/local/settings":
+            return self._api_local_settings()
+        return self._json({"error": "not_found"}, 404)
 
     def do_HEAD(self):
         self.do_GET()
 
     # ---------- 本机模式（Windows 桌面版）----------
-    # 🔴 只有 config.DESKTOP_MODE 为真时 do_GET 才会路由到这里。
-    #    这三个接口读的是**本机 Steam 的个人数据**（安装路径 / 账号 / 库 / 时长 / 封面），
-    #    绝不能出现在对外服务上 —— 改判定条件前先读 DESIGN.md 的「Steam 本地文件」一节。
+    # 🔴 只有 config.DESKTOP_MODE 为真时 do_GET/do_POST 才会路由到这里。
+    #    这些接口读的是**本机 Steam 的个人数据**（安装路径 / 账号 / 库 / 时长 / 封面），
+    #    并且 `/api/local/settings` 还会**写**一个用户目录。绝不能出现在对外服务上 ——
+    #    改判定条件前先读 DESIGN.md 的「Steam 本地文件」一节。
     def _api_local_status(self):
-        steam_dir = steam_local.find_steam()
-        return self._json({
+        """
+        桌面版状态：是不是桌面版 + 现在用哪个 Steam 目录 + 它是哪来的。
+
+        `desktop: true` 兼作前端的**桌面模式探测标志**（js/local-src.js 靠它判模式），
+        别改名、别删。
+        """
+        st = steam_local.desktop_status()
+        return self._json(dict({
             "desktop": True,
-            "available": bool(steam_dir),
-            "steamDir": steam_dir,
-        })
+            "available": bool(st.get("steamDir")),
+            "steamDir": st.get("steamDir"),
+        }, **st))
 
     def _api_local_library(self):
         return self._json(steam_local.read_library(steam_id=self._q1("steamid") or None))
@@ -389,7 +468,7 @@ class Handler(BaseHTTPRequestHandler):
         if not appid.isdigit():
             return self._json({"error": "appid 必须是数字"}, 400)
         kind = self._q1("k") or None
-        p = steam_local.cover_path(steam_local.find_steam(), int(appid), kind)
+        p = steam_local.cover_path(steam_local.resolve_steam_dir(), int(appid), kind)
         if not p:
             return self._json({"error": "这款没有本地封面"}, 404)
         try:
@@ -399,6 +478,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "封面读取失败"}, 500)
         ctype = "image/png" if p.lower().endswith(".png") else "image/jpeg"
         return self._send(200, blob, ctype, cache="max-age=86400")
+
+    def _api_local_probe(self):
+        """探一个目录像不像 Steam 安装目录。**只读不写** —— 用户还在输入框里打字时就调它。"""
+        return self._json(steam_local.looks_like_steam(self._q1("path"), with_accounts=True))
+
+    def _api_local_scan(self):
+        """
+        扫盘找 Steam。**只在用户点「扫描磁盘」时被调用**（见 steam_local.scan_for_steam）。
+        它是全盘 IO，绝不能进任何自动流程。
+        """
+        return self._json(steam_local.scan_for_steam())
+
+    def _api_local_settings(self):
+        """保存（或清空）用户指定的 Steam 目录。校验通过才落盘。"""
+        try:
+            body = json.loads(self._read_body().decode("utf-8") or "{}")
+        except Exception:
+            return self._json({"error": "bad_json",
+                               "hint": "请求体应当是一个 JSON 对象"}, 400)
+        if not isinstance(body, dict):
+            return self._json({"error": "bad_json",
+                               "hint": "请求体应当是一个 JSON 对象"}, 400)
+        res = steam_local.set_steam_dir(body.get("steamDir", ""))
+        res["status"] = steam_local.desktop_status()
+        return self._json(res, 200 if res.get("ok") else 400)
 
     # ---------- 诊断 ----------
     def _api_diag(self):

@@ -32,6 +32,8 @@
   var STATUS_TIMEOUT = 1500;
   // 拉库要扫 4 个库目录 + 2000 多个封面目录，给宽一点
   var LIBRARY_TIMEOUT = 30000;
+  // 扫盘：后端有三个上限（深度 3 / 4000 目录 / 25 秒），这里比它再宽一截
+  var SCAN_TIMEOUT = 45000;
 
   function getJSON(url, timeoutMs) {
     return new Promise(function (resolve, reject) {
@@ -48,6 +50,39 @@
       }).then(function (d) {
         if (timer) clearTimeout(timer);
         resolve(d);
+      }).catch(function (e) {
+        if (timer) clearTimeout(timer);
+        reject(e);
+      });
+    });
+  }
+
+  /**
+   * POST JSON。**必须带 `Content-Type: application/json`** ——
+   * 它会让浏览器先发一个 OPTIONS 预检，服务端不回 CORS 头 → 跨站页面调不通。
+   * 这是回环守卫之外的第二道（`_desktop_guard` 才是主防线）。
+   */
+  function postJSON(url, body, timeoutMs) {
+    return new Promise(function (resolve, reject) {
+      var ctl = null, timer = null;
+      try {
+        ctl = new AbortController();
+        timer = setTimeout(function () { ctl.abort(); }, timeoutMs || STATUS_TIMEOUT);
+      } catch (e) { /* 同上 */ }
+      var opt = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {}),
+        cache: 'no-store'
+      };
+      if (ctl) opt.signal = ctl.signal;
+      fetch(url, opt).then(function (r) {
+        // 400 也是**有内容的正经回答**（比如"这个目录不存在"），别当成网络故障吞掉
+        return r.json().then(function (d) { return { ok: r.ok, status: r.status, body: d }; },
+                             function () { return { ok: r.ok, status: r.status, body: {} }; });
+      }).then(function (r) {
+        if (timer) clearTimeout(timer);
+        resolve(r);
       }).catch(function (e) {
         if (timer) clearTimeout(timer);
         reject(e);
@@ -130,6 +165,29 @@
     probe: probe,
     load: load,
     toRecords: toRecords,
-    sync: sync
+    sync: sync,
+
+    // ---- Steam 目录（哪台机器上 Steam 装在哪都可能不一样）----
+    status: function () { return getJSON('/api/local/status', STATUS_TIMEOUT); },
+    probePath: function (p) {
+      return getJSON('/api/local/probe?path=' + encodeURIComponent(p || ''), 8000);
+    },
+    scan: function () { return getJSON('/api/local/scan', SCAN_TIMEOUT); },
+    /**
+     * 存目录。**返回形状统一成 `{ok, reason, data}`** ——
+     * 调用方不该去分辨"这是 HTTP 400 还是网络断了"，两种都是"没设成"，
+     * 区别只在给用户看的原因。
+     */
+    setSteamDir: function (p) {
+      return postJSON('/api/local/settings', { steamDir: p || '' }, 10000)
+        .then(function (r) {
+          var b = r.body || {};
+          return { ok: !!b.ok, reason: b.reason || '', data: b };
+        })
+        .catch(function (e) {
+          return { ok: false, reason: '本机服务没有响应（' + ((e && e.message) || e) + '）',
+                   data: null };
+        });
+    }
   };
 })();

@@ -254,6 +254,28 @@
 
       <div class="set-colls" id="setColls" hidden></div>
       <div class="set-hint">改完点保存，已同步的数据会当场重算一遍归类。</div>
+
+      <!-- ===== 桌面版专属：Steam 装在哪 =====
+           只在前端探测到「我在桌面版里」时才显示（#setSteamSec.hidden 由 ui.js 控制）——
+           线上版和双击 index.html 的本地版都没有「本机 Steam 目录」这回事。 -->
+      <div class="set-sec" id="setSteamSec" hidden>
+        <h4 class="set-sec-title">Steam 安装目录</h4>
+        <p class="set-hint">
+          应用会自己去注册表里找 Steam，多数情况不用管。
+          找不到、或者这台机器上有<b>多份</b> Steam 时，在这里指定。
+        </p>
+        <label class="field">
+          <span>Steam 安装目录 <em>（有 <code>steam.exe</code> 的那一层）</em></span>
+          <input id="setSteamDir" type="text" placeholder="例如 D:\Steam"
+                 autocomplete="off" spellcheck="false">
+        </label>
+        <div class="set-status" id="setSteamState"></div>
+        <div class="set-actions">
+          <button class="btn btn-ghost" id="setSteamDetect" type="button">改回自动检测</button>
+          <button class="btn btn-ghost" id="setSteamScan" type="button">扫描磁盘</button>
+        </div>
+        <div class="set-colls" id="setSteamFound" hidden></div>
+      </div>
     </div>
     <div class="modal-foot">
       <button class="btn btn-ghost" id="setReset">恢复默认</button>

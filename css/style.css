@@ -969,7 +969,13 @@ input, textarea, select { font-family: inherit; }
   border-radius: 14px;
   width: min(460px, 100%);
   max-height: 90vh;
-  overflow-y: auto;
+  /* 🔴 由 .modal-body **内部**滚动，而不是整个弹窗滚动。
+     整个弹窗滚动时，内容一长（设置面板加上扫描结果就会）就把「保存」/「确定」
+     这些主操作顶出视口 —— 用户得先滚下去才找得到按钮，容易以为没按钮可用。
+     现在头尾固定、只有中间滚。 */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   box-shadow: var(--shadow);
   animation: pop .2s cubic-bezier(.2,.8,.3,1);
 }
@@ -979,14 +985,24 @@ input, textarea, select { font-family: inherit; }
   display: flex; align-items: center; justify-content: space-between;
   padding: 15px 17px;
   border-bottom: 1px solid var(--border-soft);
+  flex: none;
 }
 .modal-head h3 { font-size: 15px; font-weight: 640; }
 
-.modal-body { padding: 17px; display: flex; flex-direction: column; gap: 13px; }
+/* min-height:0 是必须的：flex 子项默认不肯缩到内容以下，不给它的话 body 不滚，整窗反而溢出 */
+.modal-body {
+  padding: 17px;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  overflow-y: auto;
+  min-height: 0;
+}
 .modal-foot {
   display: flex; justify-content: flex-end; gap: 9px;
   padding: 13px 17px;
   border-top: 1px solid var(--border-soft);
+  flex: none;
 }
 
 .field { display: flex; flex-direction: column; gap: 6px; }
@@ -1017,6 +1033,14 @@ input, textarea, select { font-family: inherit; }
   margin: 0;
 }
 .set-hint b { color: var(--text); font-weight: 600; }
+.set-hint code {
+  background: var(--bg);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 11.5px;
+  color: var(--accent);
+  border: 1px solid var(--border-soft);
+}
 
 /* 「你数据里实际有的收藏夹」—— 点一下填进输入框，省得手敲 */
 .set-colls {
@@ -1039,6 +1063,47 @@ input, textarea, select { font-family: inherit; }
   transition: border-color .15s, color .15s;
 }
 .set-chip:hover { border-color: var(--accent); color: var(--text); }
+
+/* ===== 设置弹窗：Steam 安装目录（仅桌面版显示）=====
+   其它玩家的 Steam 装在哪都可能不一样，所以这一节要能动手改。 */
+.set-sec {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 15px;
+  margin-top: 2px;
+}
+.set-sec-title {
+  font-size: 13px;
+  font-weight: 640;
+  color: var(--text);
+  margin: 0;
+}
+/* 当前用哪个目录 / 哪来的 —— 这行字决定用户要不要动手改，得看得清 */
+.set-status {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+  word-break: break-all;   /* 路径很长，必须允许断行，否则把面板整个撑宽 */
+}
+.set-status.is-warn { color: var(--accent); }
+.set-status.is-err  { color: #f85149; }
+
+.set-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* 候选目录的圆片：比收藏夹圆片多一行来源说明，且要放得下长路径 */
+.set-chip-dir {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  border-radius: 8px;
+  text-align: left;
+  max-width: 100%;
+}
+.set-chip-dir b { font-weight: 600; word-break: break-all; }
+.set-chip-dir em { font-style: normal; font-size: 11px; color: var(--text-faint); }
 
 .hint { font-size: 12px; color: var(--text-faint); line-height: 1.6; }
 .hint code {

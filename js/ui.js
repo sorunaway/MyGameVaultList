@@ -24,8 +24,15 @@
     selectMode: false,      // 批量选择模式（暂停区里清理"不想再玩了"用）
     selected: {},           // 已选中的游戏 id（当 Set 用：{ id: true }）
     noteTargetId: null,
-    syncPayload: null
+    syncPayload: null,
+    desktop: false          // 是否跑在桌面版里（boot 里探测出来后置真）
   };
+
+  /**
+   * 桌面版最近一次 `/api/local/status` 的结果。
+   * 打开设置面板时读它填输入框；用户在面板里改了目录、保存成功后再刷新它。
+   */
+  let desktopStatus = null;
 
   /** 退出批量选择模式，并清空选中 */
   function exitSelectMode() {
@@ -96,6 +103,14 @@
     setHidden:   $('#setHidden'),
     setCollList: $('#setCollList'),
     setColls:    $('#setColls'),
+
+    // 设置里的「Steam 安装目录」一节（仅桌面版可见）
+    setSteamSec:   $('#setSteamSec'),
+    setSteamDir:   $('#setSteamDir'),
+    setSteamState: $('#setSteamState'),
+    setSteamFound: $('#setSteamFound'),
+    setSteamScan:  $('#setSteamScan'),
+    setSteamDetect:$('#setSteamDetect'),
 
     btnAdd:      $('#btnAdd'),
     btnSync:     $('#btnSync'),
@@ -1172,16 +1187,154 @@
    * 打开设置。候选（输入框的下拉 + 下面那排小圆片）来自
    * **数据里实际出现过的收藏夹名** —— 用户多半不记得自己在 Steam 里
    * 把它们叫什么，纯靠手敲很容易差一个字，然后归类静默不生效。
+   *
+   * 桌面版还多一节「Steam 安装目录」（别的玩家的 Steam 不一定装在哪）。
    */
-  function openSettings() {
+  async function openSettings() {
     const p = DS.getPrefs();
     el.setCompleted.value = p.completedCollections.join('，');
     el.setHidden.value    = p.hiddenCollections.join('，');
     renderCollectionCandidates();
+
+    // ⚠️ 顺序：先让面板亮出来，再去问服务端。
+    //    反过来（await 完再显示）在网络慢时会表现为"点了设置没反应"。
+    el.setSteamSec.hidden = !state.desktop;
+    if (state.desktop) {
+      el.setSteamDir.value = '';
+      el.setSteamFound.hidden = true;
+      el.setSteamFound.innerHTML = '';
+      el.setSteamState.className = 'set-status';
+      el.setSteamState.textContent = '正在读取…';
+    }
     el.setMask.hidden = false;
+
+    if (state.desktop) await refreshSteamStatus();
   }
 
   function closeSettings() { el.setMask.hidden = true; }
+
+  // ===== 桌面版：Steam 安装目录 =====
+
+  async function refreshSteamStatus() {
+    if (!window.GVLocal) return;
+    let st = null;
+    try { st = await window.GVLocal.status(); } catch (e) { st = null; }
+    desktopStatus = (st && st.desktop) ? st : null;
+    renderSteamState();
+  }
+
+  /** 把「现在用的是哪个目录、哪来的」如实写出来 —— 这条信息决定用户要不要动手改 */
+  function renderSteamState() {
+    const st = desktopStatus;
+    if (!st) {
+      el.setSteamState.className = 'set-status is-err';
+      el.setSteamState.textContent = '读不到本机状态（本机服务没有响应）';
+      return;
+    }
+    // 输入框只填**用户显式设过的**那个；没设过就留空（空 = 走自动检测）
+    el.setSteamDir.value = st.savedDir || '';
+
+    const used = st.steamDir || '';
+    let cls, line;
+    if (!used) {
+      cls = 'is-err';
+      line = st.reason || '没有找到 Steam 安装目录';
+    } else if (st.source === 'settings') {
+      cls = 'is-ok';
+      line = '正在使用你指定的目录：' + used;
+    } else if (st.savedInvalid) {
+      cls = 'is-warn';
+      line = '你之前指定的目录已不可用（' + (st.savedReason || '原因不明') +
+             '），暂时改用自动检测到的：' + used;
+    } else {
+      cls = 'is-ok';
+      line = '自动检测到的目录：' + used;
+    }
+    el.setSteamState.className = 'set-status ' + cls;
+    el.setSteamState.textContent = line;
+
+    renderSteamFound(st.auto || [], '另外还检测到（点一下填进上面的框）：', '');
+  }
+
+  /**
+   * 候选列表（圆片）。`label` / `meta` 可以为空。
+   * 点圆片只**填进输入框**，不直接保存 —— 和「恢复默认」同一个规矩：
+   * 面板里改的选择，一律要点「保存」才生效，不做半截应用。
+   */
+  function renderSteamFound(items, label, meta) {
+    items = items || [];
+    if (!items.length && !meta) {
+      el.setSteamFound.hidden = true;
+      el.setSteamFound.innerHTML = '';
+      return;
+    }
+    let html = '';
+    if (label) html += '<span class="set-colls-label">' + esc(label) + '</span>';
+    html += items.map((it) =>
+      '<button type="button" class="set-chip set-chip-dir" data-dir="' + esc(it.path) + '">' +
+        '<b>' + esc(it.path) + '</b>' +
+        (it.source ? '<em>' + esc(it.source) + '</em>' : '') +
+      '</button>').join('');
+    if (meta) html += '<span class="set-colls-label">' + esc(meta) + '</span>';
+    el.setSteamFound.hidden = false;
+    el.setSteamFound.innerHTML = html;
+  }
+
+  function onSteamFoundClick(e) {
+    const btn = e.target && e.target.closest ? e.target.closest('.set-chip') : null;
+    if (!btn) return;
+    el.setSteamDir.value = btn.getAttribute('data-dir') || '';
+    el.setSteamState.className = 'set-status is-warn';
+    el.setSteamState.textContent = '已填入 —— 点「保存」后生效';
+  }
+
+  /** 「改回自动检测」：清空输入框（同样是保存后才生效） */
+  function onSteamClear() {
+    el.setSteamDir.value = '';
+    el.setSteamState.className = 'set-status is-warn';
+    el.setSteamState.textContent = '已清空 —— 点「保存」后改回自动检测';
+  }
+
+  /**
+   * 扫盘找 Steam。
+   *
+   * ⚠️ 它会**阻塞用户等待**（后端有三个上限：深度 3 / 4000 个目录 / 25 秒），
+   *    所以必须有「正在扫描 + 按钮禁用」的反馈，并且**禁用期间忽略重复点击** ——
+   *    一次扫全盘已经够重了，连点就是几份全盘 IO 叠在一起。
+   */
+  async function onSteamScan() {
+    if (!window.GVLocal || el.setSteamScan.disabled) return;
+    const btn = el.setSteamScan;
+    const oldLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '正在扫描…';
+    el.setSteamFound.hidden = false;
+    el.setSteamFound.innerHTML = '<span class="set-colls-label">正在扫描各个磁盘，请稍候…</span>';
+
+    let r = null;
+    try { r = await window.GVLocal.scan(); } catch (e) { r = null; }
+
+    btn.disabled = false;
+    btn.textContent = oldLabel;
+
+    if (!r) {
+      el.setSteamFound.hidden = false;
+      el.setSteamFound.innerHTML =
+        '<span class="set-colls-label">扫描失败（本机服务没有响应）</span>';
+      return;
+    }
+
+    const items = [];
+    (r.installs || []).forEach((c) => items.push({ path: c.path, source: 'Steam 安装目录' }));
+    (r.libraries || []).forEach((c) => items.push({ path: c.path, source: '游戏库（这里没有 steam.exe，不是安装目录）' }));
+
+    const meta = '扫了 ' + (r.scanned || 0) + ' 个目录，用时 ' +
+                 ((r.elapsedMs || 0) / 1000).toFixed(1) + ' 秒' +
+                 (r.truncated ? '（到上限提前停了，可能没扫全）' : '');
+    renderSteamFound(items,
+      items.length ? '扫描结果（点一下填进上面的框）：' : '这台机器上没扫到 Steam。',
+      meta);
+  }
 
   function renderCollectionCandidates() {
     const names = DS.collectionsInData(state.games);
@@ -1227,8 +1380,36 @@
    * 状态是存在每条记录上的，光改偏好不会回头修正已同步的数据，所以这里必须
    * 重跑一遍 —— 否则用户改完设置盯着屏幕发现什么都没变，只会当成功能没生效。
    * 报告"进出各多少款"而不是只报成功，是因为「移出」同样会动用户的归档结果。
+   *
+   * 桌面版在这里还要处理「Steam 安装目录」：**先落盘（校验不过就原地报错、不关面板）**，
+   * 再重新读一次本机库 —— 换了目录却不重读，用户改完只会看到一模一样的数据。
    */
   async function saveSettings() {
+    // ---- ① Steam 安装目录（仅桌面版；校验通过才落盘）----
+    // 比较前先归一化：`D:/Steam`、`D:\Steam\`、`d:\steam` 是同一个目录，
+    // 不该因为写法不同就白跑一次保存 + 重新读库。
+    const norm = (s) => String(s || '').trim().replace(/\//g, '\\')
+                            .replace(/\\+$/, '').toLowerCase();
+    let dirChanged = false;
+
+    if (state.desktop && window.GVLocal) {
+      const want = (el.setSteamDir.value || '').trim();
+      const cur  = (desktopStatus && desktopStatus.savedDir) || '';
+      if (norm(want) !== norm(cur)) {
+        const r = await window.GVLocal.setSteamDir(want);
+        if (!r.ok) {
+          // 🔴 **不关面板**。关掉的话用户根本看不到错在哪，只会觉得"保存没反应"。
+          el.setSteamState.className = 'set-status is-err';
+          el.setSteamState.textContent = '没保存：' + (r.reason || '未知原因');
+          note('Steam 目录没保存：' + (r.reason || '未知原因'), 'err');
+          return;
+        }
+        dirChanged = true;
+        desktopStatus = (r.data && r.data.status) || null;
+      }
+    }
+
+    // ---- ② 收藏夹偏好 ----
     DS.setPrefs({
       completedCollections: el.setCompleted.value,
       hiddenCollections:    el.setHidden.value
@@ -1237,6 +1418,18 @@
 
     const before = state.games.filter(g => g.status === S.COMPLETED).length;
     try {
+      let dirMsg = '';
+      if (dirChanged) {
+        let r2 = null;
+        try { r2 = await window.GVLocal.sync(); } catch (e) { r2 = null; }
+        if (r2 && r2.ok) {
+          dirMsg = '，已按新目录读到 ' + (r2.total || 0) + ' 款';
+        } else {
+          dirMsg = '，但按新目录读库失败（' +
+                   ((r2 && r2.reason) || '本机服务没有响应') + '）';
+        }
+      }
+
       await DS.reclassifyOwned();
       await reload();
       const after = state.games.filter(g => g.status === S.COMPLETED).length;
@@ -1247,7 +1440,7 @@
       if (d > 0)      msg += '，' + d + ' 款新归入「已通关」';
       else if (d < 0) msg += '，' + (-d) + ' 款移出「已通关」';
       else            msg += '，归类结果没有变化';
-      note(msg, 'ok');
+      note(msg + dirMsg, dirChanged && !/已按新目录读到/.test(dirMsg) ? 'warn' : 'ok');
     } catch (err) {
       render();
       note('设置已保存，但重算归类失败：' + ((err && err.message) || err), 'err');
@@ -1376,6 +1569,15 @@
       if (e.key === 'Enter') saveSettings();
     });
 
+    // 设置里的「Steam 安装目录」（面板只在桌面版显示，但绑定无条件做 ——
+    // 元素在 index.html 里是静态存在的，条件绑定反而容易漏）
+    el.setSteamFound.addEventListener('click', onSteamFoundClick);
+    el.setSteamScan.addEventListener('click', onSteamScan);
+    el.setSteamDetect.addEventListener('click', onSteamClear);
+    el.setSteamDir.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') saveSettings();
+    });
+
     // 快捷键
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
@@ -1460,6 +1662,10 @@
       try { desktop = await window.GVLocal.probe(); } catch (e) { desktop = null; }
     }
     const desktopMode = !!desktop;
+    // 记进 state：设置面板要不要显示「Steam 安装目录」那一节，就看它
+    state.desktop = desktopMode;
+    // 探测结果本身就是一份 `/api/local/status`，直接留给设置面板用（省一次请求）
+    desktopStatus = desktopMode ? desktop : null;
 
     // 桌面版**也**不走云模式：它要的是「离线 + 本机数据」，
     // 云登录在桌面版里既没必要（数据就在本机），也走不通（OpenID 回调要注册过的 HTTPS 域）。
@@ -1489,6 +1695,13 @@
 
       // ?select=1 —— 直接进批量选择模式（暂停区用；也给自动化测试留个入口）
       if (sp.get('select') === '1') state.selectMode = true;
+
+      // ?settings=1 —— 直接打开设置面板。
+      // 桌面版的设置里有「Steam 安装目录」，这一步只能靠点按钮打开，
+      // 无头验收（--dump-dom 拿不到点击）就没有入口了。和 ?select=1 一个路子。
+      if (sp.get('settings') === '1') state._openSettings = true;
+      // &scan=1 —— 面板打开后顺便点一次「扫描磁盘」（同上，只为让扫盘那条路可被自动验收）
+      if (sp.get('scan') === '1') state._scanOnOpen = true;
     } catch (e) { /* ignore */ }
     state._initialView = initialView;
 
@@ -1513,7 +1726,7 @@
       try { r = await window.GVLocal.sync(); } catch (e) { console.error('本机数据读取失败', e); }
       if (!r || !r.ok) {
         const why = {
-          steam_not_found: '没找到 Steam 安装目录 —— 请确认这台机器装过 Steam',
+          steam_not_found: '没找到 Steam 安装目录 —— 去顶栏「设置」里指定，或点「扫描磁盘」找一下',
           no_account: '读不到已登录的 Steam 账号 —— 请先登录一次 Steam',
           fetch_failed: '读本机数据失败（本机服务没有响应）',
           no_datastore: '本地存储没准备好'
@@ -1563,6 +1776,15 @@
     state._initialView = null;   // 已生效，避免之后每次刷新又跳回 URL 指定的区块
 
     render();
+
+    // ?settings=1：渲染完再把设置面板弹出来（面板里的候选要用到已渲染的数据）
+    if (state._openSettings) {
+      state._openSettings = false;
+      const wantScan = !!state._scanOnOpen;
+      state._scanOnOpen = false;
+      await openSettings();
+      if (wantScan) await onSteamScan();
+    }
   }
 
   document.addEventListener('DOMContentLoaded', boot);

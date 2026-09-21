@@ -301,9 +301,38 @@ def _norm(p):
     return os.path.abspath(str(p).replace("\\", "/")).replace("\\", "/").lower()
 
 
+def _steam_dir_from_app_settings():
+    """
+    读**桌面版应用**里「设置 → Steam 安装目录」存的那个路径。
+
+    为什么要有这条：自动探测再全也有兜不住的（绿色版 / 装在非常规位置 /
+    注册表项被清理过）。用户已经在应用里指定过一次了，脚本这边不该再让他
+    重设一遍 —— 两边读同一个设置文件，就是「设一次、两边都认」。
+
+    ⚠️ 这里**故意重复**了一份 `server/steam_local.py` 的路径规则，而不是 import 它：
+       `sync.py` 要能被**单独拷走使用**（别人可以只拿走这一个文件），
+       引入 server/ 包就把这个前提毁了。改这里时记得同步改那边的
+       `settings_path()` / `SETTINGS_NAME`（同一个文件、同一套目录规则）。
+    """
+    home = os.environ.get("GV_DESKTOP_HOME") or ""
+    if not home:
+        home = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                            "MyGameVault")
+    try:
+        with open(os.path.join(home, "desktop.json"), "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return ""
+    v = d.get("steamDir") if isinstance(d, dict) else None
+    return v.strip() if isinstance(v, str) and v.strip() else ""
+
+
 def find_steam_roots():
     """返回所有可能的 Steam 根目录（去重）"""
-    cands = _steam_paths_from_registry() + _steam_paths_from_disk()
+    saved = _steam_dir_from_app_settings()
+    # ⚠️ 应用里指定的那个**排最前** —— 用户显式说过一次了，就该以他为准，
+    #    否则"设了没反应"（被后面的注册表结果盖住）。
+    cands = ([saved] if saved else []) + _steam_paths_from_registry() + _steam_paths_from_disk()
     seen, out = set(), []
     for p in cands:
         try:
@@ -508,7 +537,8 @@ def main():
     ap.add_argument("--refresh-ach", action="store_true",
                     help="联网重查成就（慢，且容易被 Steam 限流）")
     ap.add_argument("--steam-root", default=None,
-                    help="手动指定 Steam 安装目录（默认自动探测）")
+                    help="手动指定 Steam 安装目录"
+                         "（默认：应用里设过的 → 注册表 → 常见路径）")
     ap.add_argument("--no-collections", action="store_true",
                     help="跳过本地收藏夹读取")
     ap.add_argument("--out", default=os.path.join(DATA_DIR, "steam_sync.json"))
