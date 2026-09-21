@@ -544,8 +544,11 @@
     const showCheck = !!(opts && opts.selected);
     const isSel = !!(opts && opts.selected && opts.selected[g.id]);
 
+    // 封面：画框比例写死 460/215，素材比例不定 → 一律 contain（永不裁），
+    // 比例对不上的由 GVCoverFit 挂 pad 类铺模糊底（见 js/coverfit.js）
     const img = g.header
       ? '<img src="' + esc(g.header) + '" alt="" loading="lazy" ' +
+        'onload="GVCoverFit.apply(this)" ' +
         'onerror="this.parentNode.innerHTML=\'<div class=&quot;noimg&quot;>◈</div>\'">'
       : '<div class="noimg">◈</div>';
 
@@ -918,7 +921,9 @@
 
     return '' +
       '<div class="d-hero">' +
-        (g.header ? '<img src="' + esc(g.header) + '" alt="">' : '') +
+        (g.header
+          ? '<img src="' + esc(g.header) + '" alt="" onload="GVCoverFit.apply(this)">'
+          : '') +
         '<div class="d-hero-title"><h2>' + esc(g.title) + '</h2></div>' +
       '</div>' +
       '<div class="d-body">' +
@@ -1728,6 +1733,12 @@
       if (sp.get('settings') === '1') state._openSettings = true;
       // &scan=1 —— 面板打开后顺便点一次「扫描磁盘」（同上，只为让扫盘那条路可被自动验收）
       if (sp.get('scan') === '1') state._scanOnOpen = true;
+
+      // ?open=<appid> —— 直接打开某款游戏的详情页。
+      // 详情页顶部是**另一处画框**（.d-hero，同样 460/215），
+      // 无头验收拿不到「点击卡片」这个动作，只能给它留个入口；平时也能当书签用。
+      const qo = sp.get('open');
+      if (qo && /^\d+$/.test(qo)) state._openGame = qo;
     } catch (e) { /* ignore */ }
     state._initialView = initialView;
 
@@ -1805,6 +1816,14 @@
 
     // 桌面版：界面已经交给用户了，名字/封面在后台分批补（不阻塞启动，见函数说明）
     if (desktopMode) fillMetaInBackground();
+
+    // ?open=<appid>：渲染完再开详情页（得等 state.games 就位）
+    if (state._openGame) {
+      const want = state._openGame;
+      state._openGame = null;
+      const g = (state.games || []).find(x => String(x.appid) === want);
+      if (g) openDrawer(g.id);
+    }
 
     // ?settings=1：渲染完再把设置面板弹出来（面板里的候选要用到已渲染的数据）
     if (state._openSettings) {

@@ -365,13 +365,33 @@ input, textarea, select { font-family: inherit; }
   box-shadow: var(--shadow);
 }
 
+/* ── 封面画框 ─────────────────────────────────────────────────────────
+   画框比例写死 460/215（= Steam header.jpg 的原始比例），素材比例却是不定的
+   （实测 header 2.14 / hero 3.10 / 竖版 0.67 / logo 4.00）。
+
+   🔴 `object-fit` 是 `contain` 而不是 `cover`：cover 会把比例不符的图裁掉一块 ——
+      竖图（0.67）进 2.14 的横框，可见面积只剩约 31%，角色的头就是这么没的。
+      contain 永不裁内容，空档交给下面的模糊底填（`--cov` 与 `pad` 由
+      js/coverfit.js 按图片**真实**尺寸写入，不是按文件名猜）。
+      比例本来就对得上的（header.jpg）不会挂 pad，等于完全没变化。 */
 .card-media {
   position: relative;
   aspect-ratio: 460 / 215;
   background: var(--bg-elev-2);
   overflow: hidden;
 }
-.card-media img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.card-media img { position: relative; width: 100%; height: 100%; object-fit: contain; display: block; }
+/* 比例对不上时铺的模糊底：同一张图放大铺满，把 contain 留出的空档填掉。
+   没有 pad 类的卡片连这个伪元素都不存在 —— 不白花 decode / 合成开销。 */
+.card-media.pad::before,
+.d-hero.pad::before {
+  content: '';
+  position: absolute; inset: 0;
+  background: var(--cov, none) center / cover no-repeat;
+  filter: blur(18px) saturate(1.06) brightness(.84);
+  transform: scale(1.18);            /* 放大一圈，把模糊的透明边缘推出画框外 */
+}
+
 .card-media .noimg {
   width: 100%; height: 100%;
   display: grid; place-items: center;
@@ -733,7 +753,7 @@ input, textarea, select { font-family: inherit; }
   background: var(--bg-elev-2);
   overflow: hidden;
 }
-.d-hero img { width: 100%; height: 100%; object-fit: cover; }
+.d-hero img { position: relative; width: 100%; height: 100%; object-fit: contain; }
 .d-hero::after {
   content: '';
   position: absolute; inset: 0;

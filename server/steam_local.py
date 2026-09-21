@@ -55,8 +55,18 @@ _SKIP_DIR_NAMES = frozenset((
     "common", "downloading", "shadercache", "temp_content",
 ))
 
-# 封面优先级：竖版封面 > 宽版头图 > 背景图 > 名字标
-COVER_KINDS = ("library_600x900.jpg", "header.jpg", "library_hero.jpg", "logo.png")
+# 封面优先级，**顺序即优先级**。🔴 横版在前，不是竖版。
+#
+#   卡片画框与详情页画框都是 `aspect-ratio: 460 / 215`（≈2.14:1），而
+#   `header.jpg` 正好是 460×215 → 放进画框**零裁切、一点信息都不丢**。
+#
+#   ⚠️ 曾经把竖版 `library_600x900.jpg` 排在第一位（注释还写着"竖版封面"），
+#      那是把 Steam **库网格**的习惯套到了我们的**横条画框**上 ——
+#      竖图（实测本机是 300×450，比例 0.67）塞进 2.14 的横框，
+#      `object-fit: cover` 只留中间约 **31%** 的竖带，角色的头当场被裁掉。
+#      2026-09-21 排查截图到，本机约七成记录吃的是这张竖图。
+#      各变体的真实比例（本机实测）：header 2.14 / hero 3.10 / 竖版 0.67 / logo 4.00。
+COVER_KINDS = ("header.jpg", "library_hero.jpg", "library_600x900.jpg", "logo.png")
 
 
 # ============================================================
