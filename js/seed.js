@@ -56,6 +56,12 @@
 
     if (!list || !list.length) return;
 
+    // 🔴 必须**先**做旧分类名迁移，再算 suggestedStatus。
+    // 此刻库里是空的，mergeSteam 内部那次迁移看不到任何"老数据"；
+    // 而下面算出的 suggestedStatus 会被 mergeSteam 直接当新建状态用，
+    // 顺序反了的话，种子数据里靠「完结撒花」进来的款会静默落成「我的游戏单」。
+    DS.adoptLegacyCollection(list);
+
     // mergeSteam 期望每个条目带 suggestedStatus 字段（它据此决定自动归类）。
     // 注意：不能在 makeGame 之后再传 suggestedStatus: undefined ——
     // mergeSteam 里用的是 `src.suggestedStatus || LIBRARY`，undefined 会全部退化成「我的游戏」。

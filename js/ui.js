@@ -88,8 +88,18 @@
     syncStatus:  $('#syncStatus'),
     syncDiff:    $('#syncDiff'),
 
+    setMask:     $('#setMask'),
+    setClose:    $('#setClose'),
+    setSave:     $('#setSave'),
+    setReset:    $('#setReset'),
+    setCompleted:$('#setCompleted'),
+    setHidden:   $('#setHidden'),
+    setCollList: $('#setCollList'),
+    setColls:    $('#setColls'),
+
     btnAdd:      $('#btnAdd'),
     btnSync:     $('#btnSync'),
+    btnSettings: $('#btnSettings'),
     btnMenu:     $('#btnMenu'),
     btnExport:   $('#btnExport')
   };
@@ -734,7 +744,7 @@
       case S.PLAYING:   return DS.RECENT_DAYS + ' 天内启动过的游戏会自动出现在这里，也可以手动把游戏移进来。';
       case S.BACKLOG:   return '你想玩、还没开始的游戏放这里。点「同步」会把你 Steam 愿望单里的游戏自动导进来。';
       case S.PAUSED:    return '超过 ' + DS.RECENT_DAYS + ' 天没启动的游戏会自动落到这里；也可以手动把游戏移进来。';
-      case S.COMPLETED: return '全成就或「完结撒花」里的游戏会自动进来，也可以手动标记「已通关」。';
+      case S.COMPLETED: return '全成就、或收藏夹（默认「已完结」，可在「设置」里改）里的游戏会自动进来，也可以手动标记「已通关」。';
       case S.ABANDONED: return '这里是主动否掉的游戏。在「暂停区」点「批量选择」，或点开卡片改状态，都能把它挪进来。';
       default:          return '还没有游戏数据。点「同步」载入 Steam 库，或点「添加」手动录入。';
     }
@@ -930,7 +940,7 @@
         //（用户手动改完又启动过 -> lastPlayedTs 更新 -> 自动归类重新接管）
         g.statusManualAt = Math.floor(Date.now() / 1000);
         g.autoStatus = false;           // 手动设定后就不再是"自动归类"的产物
-        // 若它本来靠「完结撒花」自动进了已通关，而用户手动挪走，
+        // 若它本来靠收藏夹（默认「已完结」）自动进了已通关，而用户手动挪走，
         // 记下迟滞标记：之后同步不再把它拉回已通关（除非 Steam 里移出该分类再重新加入）
         if (st !== DS.STATUS.COMPLETED && DS.inCompletedCollection(g)) {
           g.dismissedCollection = true;
@@ -1084,6 +1094,12 @@
         el.syncApply.disabled = true;
         return;
       }
+      // 备份文件里带着收藏夹设置（导出备份时会写进去）—— 在算建议状态之前
+      // 先恢复它，否则换台设备导入备份，归类会按默认名重算一遍。
+      if (data && data.prefs) DS.setPrefs(data.prefs);
+      // 同理：先认下旧版的分类名，再算建议状态（顺序反了这些款会落成「我的游戏单」）
+      DS.adoptLegacyCollection(list);
+
       // 预处理：补上建议状态
       const prepared = list.map(src => {
         const g = DS.makeGame(src);
@@ -1141,6 +1157,100 @@
       setSyncStatus('写入失败：' + err.message, 'err');
       note('同步写入失败：' + err.message, 'err');
       el.syncApply.disabled = false;
+    }
+  }
+
+  // ===== 设置：收藏夹 -> 状态 =====
+
+  /** 「a，b、c」-> ['a','b','c']（中英文逗号、顿号都当分隔符） */
+  function splitNames(v) {
+    return String(v == null ? '' : v).split(/[,，、]/)
+      .map(s => s.trim()).filter(Boolean);
+  }
+
+  /**
+   * 打开设置。候选（输入框的下拉 + 下面那排小圆片）来自
+   * **数据里实际出现过的收藏夹名** —— 用户多半不记得自己在 Steam 里
+   * 把它们叫什么，纯靠手敲很容易差一个字，然后归类静默不生效。
+   */
+  function openSettings() {
+    const p = DS.getPrefs();
+    el.setCompleted.value = p.completedCollections.join('，');
+    el.setHidden.value    = p.hiddenCollections.join('，');
+    renderCollectionCandidates();
+    el.setMask.hidden = false;
+  }
+
+  function closeSettings() { el.setMask.hidden = true; }
+
+  function renderCollectionCandidates() {
+    const names = DS.collectionsInData(state.games);
+
+    el.setCollList.innerHTML = names
+      .map(n => '<option value="' + esc(n) + '"></option>').join('');
+
+    if (!names.length) {
+      el.setColls.hidden = true;
+      el.setColls.innerHTML = '';
+      return;
+    }
+    el.setColls.hidden = false;
+    el.setColls.innerHTML =
+      '<span class="set-colls-label">你在 Steam 里的收藏夹：</span>' +
+      names.map(n => '<button type="button" class="set-chip" data-coll="' +
+                     esc(n) + '">' + esc(n) + '</button>').join('');
+  }
+
+  /** 点一个小圆片 -> 把它加进「归入已通关」那格（要删就在输入框里删） */
+  function onCollectionChipClick(e) {
+    const btn = e.target && e.target.closest ? e.target.closest('.set-chip') : null;
+    if (!btn) return;
+    const name = btn.getAttribute('data-coll') || '';
+    if (!name) return;
+    const cur = splitNames(el.setCompleted.value);
+    if (cur.indexOf(name) < 0) cur.push(name);
+    el.setCompleted.value = cur.join('，');
+    el.setCompleted.focus();
+  }
+
+  /** 「恢复默认」只把输入框填回出厂值，点保存才真正生效 —— 不做半截应用 */
+  function resetSettingsForm() {
+    const d = DS.defaultPrefs();
+    el.setCompleted.value = d.completedCollections.join('，');
+    el.setHidden.value    = d.hiddenCollections.join('，');
+    note('已填回默认值，点「保存」后生效', 'warn');
+  }
+
+  /**
+   * 保存 + 当场重算归类。
+   *
+   * 状态是存在每条记录上的，光改偏好不会回头修正已同步的数据，所以这里必须
+   * 重跑一遍 —— 否则用户改完设置盯着屏幕发现什么都没变，只会当成功能没生效。
+   * 报告"进出各多少款"而不是只报成功，是因为「移出」同样会动用户的归档结果。
+   */
+  async function saveSettings() {
+    DS.setPrefs({
+      completedCollections: el.setCompleted.value,
+      hiddenCollections:    el.setHidden.value
+    });
+    closeSettings();
+
+    const before = state.games.filter(g => g.status === S.COMPLETED).length;
+    try {
+      await DS.reclassifyOwned();
+      await reload();
+      const after = state.games.filter(g => g.status === S.COMPLETED).length;
+      render();
+
+      const d = after - before;
+      let msg = '设置已保存';
+      if (d > 0)      msg += '，' + d + ' 款新归入「已通关」';
+      else if (d < 0) msg += '，' + (-d) + ' 款移出「已通关」';
+      else            msg += '，归类结果没有变化';
+      note(msg, 'ok');
+    } catch (err) {
+      render();
+      note('设置已保存，但重算归类失败：' + ((err && err.message) || err), 'err');
     }
   }
 
@@ -1253,12 +1363,26 @@
       if (e.target === el.syncMask) closeSyncModal();
     });
 
+    // 设置（收藏夹 -> 状态）
+    el.btnSettings.addEventListener('click', openSettings);
+    el.setClose.addEventListener('click', closeSettings);
+    el.setSave.addEventListener('click', saveSettings);
+    el.setReset.addEventListener('click', resetSettingsForm);
+    el.setColls.addEventListener('click', onCollectionChipClick);
+    el.setMask.addEventListener('click', (e) => {
+      if (e.target === el.setMask) closeSettings();
+    });
+    el.setCompleted.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') saveSettings();
+    });
+
     // 快捷键
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
         if (!el.noteMask.hidden) return closeNoteEditor();
         if (!el.modalMask.hidden) return closeAddModal();
         if (!el.syncMask.hidden) return closeSyncModal();
+        if (!el.setMask.hidden) return closeSettings();
         if (!el.drawer.hidden) return closeDrawer();
         // 筛选选项是「展开了一层」的轻量状态，排在最前面收掉
         if (state.filterOpen) { state.filterOpen = false; return render(); }
@@ -1291,6 +1415,9 @@
           const blob = new Blob([JSON.stringify({
             app: '我的游戏生涯', version: 1,
             exportedAt: new Date().toISOString(),
+            // 收藏夹设置跟着走：它决定「哪个收藏夹算已通关」，
+            // 不带上的话换设备导入备份会按默认名重算归类。
+            prefs: DS.getPrefs(),
             games: all
           }, null, 1)], { type: 'application/json' });
           const a = document.createElement('a');

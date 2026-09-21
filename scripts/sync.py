@@ -492,7 +492,8 @@ def step_compose(games, ach, store, collections=None):
             "steamReview": "",
             "myNote": "",
             "source": "steam",
-            # 本地收藏夹（如「完结撒花」「已隐藏」），供应用做状态归类
+            # 本地收藏夹名，原样带上（哪个名字代表什么状态由应用里的设置决定，
+            # 脚本不猜 —— 收藏夹是用户自己建的，名字随心）
             "collections": sorted(coll_of.get(int(appid), [])),
         })
     return out
@@ -557,10 +558,13 @@ def main():
     log("  最近两周在玩：%d 款" % len(playing))
     if colls:
         src = colls.get("__source__", "")
-        log("  收藏夹：%d 个（来源 %s）" % (len(colls) - 1, src))
-        fin = colls.get("完结撒花") or []
-        if fin:
-            log("    「完结撒花」%d 款 -> 将自动归入「已通关」" % len(fin))
+        names = sorted(k for k in colls if k != "__source__")
+        log("  收藏夹：%d 个（来源 %s）" % (len(names), src))
+        for nm in names:
+            log("    「%s」%d 款" % (nm, len(colls.get(nm) or [])))
+        # 这里刻意不打印"某某收藏夹 -> 已通关"：哪个名字算通关由用户在应用里
+        # 自己定（顶栏「设置」），脚本写死一个名字只会误导人。
+        log("    （哪个收藏夹算「已通关」在应用顶栏「设置」里定，默认「已完结」）")
     else:
         log("  收藏夹：未读取（本地 Steam 配置不可用）")
     if perfect:

@@ -31,22 +31,162 @@
   const VIEW_ORDER = [STATUS.BACKLOG, STATUS.PLAYING, STATUS.PAUSED,
                       STATUS.COMPLETED, STATUS.ABANDONED];
 
-  // ===== Steam 本地收藏夹 =====
-  // 同步脚本会从本机 Steam 配置里读出你自建的收藏夹（collections 字段）。
-  // 这里声明哪些收藏夹具备「状态含义」——用户改名字也只需改这里。
-  const COLLECTION_COMPLETED = '完结撒花';  // 归入「已通关」
-  const COLLECTION_HIDDEN    = '已隐藏';    // 视为用户主动隐藏（优先于任何归类）
+  // ===== Steam 收藏夹 -> 状态含义（名字由用户自己定）=====
+  //
+  // 收藏夹是每个人在 Steam 里自己建的、名字随心，所以**不能写死**：
+  // 默认只认 Steam 自带的那两个，其余由用户在「设置」里自己填。
+  // 同步脚本会把收藏夹名原样写进 games[].collections，这里只负责"哪个名字算什么状态"。
+  const PREFS_KEY = 'gv_prefs_v1';
 
-  /** 该游戏是否在「完结撒花」收藏夹里 */
-  function inCompletedCollection(game) {
-    return !!(game && Array.isArray(game.collections) &&
-              game.collections.indexOf(COLLECTION_COMPLETED) >= 0);
+  const DEFAULT_PREFS = {
+    completedCollections: ['已完结'],   // -> 归入「已通关」
+    hiddenCollections:    ['已隐藏']    // -> 视为用户主动隐藏（优先级最高）
+  };
+
+  // 旧版本把「归入已通关」的收藏夹硬编码成这一个名字，老用户的数据就带着它。
+  // 升级时若在数据里真的见到它，就沿用它，免得老用户整片「已通关」回退。
+  const LEGACY_COMPLETED_COLLECTION = '完结撒花';
+
+  let prefs = null;
+
+  /** 去空白、去重，支持「数组」或「逗号/顿号分隔的字符串」两种入参 */
+  function normalizeNames(v) {
+    const arr = Array.isArray(v) ? v : String(v == null ? '' : v).split(/[,，、]/);
+    const out = [];
+    arr.forEach(x => {
+      const s = String(x == null ? '' : x).trim();
+      if (s && out.indexOf(s) < 0) out.push(s);
+    });
+    return out;
   }
 
-  /** 该游戏是否在「已隐藏」收藏夹里（用户主动隐藏，优先级最高） */
+  function readPrefs() {
+    if (prefs) return prefs;
+    prefs = {
+      completedCollections: DEFAULT_PREFS.completedCollections.slice(),
+      hiddenCollections:    DEFAULT_PREFS.hiddenCollections.slice(),
+      // 用户有没有亲手改过这两项 —— 决定要不要做老数据迁移
+      completedTouched: false,
+      hiddenTouched:    false
+    };
+    try {
+      const raw = global.localStorage.getItem(PREFS_KEY);
+      const saved = raw ? JSON.parse(raw) : null;
+      if (saved && typeof saved === 'object') {
+        const c = normalizeNames(saved.completedCollections);
+        const h = normalizeNames(saved.hiddenCollections);
+        // 空列表按"没设过"处理 —— 存成空会让「已通关」永远没人进
+        if (c.length) prefs.completedCollections = c;
+        if (h.length) prefs.hiddenCollections = h;
+        prefs.completedTouched = !!saved.completedTouched;
+        prefs.hiddenTouched    = !!saved.hiddenTouched;
+      }
+    } catch (e) {
+      // 隐私模式 / 禁用存储：localStorage 会直接抛错。用默认值继续，不影响数据。
+    }
+    return prefs;
+  }
+
+  function writePrefs() {
+    try { global.localStorage.setItem(PREFS_KEY, JSON.stringify(readPrefs())); }
+    catch (e) { /* 存不下就算了，偏好丢了不影响游戏数据 */ }
+  }
+
+  function getPrefs() {
+    const p = readPrefs();
+    return {
+      completedCollections: p.completedCollections.slice(),
+      hiddenCollections:    p.hiddenCollections.slice(),
+      completedTouched:     p.completedTouched,
+      hiddenTouched:        p.hiddenTouched
+    };
+  }
+
+  /**
+   * 改偏好。两项都接受「数组」或「逗号分隔的字符串」。
+   * 传空 = 没填 = 保持原值（不存空列表，否则等于把自动归类关掉）。
+   */
+  function setPrefs(patch) {
+    const p = readPrefs();
+    if (patch && patch.completedCollections !== undefined) {
+      const v = normalizeNames(patch.completedCollections);
+      p.completedCollections = v.length ? v : DEFAULT_PREFS.completedCollections.slice();
+      p.completedTouched = true;
+    }
+    if (patch && patch.hiddenCollections !== undefined) {
+      const v = normalizeNames(patch.hiddenCollections);
+      p.hiddenCollections = v.length ? v : DEFAULT_PREFS.hiddenCollections.slice();
+      p.hiddenTouched = true;
+    }
+    writePrefs();
+    return getPrefs();
+  }
+
+  /** 出厂默认值（「恢复默认」按钮用；点它只填回输入框，点保存才真正生效） */
+  function defaultPrefs() {
+    return {
+      completedCollections: DEFAULT_PREFS.completedCollections.slice(),
+      hiddenCollections:    DEFAULT_PREFS.hiddenCollections.slice()
+    };
+  }
+
+  /** 数据里实际出现过的收藏夹名（给设置面板做候选，省得用户手敲） */
+  function collectionsInData(games) {
+    const out = [];
+    (games || []).forEach(g => {
+      (g && Array.isArray(g.collections) ? g.collections : []).forEach(c => {
+        const s = String(c == null ? '' : c).trim();
+        if (s && out.indexOf(s) < 0) out.push(s);
+      });
+    });
+    return out;
+  }
+
+  /**
+   * 迁移：老版本把「归入已通关」写死成 '完结撒花'，老用户数据里带着这个分类名。
+   * 见到它就一并认下来，避免升级后整片「已通关」掉出去。
+   *
+   * 三个刻意的设计：
+   *  1. **只认这一个历史名字，绝不猜别的**。猜错（比如把某个自定义分类当成
+   *     "通关"）会把一批没打完的游戏错误地归档，比不迁移糟得多。
+   *  2. **追加而不是替换**。用户可能同时有「已完结」和「完结撒花」两个分类，
+   *     替换会把他另一个丢掉。
+   *  3. **只认它一次**：只要用户亲手保存过设置（completedTouched），就再也不动。
+   *
+   * 🔴 **调用时机很要紧**：必须在「调用方按 suggestStatus 预先算好归类」**之前**调。
+   *    否则那些款会带着迁移前算出的「我的游戏单」入库 —— mergeSteam 的新建分支
+   *    用的是入参里的 suggestedStatus（云端那条路要靠它还原数据库里的状态，
+   *    所以不能在里面无条件重算）。实测踩过：种子数据导入时库还是空的，
+   *    mergeSteam 内部那次迁移看不到任何"老数据"，多数「已通关」只剩一小部分。
+   */
+  function adoptLegacyCollection(games) {
+    const p = readPrefs();
+    if (p.completedTouched) return false;
+    if (p.completedCollections.indexOf(LEGACY_COMPLETED_COLLECTION) >= 0) return false;
+
+    const has = (games || []).some(g =>
+      Array.isArray(g && g.collections) &&
+      g.collections.indexOf(LEGACY_COMPLETED_COLLECTION) >= 0);
+    if (!has) return false;
+
+    p.completedCollections = p.completedCollections.concat([LEGACY_COMPLETED_COLLECTION]);
+    writePrefs();
+    return true;
+  }
+
+  function inAnyCollection(game, names) {
+    if (!game || !Array.isArray(game.collections) || !names.length) return false;
+    return game.collections.some(c => names.indexOf(c) >= 0);
+  }
+
+  /** 该游戏是否在「归入已通关」的收藏夹里（名字以设置里的为准） */
+  function inCompletedCollection(game) {
+    return inAnyCollection(game, readPrefs().completedCollections);
+  }
+
+  /** 该游戏是否在「视为已隐藏」的收藏夹里（用户主动隐藏，优先级最高） */
   function inHiddenCollection(game) {
-    return !!(game && Array.isArray(game.collections) &&
-              game.collections.indexOf(COLLECTION_HIDDEN) >= 0);
+    return inAnyCollection(game, readPrefs().hiddenCollections);
   }
 
   // ===== 工具函数 =====
@@ -214,7 +354,8 @@
    * 优先级链（高 -> 低）：
    *   1. 锁定（statusLocked）     —— 在 mergeSteam 里拦截，不在此函数内处理
    *   2. 放弃区（abandoned）      —— 同上，手动终态，本函数也**永远不返回**它
-   *   3. 「完结撒花」收藏夹       —— 只要在这分类里，就是已通关（归档，不看日期）
+   *   3. 「归入已通关」的收藏夹 —— 只要在这分类里，就是已通关（归档，不看日期）
+   *                                （具体是哪个分类名，看用户的设置）
    *   4. 全成就                   —— 同上，已通关是终态
    *   5. 启动日期（90 天阈值）    —— ≤90 天 = 正在游玩；>90 天 = 已暂停
    *   6. 从未启动                 —— 停在总库，不参与日期归类
@@ -224,7 +365,7 @@
    * 注意 2：手动优先的细节（手动晚于启动则保留手动结果）也在 mergeSteam 里处理。
    */
   function suggestStatus(game) {
-    // 2. 自建收藏夹「完结撒花」—— 优先级高于全成就判断
+    // 2. 用户指定的「通关」收藏夹 —— 优先级高于全成就判断
     if (inCompletedCollection(game)) return STATUS.COMPLETED;
 
     // 3. 全成就 —— 已通关是归档终态，不再看启动日期
@@ -432,8 +573,13 @@
     isToolGame,
     inCompletedCollection,
     inHiddenCollection,
-    COLLECTION_COMPLETED,
-    COLLECTION_HIDDEN,
+    adoptLegacyCollection,
+
+    // 收藏夹 -> 状态的映射由用户自己定（见文件顶部 PREFS_KEY 那段）
+    getPrefs,
+    setPrefs,
+    defaultPrefs,
+    collectionsInData,
     tsToDate,
     yearOf,
     minutesToHours,
@@ -510,12 +656,18 @@
      *  - appid 不存在 -> 新建
      *  - 用户手动设过状态的，状态不被覆盖
      *  - 「已隐藏」收藏夹里的游戏强制隐藏（优先级高于一切）
-     *  - 「完结撒花」收藏夹里的游戏自动进「已通关」
+     *  - 用户指定的「通关」收藏夹里的游戏自动进「已通关」
+     *  - 升级上来的老数据：见到旧版写死的分类名就沿用（见 adoptLegacyCollection）
      */
     async mergeSteam(incoming) {
       const existing = await this.all();
       const byAppid = new Map();
       existing.forEach(g => { if (g.appid != null) byAppid.set(String(g.appid), g); });
+
+      // 老用户升级上来的第一趟：数据里（不管是库里已有的还是这次喂进来的）
+      // 带着旧版写死的分类名就一并认下来，否则「已通关」会整体回退。
+      // 只认一次，且用户改过设置就不动。
+      adoptLegacyCollection(existing.concat(incoming));
 
       const toSave = [];
       let added = 0, updated = 0, recollected = 0, locked = 0, abandoned = 0;
@@ -557,7 +709,7 @@
           } else if (old.status === STATUS.ABANDONED) {
             // 「放弃」是手动终态，和锁定同级：
             // 「不打算再玩了」只有用户能判断，所以同步时一律不动 ——
-            // 包括不被「完结撒花」收藏夹 / 全成就拉回「已通关」，
+            // 包括不被「通关」收藏夹 / 全成就拉回「已通关」，
             // 也不因为"后来又启动了一次"被日期规则挪去「正在游玩」。
             // 想让它回到别的状态，手动改一下即可（改完就不再是 abandoned）。
             old.autoStatus = false;
@@ -632,6 +784,27 @@
 
       await this.saveMany(toSave);
       return { added, updated, recollected, locked, abandoned };
+    },
+
+    /**
+     * 按当前偏好重跑一遍状态归类。
+     *
+     * 用户在「设置」里改了收藏夹名之后要调它 —— 状态是存在每条记录上的，
+     * 光改偏好不会回头修正已经同步过的数据。
+     *
+     * 两条刻意的设计：
+     *  1. **复用 mergeSteam 的优先级链**，不另写一套。再抄一遍那条链（锁定 /
+     *     放弃终态 / 已通关 / 手动优先 / 日期分流）迟早会跟它不一致。
+     *  2. **只跑 source === 'steam' 的记录**。mergeSteam 对已存在的记录会无条件
+     *     写 `old.source = 'steam'`，把手动添加的（'manual'）一起喂进去，
+     *     它们会莫名挂上「已拥有」角标 —— 而按约定 manual 是**不挂角标**的。
+     *     愿望单记录（'wishlist'）同理排除，避免被当成刚买下重算一遍。
+     */
+    async reclassifyOwned() {
+      const all = await this.all();
+      const owned = all.filter(g => g && g.source === 'steam');
+      if (!owned.length) return { added: 0, updated: 0, recollected: 0, locked: 0, abandoned: 0 };
+      return this.mergeSteam(owned);
     },
 
     /**
