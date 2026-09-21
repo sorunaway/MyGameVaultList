@@ -23,7 +23,8 @@
  * ⚠️ 桌面版拿到的数据是**有上限**的（别在 UI 上把它说成全量）
  * ============================================================
  * 只有「本机装过 / 玩过 / 在某收藏夹里」的款才有记录，名字还只有已安装的那些有。
- * 实测：本机约 300 款 / 账号侧约 400 款，其中约九成没有名字（要联网补，见下一步）。
+ * 实测：本机约 300 款 / 账号侧约 400 款，其中约九成没名字 —— 这些由下面的 `fillMeta()`
+ * 联网分批补（免 key 的商店接口），进度存本机、每次启动接着补。
  */
 (function () {
   'use strict';
@@ -161,11 +162,184 @@
     };
   }
 
+  // ============================================================
+  // 补全商店信息（名字 / 封面 / 发售年 / 类型 / 开发商）
+  // ============================================================
+  // 本机 Steam 文件只对「装过 / 玩过 / 在某收藏夹里」的款有记录，
+  // **名字更只有已安装的那些有**（实测本机约 300 款里九成没名字）。
+  // 名字只能联网问，走**免 key** 的 `/api/steam/store`（= store.steampowered.com/api/appdetails）。
+  //
+  // 为什么要「每轮补一批」而不是一次补完：商店接口**一款一次**，几百款要跑好几分钟，
+  // 用户会以为卡死。所以进度落在本机（`gv_local_meta_v1`），每次启动接着补 ——
+  // 单次时长有上限，中途关掉也不丢进度。这套做法与云端版（`cloud.js` 的 `fillMeta`）一致。
+  //
+  // ⚠️ **两种「没拿到」必须区分**：
+  //   · Steam 明确说查不到（下架 / 锁区）→ 记成「问过了」，不再问；
+  //   · 这次没拿到答案（网络 / 限流，后端放在 `unknown` 里）→ **绝不能记**，
+  //     否则那款游戏的名字/封面**永远**补不回来。
+  var META_KEY = 'gv_local_meta_v1';
+  var META_PER_RUN = 45;    // 一轮最多补多少款
+  var META_BATCH = 15;      // 一次请求带多少款（后端 STORE_MAX_IDS = 30，留一半余量）
+  var META_TIMEOUT = 60000; // 后端单请求预算 STORE_DEADLINE = 34 秒，客户端给宽一点
+  var META_DOWN_KEY = 'gv_local_meta_down_v1';
+  var META_DOWN_TTL = 6 * 3600 * 1000;   // 「链路不通」记住 6 小时
+
+  // 🔴 链路不通时**必须先收手**，否则每次启动都白耗：
+  //    商店域名在有些机器上被本地代理 / hosts 拦截（本机实测：直连 0.25 秒被 RST，
+  //    走环境代理 SSL EOF），而服务端每批有 34 秒预算 —— 一轮 3 批就是 100 秒的
+  //    无效等待 + 一次都不成功。所以「首波全灭」就停，并记下"不通"，6 小时内不再试。
+  //    有一批拿到正常答复就立刻清掉这个标记。
+  function linkDownAt() {
+    try { return Number(window.localStorage.getItem(META_DOWN_KEY)) || 0; }
+    catch (e) { return 0; }
+  }
+  function setLinkDown(ts) {
+    try { window.localStorage.setItem(META_DOWN_KEY, String(ts)); } catch (e) {}
+  }
+  function clearLinkDown() {
+    try { window.localStorage.removeItem(META_DOWN_KEY); } catch (e) {}
+  }
+
+  function readFetched() {
+    try {
+      var raw = window.localStorage.getItem(META_KEY);
+      var o = raw ? JSON.parse(raw) : {};
+      return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {};
+    } catch (e) { return {}; }   // 隐私模式 / 存储被禁：当没进度，功能仍可用（只是下次重来）
+  }
+
+  function writeFetched(o) {
+    try {
+      window.localStorage.setItem(META_KEY, JSON.stringify(o));
+      return true;
+    } catch (e) {
+      console.warn('补全进度写不进本机存储（不影响本次已补到的结果）', e);
+      return false;
+    }
+  }
+
+  function yearOf(s) {
+    var m = String(s || '').match(/(19|20)\d{2}/);
+    return m ? Number(m[0]) : null;
+  }
+
+  /**
+   * 补一批游戏的名字 / 封面等公共信息，直接落进 `DataStore`（本机存储）。
+   *
+   * 🔴 **严格只补缺，绝不覆盖已有**：只对「还没有名字」或「还没有封面」的款动手，
+   * 且写回时**只带当前缺的那些字段**。理由：本机已有的封面是**离线可用**的本地图，
+   * 用商店的远程图去盖它，会让离线版为了看图反而必须联网。
+   *
+   * 返回 `{filled, left}`：`filled` = 这次真的补到内容的款数，
+   * `left > 0` = 还有剩的，下次接着补。
+   */
+  async function fillMeta(appids) {
+    if (!window.DataStore) return { filled: 0, left: 0, reason: 'no_datastore' };
+
+    var all = await window.DataStore.all();
+    var byId = {};
+    (all || []).forEach(function (g) { if (g.appid != null) byId[String(g.appid)] = g; });
+
+    var fetched = readFetched();
+    var want = [];
+    (appids || []).forEach(function (a) {
+      if (a == null) return;
+      var k = String(a);
+      if (fetched[k]) return;                  // 问过了
+      var g = byId[k];
+      if (!g) return;                          // 不在库里的不问
+      if (g.title && g.header) return;         // 名字和封面都有，没什么可补
+      want.push(k);
+    });
+    if (!want.length) return { filled: 0, left: 0 };
+
+    // 上次试过、判定链路不通且还没到期 → 直接跳过（不发任何请求）
+    var down = linkDownAt();
+    if (down && Date.now() - down < META_DOWN_TTL) {
+      return { filled: 0, left: want.length, skipped: 'link_down' };
+    }
+
+    var work = want.slice(0, META_PER_RUN);
+    var filled = 0, unanswered = 0, attempted = 0;
+
+    for (var i = 0; i < work.length; i += META_BATCH) {
+      var part = work.slice(i, i + META_BATCH);
+      attempted += part.length;
+      var d = null;
+      try {
+        d = await getJSON('/api/steam/store?appids=' + part.join(','), META_TIMEOUT);
+      } catch (e) {
+        unanswered += part.length;            // 整批没回来（本机服务没响应）→ 留到下次
+        continue;
+      }
+      var items = (d && d.items) || {};
+      var unknown = {};
+      ((d && d.unknown) || []).forEach(function (x) { unknown[String(x)] = 1; });
+
+      var recs = [];
+      var answered = 0;
+      part.forEach(function (k) {
+        if (unknown[k]) { unanswered++; return; }   // 没拿到答案 → 不记进度
+        answered++;
+        fetched[k] = 1;                             // 走到这儿都是「确定答复」
+        var v = items[k];
+        if (!v) return;                             // Steam 明说查不到：记进度，不写任何字段
+        var g = byId[k] || {};
+        var rec = { appid: Number(k) };
+        if (!g.title && v.name) rec.title = v.name;
+        if (!g.header && v.header) rec.header = v.header;
+        if (!g.releaseDate && v.release) rec.releaseDate = v.release;
+        if (!g.releaseYear) {
+          var yr = yearOf(v.release);
+          if (yr) rec.releaseYear = yr;
+        }
+        if ((!g.genres || !g.genres.length) && v.genres && v.genres.length) rec.genres = v.genres;
+        if ((!g.developers || !g.developers.length) && v.developers && v.developers.length) {
+          rec.developers = v.developers;
+        }
+        if (Object.keys(rec).length > 1) { recs.push(rec); filled++; }
+      });
+
+      if (recs.length) {
+        try { await window.DataStore.mergeSteam(recs); }
+        catch (e) { console.warn('写回商店信息失败（进度照记）', e); }
+      }
+      writeFetched(fetched);   // 每批都落盘：中途关掉也不丢进度
+
+      if (!answered) {
+        // 🔴 整批一个确定答复都没有 ⇒ 是链路层不通（限流会带 429，这里连状态码都没有）。
+        //    别接着把剩下的批跑完 —— 那是纯粹的白等。
+        setLinkDown(Date.now());
+        break;
+      }
+      clearLinkDown();   // 通了：把上次留下的"不通"标记清掉
+    }
+
+    return {
+      filled: filled,
+      left: Math.max(0, want.length - attempted) + unanswered
+    };
+  }
+
   window.GVLocal = {
     probe: probe,
     load: load,
     toRecords: toRecords,
     sync: sync,
+
+    // ---- 联网补全名字 / 封面（免 key 的商店接口）----
+    fillMeta: fillMeta,
+    /** 已经问过的款数（排查"为什么它一直在补"时看这个） */
+    fetchedCount: function () { return Object.keys(readFetched()).length; },
+    /** 「缺名字或缺封面、且还没问过」的款数 —— 即还需要补多少（不发起请求，纯本地判断） */
+    pendingCount: async function () {
+      if (!window.DataStore) return 0;
+      var all = await window.DataStore.all();
+      var fetched = readFetched();
+      return (all || []).filter(function (g) {
+        return g.appid != null && !fetched[String(g.appid)] && !(g.title && g.header);
+      }).length;
+    },
 
     // ---- Steam 目录（哪台机器上 Steam 装在哪都可能不一样）----
     status: function () { return getJSON('/api/local/status', STATUS_TIMEOUT); },

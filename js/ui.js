@@ -1336,6 +1336,32 @@
       meta);
   }
 
+  /**
+   * 桌面版：后台补全游戏名字与封面。
+   *
+   * 本机 Steam 文件只有已安装的款带名字（本机约 300 款里九成没名字），
+   * 其余名字只能联网问商店接口（**免 key**）。几百款一款一次会很慢，
+   * 所以每次启动只补一批（`GVLocal.fillMeta` 上限 45 款），进度存本机、下次接着补。
+   *
+   * ⚠️ **故意不 await**：先把界面交给用户，补全在后台推进 ——
+   *    让启动时间取决于本机文件，而不是外网快不快。
+   * ⚠️ 补完只在**没有弹窗打开**时重绘：用户可能正开着「设置」在填东西，
+   *    这时整页重绘会把他的输入冲掉。
+   */
+  function fillMetaInBackground() {
+    if (!window.GVLocal || !window.GVLocal.fillMeta) return;
+    const ids = state.games.map(g => g.appid).filter(a => a != null);
+    if (!ids.length) return;
+
+    window.GVLocal.fillMeta(ids).then(async (r) => {
+      if (!r || !r.filled) return;
+      await reload();
+      if (el.setMask.hidden) render();      // 面板开着就别动它（见上面的说明）
+      note('已补全 ' + r.filled + ' 款的名字/封面' +
+           (r.left ? '，还有 ' + r.left + ' 款下次启动继续' : '，已全部补齐'), 'ok');
+    }).catch(e => console.warn('后台补全商店信息失败（不影响使用）', e));
+  }
+
   function renderCollectionCandidates() {
     const names = DS.collectionsInData(state.games);
 
@@ -1776,6 +1802,9 @@
     state._initialView = null;   // 已生效，避免之后每次刷新又跳回 URL 指定的区块
 
     render();
+
+    // 桌面版：界面已经交给用户了，名字/封面在后台分批补（不阻塞启动，见函数说明）
+    if (desktopMode) fillMetaInBackground();
 
     // ?settings=1：渲染完再把设置面板弹出来（面板里的候选要用到已渲染的数据）
     if (state._openSettings) {
