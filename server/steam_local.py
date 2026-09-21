@@ -28,6 +28,7 @@ Steam 本地文件读取 —— **Windows 桌面版专用**。
 
 import json
 import os
+import struct
 import time
 
 # SteamID64 与账号 ID（SteamID3）的固定偏移
@@ -929,6 +930,185 @@ def read_collections(steam_dir=None, account_id=None):
 
 
 # ============================================================
+# 离线名字表（appcache/appinfo.vdf，V29）
+# ============================================================
+# 🔑 为什么需要它：本机 Steam 文件里**只有已安装的款**有名字（appmanifest_*.acf），
+#    所以界面此前对绝大多数款只能显示 `App <id>` 占位（本机实测约 300 款里九成没名字），
+#    要靠联网问商店接口补。但 Steam 客户端自己缓存了一份**全量**的 app 元数据：
+#    `appcache/appinfo.vdf` —— 名字就在里面，**不需要任何网络**。
+#    （2026-09-21 实测：绝大多数能读到，耗时 0.08 秒。）
+#
+# 格式（全部实测验证，不是回忆 —— 字符串表曾猜错一次，见下）：
+#   文件头  : u32 magic(0x07564429 = V29) + u32 universe + i64 字符串表偏移
+#   字符串表: u32 数量 + 数量个**连续** cstring
+#             ⚠️ 不是「u32 偏移数组 + 字符串块」。判据：连续 cstring 的读法**恰好消耗到
+#                文件末尾（剩余 0 字节）**，偏移数组的读法会越界崩掉。
+#   条目区  : offset 16 .. 字符串表偏移，每条 = u32 appid + u32 size + size 字节「条目体」
+#   条目体  : 前若干字节是 infoState / lastUpdated / token / sha1 / changeNumber 之类的头
+#             （实测 620 的条目前缀是 60 字节），之后才是 KV
+#   KV      : [type u8][key u32 = 字符串表下标][value]
+#             type 带 0x80 位 → 字符串的值是 u32 表下标（不是内联 cstring）
+#   结构    : {appinfo: {appid: <int>, common: {name: <str>, type: <str>, …}}}
+#
+# 🔴 定位 KV 起点必须**双重自校验**，不能猜头部长度：
+#    ① 一次完整解析必须**恰好走到条目体末尾**；
+#    ② 解出的 `appinfo.appid` 必须**等于该条目自己的 appid**。
+#    只靠 ① 会误判 —— 从错误位置起解也可能"碰巧"走完（本机实测曾把 kvStart 错报成 0）。
+APPINFO_MAGIC29 = 0x07564429
+_T_DICT = 0x00
+_T_STR = 0x01
+_T_I32 = 0x02
+_T_F32 = 0x03
+_T_PTR = 0x04
+_T_WSTR = 0x05
+_T_COLOR = 0x06
+_T_U64 = 0x07
+_T_END = 0x08
+_T_I64 = 0x0A
+
+# 按 (路径, mtime, 大小) 缓存 —— 8.6MB 文件不该每次同步都重解析
+_APPINFO_CACHE = {"key": None, "val": {}}
+
+
+def _kv_string_table(buf, off):
+    """读字符串表：u32 数量 + 数量个连续 cstring。"""
+    n = struct.unpack_from("<I", buf, off)[0]
+    tbl = []
+    i = off + 4
+    for _ in range(n):
+        j = buf.index(b"\x00", i)
+        tbl.append(buf[i:j].decode("utf-8", "replace"))
+        i = j + 1
+    return tbl
+
+
+def _kv_walk(buf, i, tbl, out):
+    """解一段 binary KV。返回 `(dict, 下一位置)`；遇到不认识的类型返回 `(dict, -1)` 表示放弃。
+
+    ⚠️ 放弃时**绝不能**返回 `len(buf)` —— 那看起来像"恰好收尾"，会让自校验①误判通过。
+    """
+    while i < len(buf):
+        t = buf[i]
+        i += 1
+        if t == _T_END:
+            return out, i
+        by_ref = bool(t & 0x80)          # 带 0x80 位：字符串走表下标
+        t &= 0x7F
+        k = struct.unpack_from("<I", buf, i)[0]
+        i += 4
+        key = tbl[k] if k < len(tbl) else ""
+        if t == _T_DICT:
+            sub = {}
+            sub, i = _kv_walk(buf, i, tbl, sub)
+            if i < 0:
+                return out, -1
+            out[key] = sub
+        elif t == _T_STR:
+            if by_ref:
+                n = struct.unpack_from("<I", buf, i)[0]
+                i += 4
+                out[key] = tbl[n] if n < len(tbl) else None
+            else:
+                j = buf.index(b"\x00", i)
+                out[key] = buf[i:j].decode("utf-8", "replace")
+                i = j + 1
+        elif t in (_T_I32, _T_PTR, _T_COLOR):
+            out[key] = struct.unpack_from("<i", buf, i)[0]
+            i += 4
+        elif t == _T_F32:
+            out[key] = struct.unpack_from("<f", buf, i)[0]
+            i += 4
+        elif t in (_T_U64, _T_I64):
+            out[key] = struct.unpack_from("<q", buf, i)[0]
+            i += 8
+        elif t == _T_WSTR:
+            j = i
+            while buf[j:j + 2] != b"\x00\x00":
+                j += 2
+            out[key] = buf[i:j].decode("utf-16-le", "replace")
+            i = j + 2
+        else:
+            return out, -1
+    return out, i
+
+
+def _kv_start(blob, tbl, appid, max_try=128):
+    """在这条「条目体」里找到 KV 起点。见文件头「双重自校验」。"""
+    for s in range(0, min(max_try, len(blob))):
+        try:
+            kv, pos = _kv_walk(blob, s, tbl, {})
+        except Exception:
+            continue
+        if pos != len(blob):
+            continue
+        node = kv.get("appinfo") if isinstance(kv, dict) else None
+        if isinstance(node, dict) and node.get("appid") == appid:
+            return node
+    return None
+
+
+def _parse_appinfo(buf, budget_seconds=5.0):
+    """把 appinfo.vdf 解成 `{appid: 名字}`。只保留有名字的款。"""
+    if len(buf) < 16:
+        return {}
+    magic, _universe = struct.unpack_from("<II", buf, 0)
+    if magic != APPINFO_MAGIC29:
+        return {}                        # 只有 V29 认得；别的版本一律放弃（宁可回退联网补）
+    st_off = struct.unpack_from("<q", buf, 8)[0]
+    if not (16 <= st_off < len(buf)):
+        return {}
+    tbl = _kv_string_table(buf, st_off)
+
+    names = {}
+    i = 16
+    deadline = time.time() + budget_seconds
+    while i + 8 <= st_off:
+        if time.time() > deadline:
+            break                        # 超大文件 / 异常数据：到点收手，已拿到的照用
+        appid, size = struct.unpack_from("<II", buf, i)
+        i += 8
+        if size == 0 or i + size > st_off:
+            break
+        node = _kv_start(buf[i:i + size], tbl, appid)
+        if node:
+            common = node.get("common")
+            if isinstance(common, dict):
+                nm = common.get("name")
+                if nm:
+                    names[appid] = nm
+        i += size
+    return names
+
+
+def read_appinfo_names(steam_dir=None, budget_seconds=5.0):
+    """`{appid: 名字}`；读不到就返回 `{}`。
+
+    🔴 **绝不抛异常、绝不拖慢主流程** —— 这是锦上添花的数据源，拿不到时界面照常
+    （名字留空，由联网 `fillMeta` 收尾）。按 (路径, mtime, 大小) 缓存。
+    """
+    steam_dir = steam_dir or find_steam()
+    if not steam_dir:
+        return {}
+    path = os.path.join(steam_dir, "appcache", "appinfo.vdf")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    key = (path, st.st_mtime, st.st_size)
+    if _APPINFO_CACHE["key"] == key:
+        return _APPINFO_CACHE["val"]
+    try:
+        with open(path, "rb") as f:
+            buf = f.read()
+        names = _parse_appinfo(buf, budget_seconds)
+    except Exception:
+        names = {}
+    _APPINFO_CACHE["key"] = key
+    _APPINFO_CACHE["val"] = names
+    return names
+
+
+# ============================================================
 # 汇总出口
 # ============================================================
 def read_library(steam_id=None, with_covers=True):
@@ -974,6 +1154,10 @@ def read_library(steam_id=None, with_covers=True):
     #    或者早年在别的机器上玩过的），它们拿不到时长，但**归类的依据（收藏夹）
     #    是有的** —— 少算了它们，「已通关 / 已隐藏」这两条规则就会漏。
     appids = set(installed) | set(played) | set(coll_by_appid)
+    # 🔑 名字来源两处，优先级：已安装的 appmanifest（最贴近本机实际）→ appinfo.vdf 离线全量表。
+    #    加上第二处以后，「缺名字」从九成降到个位数（本机实测绝大多数被覆盖），
+    #    界面不再满屏 `App <id>`，而且**不需要联网**。剩下的少数才交给联网 fillMeta 收尾。
+    appinfo_names = read_appinfo_names(steam_dir)
     games = []
     for appid in sorted(appids):
         inst = installed.get(appid) or {}
@@ -981,8 +1165,7 @@ def read_library(steam_id=None, with_covers=True):
         k = cover_kind(steam_dir, appid) if with_covers else None
         games.append({
             "appid": appid,
-            # 名字只有「已安装」的款有；其余靠商店接口补（UI 会退化成 "App <appid>" 占位）
-            "title": inst.get("title") or "",
+            "title": inst.get("title") or appinfo_names.get(appid) or "",
             # localconfig.vdf 的 Playtime 是唯一的时长来源（分钟，等价 playtime_forever）
             "totalMinutes": loc.get("totalMinutes", 0),
             "recent2wMinutes": loc.get("recent2wMinutes", 0),
