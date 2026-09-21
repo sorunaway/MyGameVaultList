@@ -1,0 +1,20 @@
+{
+  "name": "我的游戏生涯",
+  "short_name": "游戏生涯",
+  "description": "Steam 游戏历程管理：玩过什么、进度如何、接下来玩什么",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f1115",
+  "theme_color": "#171a21",
+  "lang": "zh-CN",
+  "icons": [
+    {
+      "src": "assets/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

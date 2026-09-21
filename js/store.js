@@ -1,0 +1,746 @@
+/*
+ * GameVault — Steam 游戏历程管理器
+ * 数据层：统一的 Game 模型 + IndexedDB 持久化
+ * 设计原则：手动标记优先于 Steam 自动同步，绝不被覆盖
+ */
+
+(function (global) {
+  'use strict';
+
+  // ===== 状态枚举 =====
+  const STATUS = {
+    LIBRARY:   'library',    // 我的游戏单（总表：Steam 库 + 愿望单）
+    BACKLOG:   'backlog',    // 待游玩
+    PLAYING:   'playing',    // 正在游玩
+    PAUSED:    'paused',     // 暂停区
+    COMPLETED: 'completed',  // 已通关
+    ABANDONED: 'abandoned'   // 放弃区（手动终态：不打算再玩了）
+  };
+
+  const STATUS_META = {
+    library:   { key: 'library',   label: '我的游戏单', icon: '📚', color: '#6b7280', desc: 'Steam 库 + 愿望单，全在这里' },
+    backlog:   { key: 'backlog',   label: '待游玩',    icon: '🎯', color: '#3b82f6', desc: '想玩但还没开始' },
+    playing:   { key: 'playing',   label: '正在游玩',  icon: '🔥', color: '#f59e0b', desc: '90 天内启动过' },
+    paused:    { key: 'paused',    label: '暂停区',    icon: '⏸️', color: '#8b5cf6', desc: '超过 90 天没启动' },
+    completed: { key: 'completed', label: '已通关',    icon: '🏆', color: '#10b981', desc: '打完了，已归档' },
+    abandoned: { key: 'abandoned', label: '放弃区',    icon: '🗑️', color: '#78716c', desc: '不打算再玩了，已出局' }
+  };
+
+  // 状态视图顺序（不含总库）
+  // 放弃区排最后：它是一个"出局"名单，不是主线进度
+  const VIEW_ORDER = [STATUS.BACKLOG, STATUS.PLAYING, STATUS.PAUSED,
+                      STATUS.COMPLETED, STATUS.ABANDONED];
+
+  // ===== Steam 本地收藏夹 =====
+  // 同步脚本会从本机 Steam 配置里读出你自建的收藏夹（collections 字段）。
+  // 这里声明哪些收藏夹具备「状态含义」——用户改名字也只需改这里。
+  const COLLECTION_COMPLETED = '完结撒花';  // 归入「已通关」
+  const COLLECTION_HIDDEN    = '已隐藏';    // 视为用户主动隐藏（优先于任何归类）
+
+  /** 该游戏是否在「完结撒花」收藏夹里 */
+  function inCompletedCollection(game) {
+    return !!(game && Array.isArray(game.collections) &&
+              game.collections.indexOf(COLLECTION_COMPLETED) >= 0);
+  }
+
+  /** 该游戏是否在「已隐藏」收藏夹里（用户主动隐藏，优先级最高） */
+  function inHiddenCollection(game) {
+    return !!(game && Array.isArray(game.collections) &&
+              game.collections.indexOf(COLLECTION_HIDDEN) >= 0);
+  }
+
+  // ===== 工具函数 =====
+  function uid() {
+    return 'g_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+  }
+
+  /** 秒级时间戳 -> YYYY-MM-DD */
+  function tsToDate(ts) {
+    if (!ts || ts <= 0) return null;
+    const d = new Date(ts * 1000);
+    if (isNaN(d.getTime())) return null;
+    const p = n => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  }
+
+  function yearOf(ts) {
+    const s = tsToDate(ts);
+    return s ? Number(s.slice(0, 4)) : null;
+  }
+
+  /** 分钟 -> "12.5h" 形式 */
+  function minutesToHours(min) {
+    if (!min || min <= 0) return 0;
+    return Math.round((min / 60) * 10) / 10;
+  }
+
+  /** 从 Steam 商店日期字符串里抠年份，兼容 "2023 年 3 月 3 日" / "3 Mar, 2023" */
+  function parseReleaseYear(s) {
+    if (!s) return null;
+    const m = String(s).match(/(19|20)\d{2}/);
+    return m ? Number(m[0]) : null;
+  }
+
+  // ===== 工具/软件黑名单 =====
+  // Steam 库里常混入非游戏条目（引擎、工具、壁纸、跑分软件…）。
+  // 这些默认标记为 hidden，不参与游戏区块展示，但可在「我的游戏单」里取消隐藏。
+  const TOOL_APPIDS = new Set([
+    404790,   // Godot Engine
+    431960,   // Wallpaper Engine
+    993090,   // Lossless Scaling
+    228980,   // Steamworks Common Redistributables
+    250820,   // SteamVR
+    1070560,  // Steam Linux Runtime
+    1391110,  // Steam Linux Runtime - Soldier
+    1627300,  // Steam Linux Runtime - Sniper
+    1904540,  // Proton Experimental
+    1493710,  // Proton Experimental (alt)
+    3658110,  // Steam Linux Runtime 4.0
+    2180100,  // Proton Hotfix
+    961940,   // Steam Linux Runtime - Soldier (alt)
+  ]);
+
+  // 名称关键词兜底（appid 会变，名字不会）
+  const TOOL_NAME_PATTERNS = [
+    /^godot engine$/i,
+    /^wallpaper engine$/i,
+    /^lossless scaling$/i,
+    /steam linux runtime/i,
+    /^proton\b/i,
+    /^steamworks common/i,
+    /^steamvr$/i,
+    /redistributables/i,
+    /^soundpad$/i,
+    /^vtube studio$/i,
+    /^live2dviewerex/i,
+    /^3dmark/i,
+    /^blender$/i,
+    /^unreal engine$/i,
+    /^unity\b/i,
+    /^rpg maker/i,
+    /^game maker/i,
+  ];
+
+  /** 判断是否是工具/软件（非游戏） */
+  function isToolGame(game) {
+    if (!game) return false;
+    if (game.appid && TOOL_APPIDS.has(Number(game.appid))) return true;
+    const t = String(game.title || '');
+    return TOOL_NAME_PATTERNS.some(re => re.test(t));
+  }
+
+  // ===== 默认游戏对象 =====
+  function makeGame(partial) {
+    return Object.assign({
+      id: uid(),
+      appid: null,              // Steam AppID，手动添加可为 null
+      title: '',
+      icon: '',                 // 小图标 URL
+      header: '',               // 大图 URL
+      releaseYear: null,        // 发售年份
+      releaseDate: null,        // 发售日期原文
+      totalMinutes: 0,          // 总时长（Steam，分钟）
+      recentMinutes: 0,         // 最近两周（分钟）
+      lastPlayedTs: 0,          // 最后启动时间戳（秒）
+      achievements: null,       // { earned, total }
+      status: STATUS.LIBRARY,
+      manualStatus: null,       // 手动设定的状态；非空则优先于自动同步
+      statusManualAt: 0,        // 上次手动改状态的时间戳（秒）；晚于 lastPlayedTs 则保留手动结果
+      statusLocked: false,      // 锁定：为 true 时完全不参与自动归类（用户钉死的）
+      autoStatus: false,        // 当前状态是否由自动规则（启动日期）产生 —— 供 UI 打标记
+      manualHidden: null,       // 手动设定过隐藏开关；非空则优先于自动判定
+      dismissedCollection: false, // 用户主动把它从「已通关」挪走过，不再被收藏夹拉回
+      hidden: false,            // 是否隐藏（工具/软件默认隐藏）
+      steamReview: '',          // 玩家在 Steam 写的评价（抓不到就空）
+      myNote: '',               // 玩家手写感想
+      genres: [],
+      developers: [],
+      collections: [],          // Steam 本地收藏夹名列表（同步脚本写入）
+      // 这条记录**是从哪来的**，也是「我的游戏单」里那个角标的唯一依据：
+      //   'steam'    它在你的 Steam 库里            -> 角标「已拥有」
+      //   'wishlist' 它只在愿望单里，你还没买       -> 角标「未入库」
+      //   'manual'   你手动加的，Steam 那边不知道   -> 不挂角标（判断不了就别瞎标）
+      // ⚠️ 愿望单游戏被买下后，mergeSteam 会把它改成 'steam'，角标随之变「已拥有」。
+      source: 'manual',
+      // ===== 以下三个字段只有愿望单来源的记录才有意义 =====
+      wishlisted: false,        // 此刻是否还在 Steam 愿望单里
+      wishPriority: 0,          // 你在 Steam 里手动排的位次；0 = 没排过
+      wishAddedTs: 0,           // 加入愿望单的时间戳（秒）
+      addedAt: Date.now(),
+      updatedAt: Date.now()
+    }, partial || {});
+  }
+
+  // ===== 自动归类规则 =====
+  /**
+   * 「最近启动过」的判定阈值：90 天（约三个月）。
+   *
+   * 在这个天数以内启动过 -> 正在游玩
+   * 超过这个天数没启动   -> 已暂停
+   *
+   * 想调松/调紧只改这一个常量即可，其余逻辑不用动。
+   */
+  const RECENT_DAYS = 90;
+
+  /** 距上次启动过去了多少天；没有启动记录返回 -1 */
+  function daysSincePlayed(game, nowTs) {
+    if (!game || !game.lastPlayedTs || game.lastPlayedTs <= 0) return -1;
+    const now = nowTs || (Date.now() / 1000);
+    const d = (now - game.lastPlayedTs) / 86400;
+    // 时钟偏差 / 时区问题可能让 lastPlayedTs 落在未来，按「刚刚玩过」处理
+    return d < 0 ? 0 : d;
+  }
+
+  /**
+   * 「疑似已放弃」的提示阈值：730 天（两年）。
+   *
+   * ⚠️ 这个值**只用于界面提示，不参与任何自动归类**。
+   * 「不想再玩了」是主观判断，数据推不出来 —— 所以这里只在暂停区里
+   * 给超期很久的卡片挂一个淡色角标，提醒你去处理（手动标进放弃区）。
+   */
+  const STALE_DAYS = 730;
+
+  /** 是否「疑似已放弃」：玩过、超过 STALE_DAYS 没启动、还没被用户处理过 */
+  function isStale(game) {
+    if (!game) return false;
+    if (game.status === STATUS.ABANDONED || game.status === STATUS.COMPLETED) return false;
+    const d = daysSincePlayed(game);
+    return d >= STALE_DAYS;
+  }
+
+  /**
+   * 根据 Steam 数据推断状态的建议值。
+   *
+   * 优先级链（高 -> 低）：
+   *   1. 锁定（statusLocked）     —— 在 mergeSteam 里拦截，不在此函数内处理
+   *   2. 放弃区（abandoned）      —— 同上，手动终态，本函数也**永远不返回**它
+   *   3. 「完结撒花」收藏夹       —— 只要在这分类里，就是已通关（归档，不看日期）
+   *   4. 全成就                   —— 同上，已通关是终态
+   *   5. 启动日期（90 天阈值）    —— ≤90 天 = 正在游玩；>90 天 = 已暂停
+   *   6. 从未启动                 —— 停在总库，不参与日期归类
+   *
+   * 注意 1：hidden（工具隐藏）不在这里处理，隐藏优先级最高，
+   *         在 mergeSteam 里用 isToolGame / inHiddenCollection 单独判定。
+   * 注意 2：手动优先的细节（手动晚于启动则保留手动结果）也在 mergeSteam 里处理。
+   */
+  function suggestStatus(game) {
+    // 2. 自建收藏夹「完结撒花」—— 优先级高于全成就判断
+    if (inCompletedCollection(game)) return STATUS.COMPLETED;
+
+    // 3. 全成就 —— 已通关是归档终态，不再看启动日期
+    const ach = game.achievements;
+    const allDone = !!(ach && ach.total > 0 && ach.earned >= ach.total);
+    if (allDone) return STATUS.COMPLETED;
+
+    // 4. 按启动日期分流：近期玩过 -> 正在游玩，久未启动 -> 已暂停
+    const days = daysSincePlayed(game);
+    if (days >= 0) {
+      if (days <= RECENT_DAYS) return STATUS.PLAYING;
+      return STATUS.PAUSED;
+    }
+
+    // 5. 从未启动（也没有 recentMinutes）：停在总库，等用户自己决定
+    if (game.recentMinutes > 0) return STATUS.PLAYING;
+
+    return STATUS.LIBRARY;
+  }
+
+  /** 全成就判断（供 UI 挂勋章） */
+  function isPerfect(game) {
+    const ach = game.achievements;
+    return !!(ach && ach.total > 0 && ach.earned >= ach.total);
+  }
+
+  /**
+   * 「我的游戏单」卡片右下角那个角标该显示什么。
+   *
+   * 返回 'owned'（已拥有）/ 'wish'（未入库）/ ''（不挂角标，因为判断不了）。
+   *
+   * ⚠️ 判断依据是 **source 而不是「有没有时长」**：库里从没启动过的游戏
+   * 时长同样是 0，用它判断会把一大堆已拥有的游戏标成「未入库」。
+   *
+   * 手动添加的游戏（source='manual'）**故意不挂角标**：它既可能是你拥有的、
+   * 也可能不是，Steam 那边没有依据 —— 标错比不标更糟。
+   * 它一旦跟 Steam 库对上号（填了 appid 且那款在库里），mergeSteam 会把
+   * source 改成 'steam'，那时自然就显示「已拥有」了。
+   */
+  function ownershipOf(game) {
+    if (!game) return '';
+    if (game.source === 'steam') return 'owned';
+    if (game.source === 'wishlist') return 'wish';
+    return '';
+  }
+
+  // ===== 存储层：优先 IndexedDB，失败降级 localStorage =====
+  const DB_NAME = 'gamevault';
+  const DB_VERSION = 1;
+  const STORE = 'games';
+  const LS_KEY = 'gamevault_games';
+
+  let dbPromise = null;
+
+  // IndexedDB 的 open 在某些环境（无头浏览器、隐私模式、企业策略）会
+  // 永远不回调也不报错。加超时兜底，超时后降级到 localStorage。
+  const IDB_TIMEOUT = 2500;
+
+  function withTimeout(promise, ms, tag) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('timeout: ' + tag)), ms)
+      )
+    ]);
+  }
+
+  function openDB() {
+    if (dbPromise) return dbPromise;
+    dbPromise = new Promise((resolve, reject) => {
+      if (!global.indexedDB) { reject(new Error('no indexedDB')); return; }
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) { settled = true; reject(new Error('idb open timeout')); }
+      }, IDB_TIMEOUT);
+
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(STORE)) {
+          const os = db.createObjectStore(STORE, { keyPath: 'id' });
+          os.createIndex('appid', 'appid', { unique: false });
+          os.createIndex('status', 'status', { unique: false });
+        }
+      };
+      req.onsuccess = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(req.result);
+      };
+      req.onerror = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(req.error || new Error('idb open failed'));
+      };
+      req.onblocked = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error('idb blocked'));
+      };
+    });
+    // 失败时清掉缓存的 promise，允许后续重试
+    dbPromise.catch(() => { dbPromise = null; });
+    return dbPromise;
+  }
+
+  async function idbAll() {
+    const db = await openDB();
+    return withTimeout(new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+      tx.onabort = () => reject(tx.error || new Error('idb read aborted'));
+    }), IDB_TIMEOUT, 'idbAll');
+  }
+
+  async function idbPutMany(list) {
+    const db = await openDB();
+    return withTimeout(new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      const os = tx.objectStore(STORE);
+      list.forEach(g => os.put(g));
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('idb write aborted'));
+    }), 8000, 'idbPutMany');
+  }
+
+  async function idbDelete(id) {
+    const db = await openDB();
+    return withTimeout(new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).delete(id);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('idb delete aborted'));
+    }), IDB_TIMEOUT, 'idbDelete');
+  }
+
+  // localStorage 降级
+  // 注意：localStorage 通常只有 5MB。约 400 款游戏的精简数据约 200KB，
+  // 能装下；但若用户手写大量感想可能接近上限，所以裁剪掉可从 Steam 重取的字段。
+  const LS_LIGHT_FIELDS = ['header', 'releaseDate', 'genres', 'developers', 'icon'];
+
+  function lighten(list) {
+    return list.map(g => {
+      const c = Object.assign({}, g);
+      // 只保留必要字段，图片等可从 Steam 重新同步
+      LS_LIGHT_FIELDS.forEach(k => { if (k in c) c[k] = ''; });
+      if (Array.isArray(c.genres)) c.genres = [];
+      if (Array.isArray(c.developers)) c.developers = [];
+      return c;
+    });
+  }
+
+  function lsAll() {
+    try {
+      const s = global.localStorage.getItem(LS_KEY);
+      return s ? JSON.parse(s) : [];
+    } catch (e) { return []; }
+  }
+  function lsSave(list) {
+    try {
+      global.localStorage.setItem(LS_KEY, JSON.stringify(list));
+      return true;
+    } catch (e) {
+      // 配额爆了：先尝试裁剪字段，仍然失败就放弃
+      try {
+        global.localStorage.setItem(LS_KEY, JSON.stringify(lighten(list)));
+        return true;
+      } catch (e2) {
+        console.error('localStorage 写入失败（配额不足）', e2);
+        return false;
+      }
+    }
+  }
+  let useLS = false;
+
+  // 支持用 URL 参数强制走 localStorage：
+  //   index.html?storage=local
+  // 用于排障（IndexedDB 被浏览器策略禁用时）和自动化测试。
+  try {
+    if (global.location && /[?&]storage=local\b/.test(global.location.search)) {
+      useLS = true;
+    }
+  } catch (e) { /* ignore */ }
+
+  // ===== 对外 API =====
+  const DataStore = {
+    STATUS,
+    STATUS_META,
+    VIEW_ORDER,
+    makeGame,
+    suggestStatus,
+    isPerfect,
+    ownershipOf,
+    RECENT_DAYS,
+    STALE_DAYS,
+    daysSincePlayed,
+    isStale,
+    isToolGame,
+    inCompletedCollection,
+    inHiddenCollection,
+    COLLECTION_COMPLETED,
+    COLLECTION_HIDDEN,
+    tsToDate,
+    yearOf,
+    minutesToHours,
+    parseReleaseYear,
+    uid,
+
+    /** 当前是否在用降级的 localStorage（IndexedDB 不可用时为 true） */
+    get isFallback() { return useLS; },
+
+    /** 主动探测一次存储是否可用（供 UI 显示状态） */
+    async probe() {
+      try {
+        await idbAll();
+        return 'idb';
+      } catch (e) {
+        useLS = true;
+        return 'ls';
+      }
+    },
+
+    async all() {
+      if (!useLS) {
+        try { return await idbAll(); }
+        catch (e) { useLS = true; }
+      }
+      return lsAll();
+    },
+
+    async saveMany(list) {
+      if (!useLS) {
+        try { return await idbPutMany(list); }
+        catch (e) { useLS = true; }
+      }
+      const cur = lsAll();
+      const map = new Map(cur.map(g => [g.id, g]));
+      list.forEach(g => map.set(g.id, g));
+      return lsSave(Array.from(map.values()));
+    },
+
+    async save(game) {
+      game.updatedAt = Date.now();
+      return this.saveMany([game]);
+    },
+
+    async remove(id) {
+      if (!useLS) {
+        try { return await idbDelete(id); }
+        catch (e) { useLS = true; }
+      }
+      return lsSave(lsAll().filter(g => g.id !== id));
+    },
+
+    async clear() {
+      if (!useLS) {
+        try {
+          const db = await openDB();
+          await withTimeout(new Promise((res, rej) => {
+            const tx = db.transaction(STORE, 'readwrite');
+            tx.objectStore(STORE).clear();
+            tx.oncomplete = () => res(true);
+            tx.onerror = () => rej(tx.error);
+            tx.onabort = () => rej(tx.error || new Error('clear aborted'));
+          }), IDB_TIMEOUT, 'idbClear');
+          return true;
+        } catch (e) { useLS = true; }
+      }
+      return lsSave([]);
+    },
+
+    /**
+     * 合并一捆 Steam 同步结果。
+     * 规则：
+     *  - appid 已存在 -> 更新 Steam 侧字段（时长/成就/最后游玩），保留用户侧字段（状态/备注/评价）
+     *  - appid 不存在 -> 新建
+     *  - 用户手动设过状态的，状态不被覆盖
+     *  - 「已隐藏」收藏夹里的游戏强制隐藏（优先级高于一切）
+     *  - 「完结撒花」收藏夹里的游戏自动进「已通关」
+     */
+    async mergeSteam(incoming) {
+      const existing = await this.all();
+      const byAppid = new Map();
+      existing.forEach(g => { if (g.appid != null) byAppid.set(String(g.appid), g); });
+
+      const toSave = [];
+      let added = 0, updated = 0, recollected = 0, locked = 0, abandoned = 0;
+
+      incoming.forEach(src => {
+        const key = String(src.appid);
+        const old = byAppid.get(key);
+        if (old) {
+          old.title = src.title || old.title;
+          old.icon = src.icon || old.icon;
+          old.header = src.header || old.header;
+          old.totalMinutes = src.totalMinutes ?? old.totalMinutes;
+          old.recentMinutes = src.recentMinutes ?? old.recentMinutes;
+          old.lastPlayedTs = src.lastPlayedTs || old.lastPlayedTs;
+          if (src.achievements) old.achievements = src.achievements;
+          if (src.releaseYear && !old.releaseYear) old.releaseYear = src.releaseYear;
+          if (src.releaseDate && !old.releaseDate) old.releaseDate = src.releaseDate;
+          if (src.genres && src.genres.length && !old.genres.length) old.genres = src.genres;
+          if (src.developers && src.developers.length && !old.developers.length) old.developers = src.developers;
+          // 「这条记录原先只是愿望单里的」—— 必须在下面改 source 之前记下来，
+          // 状态归类那边要靠它判断「刚刚买下、还没玩过」。
+          const wasWishlistOnly = old.source === 'wishlist';
+          old.source = 'steam';
+          // 收藏夹：每次同步都覆盖（用户可能在 Steam 里改了分类）
+          if (Array.isArray(src.collections)) old.collections = src.collections;
+          old.updatedAt = Date.now();
+
+          // ===== 状态归类 =====
+          // 优先级（高 -> 低）：
+          //   1. 锁定（statusLocked）        -> 一律不动
+          //   2. 放弃区（abandoned）         -> 手动终态，一律不动
+          //   3. 已通关（收藏夹 / 全成就）   -> 归档终态，不受日期影响
+          //   4. 手动改状态晚于上次启动      -> 尊重手动结果
+          //   5. 启动日期（90 天阈值）       -> 正在游玩 / 已暂停
+          //   6. 从未启动                    -> 停在总库
+          if (old.statusLocked) {
+            // 锁定的游戏：状态一动不动，连「已通关」也不重算
+            locked++;
+          } else if (old.status === STATUS.ABANDONED) {
+            // 「放弃」是手动终态，和锁定同级：
+            // 「不打算再玩了」只有用户能判断，所以同步时一律不动 ——
+            // 包括不被「完结撒花」收藏夹 / 全成就拉回「已通关」，
+            // 也不因为"后来又启动了一次"被日期规则挪去「正在游玩」。
+            // 想让它回到别的状态，手动改一下即可（改完就不再是 abandoned）。
+            old.autoStatus = false;
+            abandoned++;
+          } else {
+            const wasCompleted = old.status === STATUS.COMPLETED;
+            const shouldCompleted = inCompletedCollection(old) ||
+                                    isPerfect(old);   // 收藏夹 或 全成就
+            const completedDismissed = shouldCompleted && !wasCompleted &&
+                                       old.dismissedCollection &&
+                                       !inCompletedCollection(old);
+            // 手动改状态是否晚于上次启动？（手动后没再启动过 -> 保留手动结果）
+            const manualWins = !!old.manualStatus &&
+                               (old.statusManualAt || 0) > (old.lastPlayedTs || 0);
+
+            if (manualWins) {
+              // 手动优先：状态保持不动
+              old.autoStatus = false;
+            } else if (shouldCompleted && !wasCompleted && !completedDismissed) {
+              // 被收藏夹/全成就拉回「已通关」
+              old.status = STATUS.COMPLETED;
+              old.autoStatus = false;
+              recollected++;
+            } else if (wasCompleted && !shouldCompleted && !old.dismissedCollection) {
+              // 曾经通关但已不在收藏夹、也丢了全成就 -> 交给自动规则
+              const s = suggestStatus(old);
+              old.status = s;
+              old.autoStatus = (s === STATUS.PLAYING || s === STATUS.PAUSED);
+            } else if (wasCompleted) {
+              // 已通关是归档终态，不动
+              old.autoStatus = false;
+            } else {
+              // 刚好从愿望单买下、而且一次都还没启动过 -> **留在「待游玩」**。
+              // 「买了」不等于「开始玩了」：让它在待玩清单里等你亲自开，
+              // 而不是悄无声息掉进总库 —— 用户的预期是「我刚买的那个应该
+              // 还躺在我待玩列表里」。一旦真的启动过（lastPlayedTs 有值），
+              // 这条分支就不成立，会走下面的正常分流。
+              if (wasWishlistOnly && old.status === STATUS.BACKLOG && !old.lastPlayedTs) {
+                old.status = STATUS.BACKLOG;
+                old.autoStatus = false;
+              } else {
+                // 普通游戏：按启动日期自动分流
+                const s = suggestStatus(old);
+                old.status = s;
+                old.autoStatus = (s === STATUS.PLAYING || s === STATUS.PAUSED);
+              }
+            }
+          }
+
+          // 隐藏：工具/软件 or「已隐藏」收藏夹
+          if (!old.manualHidden) {
+            old.hidden = inHiddenCollection(old) || isToolGame(old);
+          } else if (inHiddenCollection(old)) {
+            old.hidden = true;   // 「已隐藏」收藏夹优先级最高，覆盖手动取消隐藏
+          }
+          toSave.push(old);
+          updated++;
+        } else {
+          const g = makeGame(Object.assign({}, src, {
+            status: src.suggestedStatus || suggestStatus(src),
+            source: 'steam'
+          }));
+          delete g.suggestedStatus;   // 内部字段，不入库
+          if (!Array.isArray(g.collections)) g.collections = [];
+          // 标记这条状态是不是自动规则产生的（供 UI 打「自动」角标）
+          g.autoStatus = (g.status === STATUS.PLAYING || g.status === STATUS.PAUSED);
+          g.hidden = inHiddenCollection(g) || isToolGame(g);
+          toSave.push(g);
+          added++;
+        }
+      });
+
+      await this.saveMany(toSave);
+      return { added, updated, recollected, locked, abandoned };
+    },
+
+    /**
+     * 合并一次 Steam 愿望单抓取结果（「愿望单 -> 待游玩」那一步）。
+     *
+     * :param items  [{appid, priority, addedTs}, …]，服务端 /api/steam/wishlist
+     *               原样给的数组。
+     *
+     * ## 新建的记录长什么样
+     *
+     * status = backlog（→ 出现在「待游玩」），source = 'wishlist'
+     * （→ 「我的游戏单」里挂「未入库」角标）。appid 已经有，但 title/封面是空的
+     * —— 愿望单接口不给名字，得靠 store 补全那条路填（见 cloud.js syncWishlist）。
+     *
+     * ## 已经在库里 / 已手动添加过的怎么办
+     *
+     * **只补愿望单身份，绝不碰状态。** 一款游戏可能既在库里又在愿望单里
+     * （手动添加的、或者 Steam 还没把它移出去的），那种情况下它已经是
+     * 「已拥有」，不能被愿望单这边拉回「待游玩」。
+     *
+     * ## 🔴 调用方必须保证的前提
+     *
+     * **只有「成功拿到一份非空列表」时才准调它。** 这个函数会做删除：
+     * 本地有、这次返回里没有 → 判定「你从愿望单移除了它」。而
+     *   · 接口失败（None）      → 前端根本不该走到这里
+     *   · 空列表（未公开/为空）  → 前端也不该走到这里
+     * 否则一次链路抖动、或者用户把愿望单隐私改成「仅好友」，
+     * 就会把几百款记录一次清空。守卫写在 cloud.js syncWishlist 里。
+     *
+     * ## 删除的条件（很严格，故意的）
+     *
+     * 只有「愿望单来源 + 仍是待游玩 + 用户一次都没动过」才删 —— 改过状态、
+     * 锁过、写过感想、收藏过、隐藏过的，一律只摘掉 wishlisted 标记、记录留着。
+     * 用户既然花力气动过它，就从「愿望单的投影」变成了他自己的东西。
+     *
+     * 返回 { added, updated, removed, kept }
+     */
+    async mergeWishlist(items) {
+      const list = Array.isArray(items) ? items : [];
+      const existing = await this.all();
+      const byAppid = new Map();
+      existing.forEach(g => { if (g.appid != null) byAppid.set(String(g.appid), g); });
+
+      const toSave = [];
+      const toRemove = [];
+      const seen = new Set();
+      let added = 0, updated = 0, removed = 0, kept = 0;
+
+      list.forEach(it => {
+        const appid = it && it.appid;
+        if (!appid) return;
+        const key = String(appid);
+        if (seen.has(key)) return;      // 接口理论上不会给重复，防御一下
+        seen.add(key);
+
+        const pri = it.priority || 0;
+        const addedTs = it.addedTs || 0;
+        const old = byAppid.get(key);
+
+        if (old) {
+          if (old.wishlisted && old.wishPriority === pri && old.wishAddedTs === addedTs) {
+            return;                     // 没有任何变化，别白写一次
+          }
+          old.wishlisted = true;
+          old.wishPriority = pri;
+          old.wishAddedTs = addedTs;
+          old.updatedAt = Date.now();
+          toSave.push(old);
+          updated++;
+          return;
+        }
+
+        toSave.push(makeGame({
+          appid: Number(appid),
+          title: '',                    // 空着 —— 名字由商店补全那条路填，绝不编 "App 123"
+          status: STATUS.BACKLOG,
+          source: 'wishlist',
+          wishlisted: true,
+          wishPriority: pri,
+          wishAddedTs: addedTs
+        }));
+        added++;
+      });
+
+      // ===== 已经不在愿望单里的 =====
+      existing.forEach(g => {
+        if (g.source !== 'wishlist') return;    // 不是愿望单来源，与它无关
+        if (g.appid == null) return;
+        if (seen.has(String(g.appid))) return;  // 还在愿望单里
+        if (!g.wishlisted) return;              // 上轮已经处理过，别重复计数
+
+        const touched = g.statusManualAt || g.statusLocked || g.myNote ||
+                        g.favorite || g.hidden || g.status !== STATUS.BACKLOG;
+        if (touched) {
+          g.wishlisted = false;                 // 摘掉身份，记录留着
+          g.updatedAt = Date.now();
+          toSave.push(g);
+          kept++;
+          return;
+        }
+        toRemove.push(g.id);
+        removed++;
+      });
+
+      if (toSave.length) await this.saveMany(toSave);
+      for (const id of toRemove) await this.remove(id);
+      return { added, updated, removed, kept };
+    }
+  };
+
+  global.DataStore = DataStore;
+})(window);

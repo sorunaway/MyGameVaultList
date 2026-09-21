@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#171a21">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="游戏生涯">
+<meta name="format-detection" content="telephone=no">
+<title>我的游戏生涯</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="assets/icon.svg">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- ===== 顶栏 ===== -->
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">◈</span>
+    <div class="brand-text">
+      <h1>我的游戏生涯</h1>
+      <p id="brandSub">游戏历程 · 进度 · 待玩计划</p>
+    </div>
+  </div>
+
+  <div class="topbar-actions">
+    <div class="searchbox">
+      <svg viewBox="0 0 24 24" class="ico"><path d="M21 21l-4.35-4.35M17 10.5A6.5 6.5 0 1 1 4 10.5a6.5 6.5 0 0 1 13 0z"/></svg>
+      <input id="searchInput" type="text" placeholder="搜索游戏…">
+    </div>
+    <button class="btn btn-ghost" id="btnAdd" title="手动添加游戏">
+      <svg viewBox="0 0 24 24" class="ico"><path d="M12 5v14M5 12h14"/></svg>
+      添加
+    </button>
+    <button class="btn btn-ghost" id="btnSync" title="从 Steam 同步">
+      <svg viewBox="0 0 24 24" class="ico"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"/></svg>
+      同步
+    </button>
+    <!-- 消息记录：同步、绑定这些操作的提示条一闪就没了，这里留个回看入口。
+         有未读消息时按钮上会挂一个红色角标（由 js/msglog.js 渲染）。 -->
+    <button class="btn btn-ghost" id="btnMsg" title="消息记录">
+      <svg viewBox="0 0 24 24" class="ico"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+      消息
+    </button>
+    <button class="btn btn-ghost" id="btnMenu" title="更多">
+      <svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
+    </button>
+  </div>
+</header>
+
+<!-- ===== 统计条 ===== -->
+<section class="statsbar" id="statsBar"></section>
+
+<!-- ===== 主体 ===== -->
+<main class="layout">
+
+  <!-- 侧栏：区块导航 -->
+  <aside class="sidebar">
+    <nav id="viewNav" class="viewnav"></nav>
+
+    <div class="sidebar-foot">
+      <div class="legend" id="legend"></div>
+    </div>
+  </aside>
+
+  <!-- 内容区 -->
+  <section class="content">
+    <div class="viewhead">
+      <div class="viewhead-left">
+        <h2 id="viewTitle">正在游玩</h2>
+        <span class="viewcount" id="viewCount"></span>
+        <!-- 总库的三个过滤开关收进这里的一个按钮（只在「我的游戏」出现）。
+             以前它们是塞在侧栏导航条里的 —— 桌面竖排没问题，但手机端侧栏
+             变成横滑条后会被排到整条最右端，实测要横滑 800+px 才够得着。
+             点开后选项展开在标题下方（见 #filterPanel）。 -->
+        <button class="filterbtn" id="filterBtn" hidden aria-expanded="false"
+                title="按条件从总库里隐藏一批游戏">
+          <svg viewBox="0 0 24 24" class="ico"><path d="M3 6h18M7 12h10M10 18h4"/></svg>
+          筛选<span class="filterbadge" id="filterBadge" hidden></span>
+          <svg viewBox="0 0 24 24" class="ico fchev"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+      </div>
+      <div class="viewhead-right">
+        <button class="ghosttoggle" id="groupPerfectBtn" hidden
+                title="按是否全成就分成两段显示">分组：全成就</button>
+        <button class="ghosttoggle" id="selectModeBtn" hidden
+                title="进入批量选择，一次把多款游戏移入放弃区">批量选择</button>
+        <div class="segmented" id="sortSeg">
+          <button data-sort="lastPlayed" class="on">最近游玩</button>
+          <button data-sort="playtime">游玩时长</button>
+          <button data-sort="achievement">成就进度</button>
+          <button data-sort="title">名称</button>
+          <button data-sort="release">发售年份</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 筛选选项：点「筛选」按钮才展开，收起时不占高度 -->
+    <div class="filterpanel" id="filterPanel" hidden></div>
+
+    <div class="selbar" id="selbar" hidden>
+      <span class="selbar-count" id="selbarCount"></span>
+      <span class="selbar-hint">点卡片选中 · 再点一次取消</span>
+      <div class="selbar-actions">
+        <button class="btn btn-ghost" id="selAllBtn">全选</button>
+        <button class="btn btn-drop" id="selDropBtn">标为放弃</button>
+        <button class="btn btn-ghost" id="selExitBtn">退出</button>
+      </div>
+    </div>
+
+    <div id="grid" class="grid"></div>
+
+    <div id="emptyState" class="empty" hidden>
+      <div class="empty-mark">◈</div>
+      <h3>这里还空着</h3>
+      <p id="emptyHint"></p>
+    </div>
+  </section>
+</main>
+
+<!-- ===== 详情抽屉 ===== -->
+<div class="drawer-mask" id="drawerMask" hidden></div>
+<aside class="drawer" id="drawer" hidden>
+  <button class="drawer-close" id="drawerClose" aria-label="关闭">
+    <svg viewBox="0 0 24 24" class="ico"><path d="M18 6L6 18M6 6l12 12"/></svg>
+  </button>
+  <div id="drawerBody"></div>
+</aside>
+
+<!-- ===== 手动添加弹窗 ===== -->
+<div class="modal-mask" id="modalMask" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h3>手动添加游戏</h3>
+      <button id="modalClose" class="iconbtn" aria-label="关闭">
+        <svg viewBox="0 0 24 24" class="ico"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <label class="field">
+        <span>游戏名称 <b>*</b></span>
+        <input id="mTitle" type="text" placeholder="例如：只狼：影逝二度">
+      </label>
+      <label class="field">
+        <span>Steam AppID <em>（可选，填了能自动抓图标）</em></span>
+        <input id="mAppid" type="text" placeholder="例如：814380" inputmode="numeric">
+      </label>
+      <label class="field">
+        <span>初始状态</span>
+        <select id="mStatus"></select>
+      </label>
+      <label class="field">
+        <span>备注 / 想玩的理由</span>
+        <textarea id="mNote" rows="3" placeholder="为什么想玩？期待什么？"></textarea>
+      </label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="modalCancel">取消</button>
+      <button class="btn btn-primary" id="modalSave">添加</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 自己手写的评价输入弹窗 ===== -->
+<div class="modal-mask" id="noteMask" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h3>编辑我的记录</h3>
+      <button id="noteClose" class="iconbtn" aria-label="关闭">
+        <svg viewBox="0 0 24 24" class="ico"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div id="noteGameName" class="notegame"></div>
+      <label class="field">
+        <span>我的游玩感想</span>
+        <textarea id="noteText" rows="6" placeholder="打到哪了？喜欢什么？哪里劝退？以后还玩吗？"></textarea>
+      </label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="noteCancel">取消</button>
+      <button class="btn btn-primary" id="noteSave">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 同步面板 ===== -->
+<div class="modal-mask" id="syncMask" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h3>Steam 同步</h3>
+      <button id="syncClose" class="iconbtn" aria-label="关闭">
+        <svg viewBox="0 0 24 24" class="ico"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="sync-status" id="syncStatus"></div>
+      <label class="field">
+        <span>游戏库数据文件 <em>（由 scripts/sync 生成）</em></span>
+        <input id="syncFile" type="file" accept=".json">
+      </label>
+      <p class="hint">
+        在项目目录运行 <code>python scripts/sync.py</code>，会生成
+        <code>data/steam_sync.json</code>，然后在这里选它载入。
+      </p>
+      <div class="sync-diff" id="syncDiff"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="syncCancel">关闭</button>
+      <button class="btn btn-primary" id="syncApply" disabled>应用同步</button>
+    </div>
+  </div>
+</div>
+
+<footer class="foot">
+  <span id="footInfo"></span>
+  <button class="footlink" id="btnExport" type="button"
+          title="导出为 JSON 文件，可用于备份或迁移到云端版">导出备份</button>
+</footer>
+
+<script src="js/msglog.js"></script>
+<script src="js/store.js"></script>
+<!-- js/seed-data.js 有意不在这里静态引入 —— 它由 scripts/build-embed.py 从
+     「你自己的游戏库」内联生成，属于个人数据，不随仓库分发。js/seed.js 会按需
+     动态加载它：有就用，没有就静默跳过（新克隆的仓库不会因此报 404）。 -->
+<script src="js/seed.js"></script>
+<script src="js/ui.js"></script>
+<!-- 云服务 SDK：自托管在 vendor/ 下（原因与升级步骤见 vendor/README.md）
+     ⚠️ 不要改回 CDN 链接。cdn.jsdelivr.net 在国内链路实测时通时不通，
+        而它挂掉的后果是「整个云端功能不可用」（登录都进不去），不是少个功能；
+        另外 @dev 是滚动标签，等于让平台方直接往生产环境推代码。 -->
+<script src="vendor/index.global.js"></script>
+<script src="js/cloud-config.js"></script>
+<script src="js/cloud.js"></script>
+</body>
+</html>
