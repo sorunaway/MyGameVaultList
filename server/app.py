@@ -950,15 +950,30 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, body, ctype)
 
 
-def main():
-    port = config.PORT
-    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+def build_server(host="0.0.0.0", port=None):
+    """
+    建一个 HTTP 服务实例（**只建不启动**）。
+
+    云端 `main()` 和桌面版启动器（`desktop/main.py`）都走这里，避免两处各写一份绑定逻辑。
+
+    · `port=None` → 用 `config.PORT`；**`port=0` → 让系统分配一个空闲端口**
+      （桌面版要的就是这个：不跟别的程序抢 3000）。
+      真实端口请读返回对象的 `server_address[1]`。
+    · `host="127.0.0.1"` 是桌面版必须的 —— 只监听回环，局域网内别的机器连不上。
+    """
+    server = ThreadingHTTPServer((host, config.PORT if port is None else port), Handler)
     server.daemon_threads = True
+    return server
+
+
+def main():
+    server = build_server("0.0.0.0")
     log("=" * 52)
     log("我的游戏生涯 服务端 v%s" % VERSION)
-    log("监听 0.0.0.0:%d" % port)
+    log("监听 %s:%d" % server.server_address[:2])
     log("Steam API Key：%s" % ("已配置" if config.STEAM_API_KEY else "【缺失】"))
     log("静态目录：%s" % config.WEB_DIR)
+    log("本机模式：%s" % ("开（桌面版）" if config.DESKTOP_MODE else "关"))
     log("=" * 52)
     try:
         server.serve_forever()

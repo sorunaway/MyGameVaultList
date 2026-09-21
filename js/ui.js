@@ -1451,7 +1451,19 @@
       forceLocal = /[?&]local=1\b/.test(location.search) ||
                    location.protocol === 'file:';
     } catch (e) { /* ignore */ }
-    const cloudMode = !!(window.Cloud && window.Cloud.enabled && !forceLocal);
+
+    // ---- 桌面版探测（问卷，别猜）----
+    // 只有桌面版启动器设了 GV_DESKTOP=1，也只有那时 /api/local/status 才存在。
+    // 探测失败一律当「不是桌面版」——线上/双击打开时探测本来就会失败，这是正常路径。
+    let desktop = null;
+    if (window.GVLocal) {
+      try { desktop = await window.GVLocal.probe(); } catch (e) { desktop = null; }
+    }
+    const desktopMode = !!desktop;
+
+    // 桌面版**也**不走云模式：它要的是「离线 + 本机数据」，
+    // 云登录在桌面版里既没必要（数据就在本机），也走不通（OpenID 回调要注册过的 HTTPS 域）。
+    const cloudMode = !!(window.Cloud && window.Cloud.enabled && !forceLocal && !desktopMode);
 
     // ---- URL 参数先解析进 state ----
     // 必须放在「云端登录」之前：登录界面期间 state 已经就位，
@@ -1493,7 +1505,31 @@
       render();
     };
 
-    if (!cloudMode && window.__seedIfEmpty) {
+    if (desktopMode) {
+      // 桌面版：数据来自本机 Steam 文件（/api/local/library）。
+      // 不灌 seed-data.js —— 那是给双击 index.html 用的**个人库快照**，
+      // 桌面版要的是「这台机器上真实的库」，灌种子反而会用别人的数据盖住自己的。
+      let r = null;
+      try { r = await window.GVLocal.sync(); } catch (e) { console.error('本机数据读取失败', e); }
+      if (!r || !r.ok) {
+        const why = {
+          steam_not_found: '没找到 Steam 安装目录 —— 请确认这台机器装过 Steam',
+          no_account: '读不到已登录的 Steam 账号 —— 请先登录一次 Steam',
+          fetch_failed: '读本机数据失败（本机服务没有响应）',
+          no_datastore: '本地存储没准备好'
+        }[r && r.reason] || '读取本机 Steam 数据失败';
+        note(why, 'err');
+      } else {
+        const st = r.stats || {};
+        console.log('[桌面版] 本机库 %d 款（已安装 %d / 有名字 %d / 有封面 %d / 有时长 %d）',
+                    st.total || 0, st.installed || 0, st.named || 0,
+                    st.withCover || 0, st.played || 0);
+        if (st.total) {
+          note('已读取本机 Steam：' + st.total + ' 款' +
+               (r.added ? '（新增 ' + r.added + ' 款）' : ''), 'ok');
+        }
+      }
+    } else if (!cloudMode && window.__seedIfEmpty) {
       // 本地模式（直接双击 index.html）：空库时用内置数据灌一次
       try { await window.__seedIfEmpty(); } catch (e) { console.warn('seed failed', e); }
     }

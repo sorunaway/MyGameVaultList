@@ -33,6 +33,9 @@
 !vendor/
 !server/
 !scripts/
+!desktop/
+# 说明：desktop/ 里只有启动器源码（desktop/main.py），不含任何个人数据。
+# 它是**桌面版**的入口，线上部署用不到，所以不进 pack_deploy.py 的白名单。
 
 # ---- 放行目录内部再单独挡掉 ----
 # 个人游戏库（本地双击版的初始数据）。仓库里不含它；

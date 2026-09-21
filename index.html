@@ -274,6 +274,9 @@
      「你自己的游戏库」内联生成，属于个人数据，不随仓库分发。js/seed.js 会按需
      动态加载它：有就用，没有就静默跳过（新克隆的仓库不会因此报 404）。 -->
 <script src="js/seed.js"></script>
+<!-- 本机数据源（Windows 桌面版）：把 /api/local/* 接进 DataStore。
+     在线上/双击打开时它探测不到本机服务，会静默回落，不影响别的模式。 -->
+<script src="js/local-src.js"></script>
 <script src="js/ui.js"></script>
 <!-- 云服务 SDK：自托管在 vendor/ 下（原因与升级步骤见 vendor/README.md）
      ⚠️ 不要改回 CDN 链接。cdn.jsdelivr.net 在国内链路实测时通时不通，

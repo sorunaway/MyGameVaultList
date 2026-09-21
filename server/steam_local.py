@@ -7,6 +7,8 @@ Steam 本地文件读取 —— **Windows 桌面版专用**。
     · 库文件夹列表（可多盘）
     · 已安装游戏的名字/体积（`appmanifest_*.acf`）
     · **总时长 / 近两周时长 / 最后启动时间**（`localconfig.vdf`）—— 原本要调 API 才有
+    · **收藏夹名与成员**（`cloudstorage/cloud-storage-namespace-1.json`）——
+      「已通关 / 已隐藏」这两条归类规则的依据，**离线也能拿到**
     · 封面图（`appcache/librarycache/<appid>/`）
 
 🔴 **这些全部是本机个人数据。**
@@ -15,10 +17,13 @@ Steam 本地文件读取 —— **Windows 桌面版专用**。
    改这里之前先读 `.workbuddy/memory/DESIGN.md` 的「Steam 本地文件」一节。
 
 ⚠️ **覆盖率有上限**：`localconfig.vdf` 只对**本机玩过/装过**的 app 写记录。
-   实测：云端库约 400 款，本机记录约 300 条、两边交集约两百款。
+   收藏夹能补回一部分 —— 收藏夹里那些「没装、也没在本机玩过」的款（换机 / 云游戏 /
+   早年别的机器上玩过的）。实测（2026-09-21）：云端库**约 400**款，
+   本地记录约 300 条（安装 ∪ 时长记录，外加靠收藏夹补回的一小批）；两边交集约两百款。
    **这不是"零凭证拿全库"** —— 剩下那部分只能靠 API（需要用户自己的 key）。
 """
 
+import json
 import os
 
 # SteamID64 与账号 ID（SteamID3）的固定偏移
@@ -342,18 +347,124 @@ def cover_kind(steam_dir, appid):
 
 
 # ============================================================
+# 收藏夹（collection）
+# ============================================================
+# 🔑 收藏夹**不在** localconfig.vdf 里（那里只有一个空的 `"user-collections"  "{}"`），
+#    而是在**云存储的本地镜像**里：
+#      userdata/<accountId>/config/cloudstorage/cloud-storage-namespace-1.json
+#
+#    这份文件的形状（2026-09-21 实测，猜错两次才对）：
+#      顶层 = list，每一项是 `[key, record]` 两元组；
+#      `record = {key, version, timestamp, value, is_deleted?, conflictResolutionMethod?}`
+#      收藏夹的正文在 `record["value"]` 里：`{id, name, added:[appid…], removed:[appid…]}`
+#      → **成员 = added − removed**（都是 int）。
+#
+#    🔴 两个必须处理的坑：
+#      ① `is_deleted: true` 的记录**要整个跳过** —— 否则被删掉的收藏夹会带着**过期成员表**
+#         继续参与归类（实测本机就有 4 个这样的）。
+#      ② 键名前缀有三种：`user-collections.<匿名id>`、`user-collections.from-tag-<标签名>`、
+#         以及 Steam 内置的 `user-collections.hidden`（= 界面上那个「已隐藏」）。
+#         **不能用键名推名字**，名字一律取 `value.name`（只有取不到时才退化成键名尾巴）。
+CLOUD_STORAGE_REL = ("config", "cloudstorage", "cloud-storage-namespace-1.json")
+
+
+def _int_list(v):
+    """把 added/removed 这类数组里的元素抽成 int 集合（容忍字符串数字与脏值）。"""
+    out = set()
+    if not isinstance(v, list):
+        return out
+    for x in v:
+        try:
+            n = int(x)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            out.add(n)
+    return out
+
+
+def read_collections(steam_dir=None, account_id=None):
+    """
+    读本机 Steam 的收藏夹 → `{appid: [收藏夹名…]}`。
+
+    返回 `(by_appid, names)`：
+        by_appid —— `{appid(int): [收藏夹名(str)…]}`（名字按字典序，保证输出稳定）
+        names    —— `{收藏夹名(str): 成员数(int)}`
+
+    读不到（没装 Steam / 没这个账号 / 文件不存在 / 解析失败）一律返回空表，
+    **不抛异常** —— 桌面版没有收藏夹也要能正常显示库。
+    """
+    steam_dir = steam_dir or find_steam()
+    if not steam_dir or not account_id:
+        return {}, {}
+
+    path = os.path.join(steam_dir, "userdata", str(account_id), *CLOUD_STORAGE_REL)
+    if not os.path.isfile(path):
+        return {}, {}
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception:
+        return {}, {}
+
+    # 顶层是 list（实测）。也容忍 dict 形态 —— 这份文件由 Steam 维护，
+    # 万一以后换成 `{key: record}` 的写法，这里不至于整块失效。
+    items = data if isinstance(data, list) else list(data.items()) if isinstance(data, dict) else []
+
+    by_appid, names = {}, {}
+    for it in items:
+        if not (isinstance(it, (list, tuple)) and len(it) >= 2 and isinstance(it[0], str)):
+            continue
+        key, rec = it[0], it[1]
+        if not key.startswith("user-collections."):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        # ① 删掉的收藏夹必须跳过（带着过期成员表）
+        if rec.get("is_deleted"):
+            continue
+        inner = rec.get("value")
+        if isinstance(inner, str):
+            try:
+                inner = json.loads(inner)
+            except Exception:
+                continue
+        if not isinstance(inner, dict):
+            continue
+
+        # ② 名字只认 value.name；取不到才退化成键名尾巴
+        name = inner.get("name")
+        name = name.strip() if isinstance(name, str) else ""
+        if not name:
+            name = key.split("user-collections.", 1)[1] or key
+
+        members = _int_list(inner.get("added")) - _int_list(inner.get("removed"))
+        if not members:
+            names[name] = 0
+            continue
+        names[name] = len(members)
+        for appid in members:
+            by_appid.setdefault(appid, []).append(name)
+
+    for appid in by_appid:
+        by_appid[appid].sort()
+    return by_appid, names
+
+
+# ============================================================
 # 汇总出口
 # ============================================================
 def read_library(steam_id=None, with_covers=True):
     """
-    桌面版的主出口：一次性给出「当前账号 + 本地库 + 时长」。
+    桌面版的主出口：一次性给出「当前账号 + 本地库 + 时长 + 收藏夹」。
 
     返回形状（前端直接用）：
         { ok, steamDir, account:{steamId,personaName,accountName,lastLoginTs,autoLogin},
           accounts:[…], libraries:[…],
           games:[{appid,title,totalMinutes,recent2wMinutes,lastPlayedTs,
-                  installed,sizeOnDisk,cover,coverKind}],
-          stats:{total,installed,named,withCover,played} }
+                  installed,sizeOnDisk,cover,coverKind,collections}],
+          stats:{total,installed,named,withCover,played,fromCollections,
+                 collections:{名字:成员数}} }
 
     `ok=False` 时带 `reason`：`steam_not_found` / `no_account`。
     """
@@ -379,8 +490,13 @@ def read_library(steam_id=None, with_covers=True):
     libraries = read_libraries(steam_dir)
     installed = read_installed(steam_dir, libraries)
     played = read_local_apps(steam_dir, account_id)
+    coll_by_appid, coll_names = read_collections(steam_dir, account_id)
 
-    appids = set(installed) | set(played)
+    # 🔴 appid 来源是**三份之并**：已安装 ∪ 有时长记录 ∪ 在某个收藏夹里。
+    #    第三份不能省：收藏夹里会有「没装也没本机玩过」的款（换机、云游戏、
+    #    或者早年在别的机器上玩过的），它们拿不到时长，但**归类的依据（收藏夹）
+    #    是有的** —— 少算了它们，「已通关 / 已隐藏」这两条规则就会漏。
+    appids = set(installed) | set(played) | set(coll_by_appid)
     games = []
     for appid in sorted(appids):
         inst = installed.get(appid) or {}
@@ -390,7 +506,8 @@ def read_library(steam_id=None, with_covers=True):
             "appid": appid,
             # 名字只有「已安装」的款有；其余靠商店接口补（UI 会退化成 "App <appid>" 占位）
             "title": inst.get("title") or "",
-            "totalMinutes": inst.get("lastPlayedTs") and loc.get("totalMinutes") or loc.get("totalMinutes", 0),
+            # localconfig.vdf 的 Playtime 是唯一的时长来源（分钟，等价 playtime_forever）
+            "totalMinutes": loc.get("totalMinutes", 0),
             "recent2wMinutes": loc.get("recent2wMinutes", 0),
             # 两处都有 LastPlayed 时取较新的那个
             "lastPlayedTs": max(loc.get("lastPlayedTs", 0), inst.get("lastPlayedTs", 0)),
@@ -398,6 +515,8 @@ def read_library(steam_id=None, with_covers=True):
             "sizeOnDisk": inst.get("sizeOnDisk", 0),
             "cover": ("/api/local/cover?appid=%d" % appid) if k else None,
             "coverKind": k,
+            # 收藏夹名列表 —— 前端拿它做「已通关 / 已隐藏」归类（名字哪个代表什么由用户在设置里定）
+            "collections": coll_by_appid.get(appid, []),
         })
 
     return {
@@ -413,5 +532,10 @@ def read_library(steam_id=None, with_covers=True):
             "named": sum(1 for g in games if g["title"]),
             "withCover": sum(1 for g in games if g["cover"]),
             "played": sum(1 for g in games if g["totalMinutes"] > 0),
+            "fromCollections": sum(1 for g in games
+                                   if g["appid"] in coll_by_appid
+                                   and g["appid"] not in installed
+                                   and g["appid"] not in played),
+            "collections": coll_names,
         },
     }
