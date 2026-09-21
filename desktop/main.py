@@ -13,29 +13,51 @@
 桌面版把数据源换成 `/api/local/*` 就行，改动量远小于重写前端。
 而且这个回环服务**本来就存在**，只是原来只跑在部署环境里。
 
-## 🔴 两个安全约定
+## 🔴 三条不能动的约定
 
-1. **只绑 `127.0.0.1`，端口交给系统分配（`port=0`）** —— 不监听 `0.0.0.0`，
-   局域网内别的机器连不上；端口随机，也不会跟别的程序抢 3000。
-2. `GV_DESKTOP=1` 才会注册 `/api/local/*`（读本机 Steam 的个人数据）。
+1. **只绑 `127.0.0.1`** —— 不监听 `0.0.0.0`，局域网内别的机器连不上。
+2. **端口固定**（`DEFAULT_PORT`），**不是随机**。
+3. `GV_DESKTOP=1` 才会注册 `/api/local/*`（读本机 Steam 的个人数据）。
    本文件是**唯一**该设这个变量的地方；线上部署永不设 → 那些路由根本不存在。
 
-## 用法
+## 🔴🔴 为什么端口必须固定（别改回 `port=0`）
 
-    python desktop/main.py            正常启动（开窗口）
-    python desktop/main.py --serve    只起服务、打印地址，不开窗（排错 / 自动化验收）
-    python desktop/main.py --browser  用系统默认浏览器打开（没装 pywebview 时的降级）
-    python desktop/main.py --port=8080  指定端口（默认 0 = 系统分配）
+浏览器存储（localStorage / IndexedDB）是按**源**隔离的，而**源里含端口**：
+
+    http://127.0.0.1:11699   ← 一个源
+    http://127.0.0.1:11700   ← 另一个源，看不到上面那个源的数据
+
+原来用 `port=0`（系统分配空闲端口）时，**每次启动端口都不同 → 每次都换源**，
+于是游戏库、状态归类、感想、偏好、消息历史**全部在重启后消失**。
+实测（`_probe_origin.py`，同一个 Chrome profile）：连起两次得到 11699 / 11700；
+在 `:11701` 写入 `written@11701`，到 `:11730` 读回 `None`。
+
+所以：**固定端口 = 固定源 = 数据能留住**。
+代价是「可能撞端口」，用下面两条兜住：
+  · 撞上的是**我们自己的另一个实例** → 直接连上去（单实例，不再起第二个服务）；
+  · 撞上的是**别的程序** → 明确报错并给换端口指引（不偷偷换端口，那等于偷偷清空用户数据）。
+
+    python desktop/main.py                正常启动（开窗口，用默认固定端口）
+    python desktop/main.py --serve        只起服务、打印地址，不开窗（排错 / 自动化验收）
+    python desktop/main.py --browser      用系统默认浏览器打开（没装 pywebview 时的降级）
+    python desktop/main.py --port=8080    指定端口
+                                          ⚠️ 换端口 = 换源 = 之前存在浏览器里的数据看不见了
+    python desktop/main.py --port=0       随机端口：**只给自动化测试隔离用**，不要给用户用
 """
 
+import json
 import os
 import sys
 import threading
 import time
+import urllib.request
 import webbrowser
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "server"))
+
+# 🔴 固定端口（见文件头「为什么端口必须固定」）。选一个大号高位端口，避开常见服务。
+DEFAULT_PORT = 47615
 
 # 🔴 顺序要紧：config.DESKTOP_MODE 是**导入期**读的环境变量，
 #    这行必须在下面 import app（进而 import config）之前。
@@ -47,13 +69,43 @@ import steam_local                # noqa: E402
 WINDOW_TITLE = "我的游戏生涯"
 
 
-def start_server(host="127.0.0.1", port=0):
-    """起一个回环服务线程，返回 (server, url)。server 用来读真实端口、退出时关掉。"""
+def is_our_service(port, timeout=1.5):
+    """端口上跑的是不是**我们自己**的一个实例？
+
+    判据是 `/api/local/status` 回 `desktop: true` —— 只有设了 `GV_DESKTOP=1`
+    的进程才注册那个路由，所以别的程序不可能冒充。
+    """
+    try:
+        with urllib.request.urlopen(
+                "http://127.0.0.1:%d/api/local/status" % port, timeout=timeout) as r:
+            return bool(json.loads(r.read().decode("utf-8")).get("desktop"))
+    except Exception:
+        return False
+
+
+def start_link(host="127.0.0.1", port=DEFAULT_PORT):
+    """起回环服务；端口已被**自己**占着就改连上去。
+
+    返回 `(server, url, attached)`：
+      · `attached=False` → `server` 是本进程新起的服务（退出时要关）。
+      · `attached=True`  → 端口上已有我们的实例，`server` 为 None，直接用它。
+
+    端口被**别的程序**占用时抛 `OSError`，由调用方给用户明确指引 ——
+    绝不静默换端口（那会让用户以为"数据没了"）。
+
+    🔴 **必须先探再绑，不能靠「bind 失败」来发现重复实例**：
+    Windows 的 `SO_REUSEADDR` 语义与 Unix 不同 —— 它允许绑定别人已占用的端口。
+    实测：第一个实例在 47615 上服务时，第二个实例 `bind(47615)` **照样成功**，
+    于是「撞端口」永远不会抛错，两个服务一起抢同一个端口的连接
+    （回归断言 `L3b` 就是这么抓到它的）。
+    """
+    if port and is_our_service(port):
+        return None, "http://%s:%d/" % (host, port), True
     server = gv_app.build_server(host, port)
     t = threading.Thread(target=server.serve_forever, name="gv-http", daemon=True)
     t.start()
     real_host, real_port = server.server_address[:2]
-    return server, "http://%s:%d/" % (real_host, real_port)
+    return server, "http://%s:%d/" % (real_host, real_port), False
 
 
 def startup_report():
@@ -76,7 +128,7 @@ def startup_report():
 
 def parse_args(argv):
     """极简参数解析（不引 argparse 之外的东西，保持零依赖观感）。"""
-    opts = {"port": 0, "mode": "window"}
+    opts = {"port": DEFAULT_PORT, "mode": "window"}
     for a in argv:
         if a.startswith("--port="):
             try:
@@ -128,14 +180,34 @@ def open_window(url):
 
 def main(argv=None):
     opts = parse_args(sys.argv[1:] if argv is None else argv)
+    port = opts["port"]
 
-    server, url = start_server("127.0.0.1", opts["port"])
+    try:
+        server, url, attached = start_link("127.0.0.1", port)
+    except OSError as e:
+        # 🔴 不偷偷换端口：换端口会让浏览器换源，用户会以为「我存的数据全没了」。
+        #    宁可停在这里说清楚，让他自己决定关掉谁。
+        print("=" * 56)
+        print("🔴 端口 %d 被别的程序占用了（%s）" % (port, e))
+        print("这个端口不能随便换 —— 浏览器按「端口」隔离本机数据，")
+        print("换端口 = 换一份存储 = 之前保存的库 / 状态 / 感想会看不见。")
+        print("请先关掉占用 %d 的程序，再重新启动。" % port)
+        print("确实需要换：python desktop/main.py --port=<另一个端口>")
+        print("（换了以后数据要从头同步一遍；旧的并没有被删，换回端口就还在。）")
+        print("=" * 56)
+        return 3
+
     print("=" * 56)
     print("我的游戏生涯 · 桌面版（离线）")
     print("本机地址：%s" % url)
     print("监听范围：仅本机回环（127.0.0.1）—— 局域网内别的机器连不上")
+    if attached:
+        print("已在运行：端口上已有本程序的一个实例，直接连上它（共用同一份本机数据）")
     print("=" * 56)
-    startup_report()
+    if attached:
+        print("（另一个窗口里的数据就在这里，不需要再同步一遍。）")
+    else:
+        startup_report()
     print("-" * 56)
 
     try:
@@ -150,8 +222,9 @@ def main(argv=None):
             open_window(url)
             print("窗口已关闭，退出。")
     finally:
-        server.shutdown()
-        server.server_close()
+        if server is not None:
+            server.shutdown()
+            server.server_close()
     return 0
 
 
