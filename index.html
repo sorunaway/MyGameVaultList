@@ -219,6 +219,11 @@
            打开这个面板时自动跑一次；这个按钮是"再跑一次"。 -->
       <div class="set-sec" id="syncLocalSec" hidden>
         <div class="set-status" id="syncLocalInfo"></div>
+        <!-- 「这次同步的数据到底从哪来」—— 一行结论，蓝色/黄色两种。
+             背景：本机文件只覆盖「装过 / 玩过 / 在收藏夹里」的款，全量库必须联网。
+             所以用户点同步之前就该知道这次是"联网全量 + 本机补充"还是"只有本机"，
+             以及后者缺的是什么。 -->
+        <div class="set-status" id="syncSourceNote"></div>
         <div class="set-actions">
           <button class="btn btn-ghost" id="syncLocalBtn" type="button">重新同步</button>
           <button class="btn btn-ghost" id="syncLocalSetup" type="button">账号设置</button>
@@ -303,10 +308,13 @@
            本机 Steam 文件只含「装过 / 玩过 / 在收藏夹里」的款；这一节是补上
            「买了但从没碰过」的那些（本机约 300 款 → 账号侧约 400 款）。不填也能用，只是少了这一批。 -->
       <div class="set-sec" id="setAcctSec" hidden>
-        <h4 class="set-sec-title">Steam 账号 <em>（可选 · 联网同步用）</em></h4>
+        <h4 class="set-sec-title">Steam 账号 <em>（联网取全量库用）</em></h4>
         <p class="set-hint">
-          本机 Steam 文件只记录<b>装过 / 玩过 / 在收藏夹里</b>的游戏。
-          填上账号后，同步时会再问一次 Steam，把<b>买了但从没碰过</b>的那些也补进来。
+          本机 Steam 文件只记录<b>装过 / 玩过 / 在收藏夹里</b>的游戏，<b>名字也只有装过的那些</b>。
+          填上下面两项后，同步会<b>以联网的全量库为主</b>（含名字与时长），
+          本机数据用来补<b>收藏夹 / 离线封面 / 联网列不到的款</b>。
+          <br>两个都要填：<b>SteamID</b> 说明读谁的库，<b>API Key</b> 才是那把钥匙
+          —— 少了 Key，同步就只能读本机。
         </p>
         <label class="field">
           <span>SteamID 或个人资料链接</span>

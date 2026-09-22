@@ -104,6 +104,7 @@
     syncDiff:    $('#syncDiff'),
     syncLocalSec:$('#syncLocalSec'),
     syncLocalInfo:$('#syncLocalInfo'),
+    syncSourceNote:$('#syncSourceNote'),
     syncLocalBtn:$('#syncLocalBtn'),
     syncLocalSetup:$('#syncLocalSetup'),
 
@@ -1196,22 +1197,81 @@
     }[reason] || ('联网同步失败（' + (reason || '原因不明') + '）');
   }
 
-  /** 面板里的"现在会拿什么去同步"一行 —— 让用户在点之前就知道结果从哪来 */
-  function renderSyncLocalInfo() {
+  // 「去申请 API Key」的官方地址。写成常量：同步面板和账号设置两处都要用，
+  // 散着写迟早有一处改漏。
+  // ⚠️ 必须 `target="_blank"`：桌面窗口里点它，pywebview 会把这次新窗口请求
+  //    交给**系统浏览器**（`OPEN_EXTERNAL_LINKS_IN_BROWSER` 默认为真，
+  //    见 webview/__init__.py 的 settings 与 edgechromium.py 的 on_new_window_request）。
+  //    所以不需要为此单开一个「用系统浏览器打开某 URL」的服务端接口。
+  const STEAM_KEY_URL = 'https://steamcommunity.com/dev/apikey';
+
+  /**
+   * 这次同步会走哪条路 —— **单一判据**。
+   *
+   * 🔴 渲染文案、执行流程、失败归因都读它，别各判各的。
+   *    以前就是"前端自己判有没有 Key"→ 判成"没有"以后**连请求都不发**，
+   *    于是服务端那段早就写好的「怎么修」文案永远到不了用户眼前，
+   *    用户看到的只是一行不起眼的小字（实测投诉：绑了账号点同步，还是只有本机数据）。
+   */
+  function syncPlan() {
     const st = desktopStatus || {};
+    const auto = st.autoAccount || {};
+    const sid = String(st.steamId || '').trim() || String(auto.steamId || '').trim();
+    return {
+      st: st,
+      auto: auto,
+      sid: sid,
+      viaAuto: !st.steamId && !!sid,                       // 用的是本机检测到的账号
+      hasKey: !!(st.hasApiKey || st.hasEnvKey)
+    };
+  }
+
+  /** 面板里的"现在会拿什么去同步"两行 —— 让用户在点之前就知道结果从哪来 */
+  function renderSyncLocalInfo() {
+    const p = syncPlan();
+    const st = p.st;
     const bits = [];
     bits.push('本机目录：' + (st.steamDir || '未找到'));
-    const auto = st.autoAccount || {};
-    const sid = (st.steamId || '').trim() || auto.steamId || '';
-    if (sid) {
-      const who = st.steamId ? '已绑定' : '本机检测到';
-      bits.push(who + '账号：' + sid + (auto.accountName ? '（' + auto.accountName + '）' : ''));
+    if (p.sid) {
+      const who = p.viaAuto ? '本机检测到' : '已绑定';
+      bits.push(who + '账号：' + p.sid + (p.auto.accountName ? '（' + p.auto.accountName + '）' : ''));
     } else {
       bits.push('未绑定 Steam 账号（只同步本机数据）');
     }
-    bits.push((st.hasApiKey || st.hasEnvKey) ? 'API Key：已配置' : 'API Key：未配置');
+    bits.push(p.hasKey ? 'API Key：已配置' : 'API Key：未配置');
     el.syncLocalInfo.className = 'set-status';
     el.syncLocalInfo.textContent = bits.join('　·　');
+
+    renderSyncSourceNote(p);
+  }
+
+  /**
+   * 「本次数据来源」结论行。
+   *
+   * 为什么要单独一行、还要带申请链接：本机 Steam 文件**结构上只有**
+   * 「装过 / 玩过 / 在收藏夹里」的款（本机约 300 款 / 账号侧约 400 款），而全量库必须联网
+   * （Steam 的库接口强制要 API Key，没有免 key 的路子）。
+   * 所以"要不要联网"不是可选项，是"数据全不全"的分水岭 ——
+   * 必须写在用户点按钮之前，而不是同步完在结果里悄声提一句。
+   */
+  function renderSyncSourceNote(p) {
+    if (!el.syncSourceNote) return;
+    if (p.sid && p.hasKey) {
+      el.syncSourceNote.className = 'set-status is-ok';
+      el.syncSourceNote.innerHTML =
+        '数据来源：<b>联网全量库（主）</b>　+　本机补充（收藏夹 / 本地封面 / 联网列不到的款）';
+    } else if (p.sid) {
+      el.syncSourceNote.className = 'set-status is-warn';
+      el.syncSourceNote.innerHTML =
+        '数据来源：<b>只有本机</b> —— 联网取全量库需要 API Key（' +
+        '<a href="' + STEAM_KEY_URL + '" target="_blank" rel="noopener">去申请</a>，免费）。' +
+        '本机只有「装过 / 玩过 / 在收藏夹里」的款，买了没碰过的看不到。';
+    } else {
+      el.syncSourceNote.className = 'set-status is-warn';
+      el.syncSourceNote.innerHTML =
+        '数据来源：<b>只有本机</b> —— 还没绑定 Steam 账号，拿不到「买了但从没碰过」的那些。' +
+        '去「账号设置」绑一下就能联网取全量。';
+    }
   }
 
   /**
@@ -1232,8 +1292,12 @@
 
     const rows = [];
     let localOk = false;
+    let localBad = '';
     let newIds = [];
     let onlineBad = '';
+    let onlineOk = false;
+    let onlineTotal = 0;
+    let plan = null;      // 收尾文案要知道"账号到底绑了没"（p 只在 try 块里活着）
 
     try {
       // ---- ① 本机（永远做）----
@@ -1243,7 +1307,7 @@
       if (r && r.ok) {
         localOk = true;
         const st = r.stats || {};
-        rows.push(['本机 Steam', (r.total || 0) + ' 款']);
+        rows.push(['本机 Steam', (r.total || 0) + ' 款（辅助：收藏夹 / 本地封面 / 联网列不到的款）']);
         rows.push(['已安装 / 有名字 / 有封面 / 有时长',
           (st.installed || 0) + ' / ' + (st.named || 0) + ' / ' +
           (st.withCover || 0) + ' / ' + (st.played || 0)]);
@@ -1251,42 +1315,55 @@
         if (r.recollected) rows.push(['被收藏夹拉回「已通关」', r.recollected + ' 款']);
         setSyncStatus('本机数据已同步。', 'ok');
       } else {
-        setSyncStatus(localFailText(r), 'err');
+        localBad = localFailText(r);
+        setSyncStatus(localBad, 'err');
       }
 
-      // ---- ② 联网（可选；本机没读成就不做，免得把真原因盖掉）----
-      const st = desktopStatus || {};
-      const auto = st.autoAccount || {};
-      const sid = (st.steamId || '').trim() || (auto.steamId || '').trim();
+      // ---- ② 联网 ----
+      //
+      // 🔴 这里**不再自己判断「有没有 Key」**。
+      //    以前是 `if (!hasApiKey && !hasEnvKey) rows.push('未填 API Key —— …')` ——
+      //    于是缺 Key 时**一个请求都不发**，服务端那段「为什么读不到 + 怎么修」的
+      //    文案（`howToFix`，带申请地址）永远到不了用户眼前。
+      //    现在一律发出去，让**服务端**回答"行不行、为什么不行" ——
+      //    它才是唯一知道 `.env` / 用户填的 key / profile 公不公开的那一端。
+      //    代价只是缺 Key 时多一次本机回环请求（不碰外网），换来确定性的归因。
+      //
+      // 🔴 也不再要求「本机必须读成功」。联网取全量库**完全不需要本机 Steam**
+      //    —— 而那恰恰是这台机器上最容易缺的东西（换了台电脑、新装的系统、
+      //    Steam 装在别的盘没被认出来）。以前本机一失败就整块跳过联网，
+      //    于是"联网为主"在最需要它的场景里反而用不上。现在两半各报各的。
+      const p = syncPlan();
+      plan = p;
 
-      if (localOk) {
-        if (!sid) {
-          rows.push(['联网补全量', '未绑定账号 —— 设置 →「Steam 账号」']);
-        } else if (!st.hasApiKey && !st.hasEnvKey) {
-          rows.push(['联网补全量', '未填 API Key —— 设置 →「Steam 账号」']);
+      if (p.sid) {
+        setSyncStatus('正在问 Steam 要全量库…', '');
+        let o = null;
+        try { o = await window.GVLocal.syncOnline(p.sid); } catch (e) { o = null; }
+        if (o && o.ok) {
+          onlineOk = true;
+          onlineTotal = o.total || 0;
+          rows.push(['Steam 账号全量（联网·主）',
+                     (o.total || 0) + ' 款（新增 ' + (o.added || 0) + '）']);
+          if (o.newIds && o.newIds.length) newIds = o.newIds;
+          if (o.stale) {
+            onlineBad = o.staleMessage || '这次没连上 Steam，用的是上次的结果';
+            rows.push(['⚠️ 这次没连上 Steam', '显示的是上一次的结果']);
+          }
         } else {
-          setSyncStatus('正在问 Steam 要全量库…（本机这次已经生效）', '');
-          let o = null;
-          try { o = await window.GVLocal.syncOnline(sid); } catch (e) { o = null; }
-          if (o && o.ok) {
-            rows.push(['Steam 账号全量', (o.total || 0) + ' 款（新增 ' + (o.added || 0) + '）']);
-            if (o.newIds && o.newIds.length) newIds = o.newIds;
-            if (o.stale) {
-              onlineBad = o.staleMessage || '这次没连上 Steam，用的是上次的结果';
-              rows.push(['⚠️ 这次没连上 Steam', '显示的是上一次的结果']);
-            }
-          } else {
-            const reason = (o && o.reason) || 'unknown';
-            onlineBad = onlineFailText(reason);
-            rows.push(['联网补全量失败', onlineBad]);
-            // 隐私设置是最常见的失败原因，而且"怎么改"能写得很具体 ——
-            // 提示条 3 秒就没了，所以既弹提示也**记进「消息」**，事后能翻照着做。
-            if (o && o.howToFix && o.howToFix.length) {
-              note('读不到你的游戏库。' + (o.message || '') + '\n' +
-                   o.howToFix.map((s, i) => (i + 1) + '. ' + s).join('\n'), 'err');
-            }
+          const reason = (o && o.reason) || 'unknown';
+          // 服务端给的 message 更具体（它知道是没 key、还是资料没公开）→ 优先用它
+          onlineBad = (o && o.message) || onlineFailText(reason);
+          rows.push(['联网补全量失败', onlineBad]);
+          // 隐私设置是最常见的失败原因，而且"怎么改"能写得很具体 ——
+          // 提示条 3 秒就没了，所以既弹提示也**记进「消息」**，事后能翻照着做。
+          if (o && o.howToFix && o.howToFix.length) {
+            note('读不到你的游戏库。' + (o.message || '') + '\n' +
+                 o.howToFix.map((s, i) => (i + 1) + '. ' + s).join('\n'), 'err');
           }
         }
+      } else {
+        rows.push(['联网补全量', '未绑定账号 —— 设置 →「Steam 账号」']);
       }
     } catch (err) {
       setSyncStatus('同步出错：' + ((err && err.message) || err), 'err');
@@ -1295,23 +1372,53 @@
       el.syncLocalBtn.disabled = false;
     }
 
-    el.syncDiff.innerHTML = rows.map((p) =>
-      '<div class="dl"><span>' + esc(p[0]) + '</span><b>' + esc(p[1]) + '</b></div>'
+    el.syncDiff.innerHTML = rows.map((row) =>
+      '<div class="dl"><span>' + esc(row[0]) + '</span><b>' + esc(row[1]) + '</b></div>'
     ).join('');
 
-    if (localOk) {
+    // 任一半成功都要刷新界面 —— **只成功联网那半时同样得刷**（换台机器、
+    // 本机没装 Steam 就是这种情形：全量库照样拿得到）。
+    if (localOk || onlineOk) {
       await reload();
       if (el.setMask.hidden) render();
 
       const total = state.games.length;
       let msg = '同步完成：共 ' + total + ' 款';
-      if (newIds.length) msg += '（联网新补 ' + newIds.length + ' 款）';
-      if (onlineBad) msg += '。' + onlineBad;
-      setSyncStatus(msg + '。', onlineBad ? 'warn' : 'ok');
-      note(msg, onlineBad ? 'warn' : 'ok');
+      // 说清这一轮的数据**主要来自哪** —— 用户真正关心的是"全不全"，
+      // 而不是"同步跑了几步"。
+      if (onlineOk) {
+        msg += '（联网全量 ' + onlineTotal + ' 款为主' +
+               (localOk ? '，本机补充收藏夹 / 本地封面' : '，本机这半没读成') + '）';
+      } else if (onlineBad) {
+        msg += '（仅本机：' + onlineBad + '）';
+      }
+      if (newIds.length) msg += '，联网新补 ' + newIds.length + ' 款';
+      if (!localOk && localBad) msg += '。本机没读成：' + localBad;
+      // 本机那半失败也要算"需要看一眼" —— 否则状态行一句干净的「同步完成」
+      // 会把上面那行本机错误盖掉。
+      const bad = !!onlineBad || !localOk;
+      setSyncStatus(msg + '。', bad ? 'warn' : 'ok');
+      note(msg, bad ? 'warn' : 'ok');
 
       // 联网新进来的款本机没有封面，优先去补它们（不 await，后台跑）
       fillMetaInBackground(newIds);
+    } else {
+      // ---- 两半都没成 ----
+      //
+      // 🔴 这里**必须**落一个终态。不然状态行会一直挂着 ② 那句
+      //    「正在问 Steam 要全量库…」—— 一个**中间态**，用户看着它以为还在转圈，
+      //    既不知道本机为什么没读成，也等不到任何结论（实测过）。
+      //    而且两边的原因都要说：本机缺 Steam 目录、联网缺 Key 是**两件独立**的事，
+      //    以前只报后一句，用户照做了也不会好。
+      let msg = '同步没读成任何东西';
+      if (localBad) msg += '。本机：' + localBad;
+      if (!plan || !plan.sid) {
+        msg += '。联网：未绑定账号 —— 设置 →「Steam 账号」';
+      } else if (onlineBad) {
+        msg += '。联网：' + onlineBad;
+      }
+      setSyncStatus(msg + '。', 'err');
+      note(msg + '。', 'err');
     }
   }
 
@@ -1690,6 +1797,10 @@
 
     // 账号那一节和目录共用同一份状态，一次刷新一起渲染
     renderAcctState();
+
+    // 同步面板里那两行读的也是同一份状态 —— 用户刚把 Key 补上，
+    // 面板上的「数据来源」必须当场跟着变，别等他关了设置再打开才发现。
+    renderSyncLocalInfo();
   }
 
   // ===== 桌面版：Steam 账号 / API Key（联网同步，可选）=====
@@ -1715,9 +1826,15 @@
     el.setAcctKey.value = '';
 
     if (st.steamId) {
-      el.setAcctState.className = 'set-status is-ok';
-      el.setAcctState.textContent = '已绑定账号 ' + st.steamId +
-        ((st.hasApiKey || st.hasEnvKey) ? '，API Key 已配置' : '，但还没填 API Key');
+      const hasKey = !!(st.hasApiKey || st.hasEnvKey);
+      // ⚠️ 缺 Key 时**不能用绿色的 is-ok**：绑定成功那抹绿会让用户以为"配置齐了"。
+      //    实测就是这么发生的 —— 绑了 SteamID、点同步只拿到本机数据，
+      //    因为联网那半要 Key，而这条绿色提示里读不出这件事。
+      el.setAcctState.className = 'set-status ' + (hasKey ? 'is-ok' : 'is-warn');
+      el.setAcctState.textContent = hasKey
+        ? ('已绑定账号 ' + st.steamId + '，API Key 已配置 —— 同步会联网取全量库')
+        : ('已绑定账号 ' + st.steamId + '，但还缺 API Key —— 同步只能读本机，' +
+           '拿不到「买了但从没碰过」的那些。Key 在下面那个链接免费申请（约 30 秒）。');
     } else {
       el.setAcctState.className = 'set-status';
       el.setAcctState.textContent = '未绑定 —— 同步只读本机 Steam 文件（少一批"买了没碰过"的）';
@@ -1792,8 +1909,14 @@
         return;
       }
       await refreshSteamStatus();
+      // 只绑了 ID、没填 Key 的话，联网那半其实还没通 —— 别报成一句干净的
+      // 「已保存」（那会让用户以为配置齐了，实测就是这么误判的）。
+      const keyNow = !!(desktopStatus && (desktopStatus.hasApiKey || desktopStatus.hasEnvKey));
       note('Steam 账号已保存：' + (id || '（已清空）') +
-           (rawKey ? '，API Key 已更新' : ''), 'ok');
+           (rawKey ? '，API Key 已更新' : '') +
+           (id && !keyNow ? '\n⚠️ 还缺 API Key —— 没有它同步只能读本机（少一批"买了没碰过"的）。' +
+                            '免费申请：' + STEAM_KEY_URL : ''),
+           (id && !keyNow) ? 'warn' : 'ok');
     } finally {
       el.setAcctVerify.disabled = false;
     }
