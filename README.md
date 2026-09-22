@@ -714,3 +714,59 @@ Steam 的本地文件里，**只有「装过 / 玩过 / 在某收藏夹里」的
 > 想知道还差多少：控制台里 `GVLocal.pendingCount()` 是「还需要补几款」，
 > `GVLocal.fetchedCount()` 是「已经问过几款」。
 
+## 桌面版：打包成 exe（双击就能用，不用装 Python）
+
+```bash
+# 依赖装到隔离 venv 里（别动系统 Python）
+python -m venv .venv-desktop
+.venv-desktop/Scripts/python -m pip install pyinstaller pywebview
+
+# 出包
+.venv-desktop/Scripts/python scripts/pack_win.py
+```
+
+产物在 **项目外面**：`../_build_desktop/dist/gamevault-desktop/`（约 38 MB）。
+里面的 `gamevault-desktop.exe` 双击就跑 —— ⚠️ **整个目录一起拷走**（`_internal/` 不能丢）。
+
+打包脚本走**白名单**：只把前端静态资源 + `server/` 的代码装进去，
+`server/` 是以编译进包的形式（源码不以明文落在 `_internal/` 里）。
+包出来会自动做**两次泄露体检**（打包前一次、打包后一次），
+查 `.env` / `js/seed-data.js` / `desktop.json` / SteamID / 32 位十六进制串，
+任一不过就拒绝出包。
+
+> ⚠️ **别拿 `scripts/pack_deploy.py` 出 exe**：那是给**线上服务**用的白名单，
+> 它**故意包含 `.env`**（服务端要用它代表访问者去查 Steam）。
+> 桌面版是发给别人用的，带上 `.env` 等于把 API Key 送出去 —— 两个脚本白名单刚好相反。
+
+### 出包时踩过的两个坑（已修，别再犯）
+
+1. **pywebview 默认不会把数据存在磁盘上。** 它 `start()` 的默认参数是
+   `private_mode=True` + 没有 `storage_path`，Windows 后端遇到这个组合会用**临时目录**
+   （而且每次启动换一个）再开隐身模式 —— 结果是**你存的库、状态、感想，关掉窗口全没了**。
+   所以 `desktop/main.py` 里固定传了 `private_mode=False, storage_path=%LOCALAPPDATA%\MyGameVault\webview`。
+   🔴 这两个参数**缺一不可**。它和「端口必须固定 47615」是**两条独立的存储**：
+   端口那条管的是浏览器存储的「源」，这条管的是 WebView2 自己那套。
+2. **打包后 `__file__` 不再指向项目目录。** `server/config.py` 的 `BASE_DIR` 和
+   `desktop/main.py` 的 `ROOT` 都靠它找静态文件，冻结后算法不一样 → 已加 `sys.frozen` 分支。
+   不加的表现是：exe 打开**一片白**，或一启动就退。
+
+### 验收
+
+```bash
+# 反向对照（几秒）：证明"默认参数下目录长不出来、传了参数才固定"
+<venv>/python _probe_webview_storage.py
+
+# 真 exe + 真窗口：写进存储 → 关窗 → 重开 → 把值读回来
+python _e2e_desktop_exe.py
+
+# 给打包出来的 exe 截一张真窗口图
+python _shot_desktop_exe.py
+```
+
+### 还没做的
+
+- **图标**：现在用的是 PyInstaller 默认图标（仓库里只有 `assets/icon.svg`，需要先转成 `.ico`）。
+- **无控制台版**：`--windowed` 还没出。原因很实际 —— 找不到 Steam、端口被占用（退出码 3）
+  这些提示都走 `print`，去掉控制台用户就什么也看不见了。要对外发得先给这些错误补弹窗兜底。
+- 首次启动的设置向导。
+

@@ -10,8 +10,21 @@
 """
 
 import os
+import sys
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 🔴 全项目**唯一**的路径锚点（`WEB_DIR` 就是它，静态文件服务靠它找 index.html/css/js）。
+#    冻结（PyInstaller）后算法不同，不能沿用 `__file__` 上跳两层：
+#      · 开发期：本文件在 `<项目>/server/config.py` → 上跳两层 = 项目根 ✅
+#      · 冻结后：本模块被编译进 PYZ，`__file__` 由 FrozenImporter **按模块名**拼成
+#        `<_MEIPASS>/config.py` —— 注意**没有 `server/` 这一层**（模块名就叫 `config`，
+#        不是 `server.config`）→ `dirname(dirname(...))` 会跑到解包目录的**父目录**
+#        → 静态文件全部 404，exe 打开是白屏。真身在 `sys._MEIPASS`。
+#    ⚠️ 别用「把 server/ 当数据文件打进去」来绕：PYZ 里的模块优先于文件系统，
+#       `__file__` 仍然指向 `_MEIPASS/config.py`，绕不过去。
+if getattr(sys, "frozen", False):
+    BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+else:
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

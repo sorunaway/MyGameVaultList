@@ -13,12 +13,17 @@
 桌面版把数据源换成 `/api/local/*` 就行，改动量远小于重写前端。
 而且这个回环服务**本来就存在**，只是原来只跑在部署环境里。
 
-## 🔴 三条不能动的约定
+## 🔴 四条不能动的约定
 
 1. **只绑 `127.0.0.1`** —— 不监听 `0.0.0.0`，局域网内别的机器连不上。
 2. **端口固定**（`DEFAULT_PORT`），**不是随机**。
 3. `GV_DESKTOP=1` 才会注册 `/api/local/*`（读本机 Steam 的个人数据）。
    本文件是**唯一**该设这个变量的地方；线上部署永不设 → 那些路由根本不存在。
+4. 🔴🔴 **开窗必须带 `private_mode=False` + 固定 `storage_path`**
+   （`webview_data_dir()`，见该函数的说明）—— 少了任一个，用户存的数据
+   **关掉窗口就没了**。这条与第 2 条是一对：端口固定管住了浏览器那一路的「源」，
+   这条管住 WebView2 自己那套存储。<br>
+   冻结（出 exe）后还有一条同源的：**资源根用 `sys._MEIPASS`**，不是 `__file__` 上跳两层。
 
 ## 🔴🔴 为什么端口必须固定（别改回 `port=0`）
 
@@ -53,7 +58,18 @@ import time
 import urllib.request
 import webbrowser
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 🔴 资源根目录：开发期与**冻结（PyInstaller）后**算法不同，不能合并。
+#
+# 开发期：本文件在 `<项目>/desktop/main.py` → 上跳两层就是项目根。
+# 冻结后：PyInstaller 把入口脚本当顶层模块 `__main__` 放进解包目录，
+#         `__file__` 变成 `<解包根>/main.py` —— **desktop/ 这一层不存在**，
+#         于是 `dirname(dirname(...))` 会指到解包根的**父目录** → `server/` 找不到
+#         → `import app` 直接失败，exe 一启动就崩。
+#         解包根的真身在 `sys._MEIPASS`。
+if getattr(sys, "frozen", False):
+    ROOT = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+else:
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "server"))
 
 # 🔴 固定端口（见文件头「为什么端口必须固定」）。选一个大号高位端口，避开常见服务。
@@ -157,6 +173,39 @@ def block_forever():
         pass
 
 
+def webview_data_dir():
+    """WebView2 的用户数据目录（localStorage / IndexedDB 真正落盘的地方）。
+
+    与 `desktop.json`（`steam_local.settings_path()`）同根：默认
+    `%LOCALAPPDATA%\\MyGameVault\\webview`，`GV_DESKTOP_HOME` 可整体改（测试用）。
+
+    🔴🔴 为什么必须显式传（别退回 `webview.start()` 裸调用）
+
+    pywebview 的 `start()` 签名默认是 `private_mode=True` + `storage_path=None`，
+    Windows 后端（`webview/platforms/winforms.py::init_storage`）遇到这个组合会走：
+
+        cache_dir = tempfile.TemporaryDirectory().name      # 每次启动一个随机临时目录
+
+    再叠上 `edgechromium.py` 的 `props.set_IsInPrivateModeEnabled(True)`
+    → WebView2 进 InPrivate，且 user data folder 每个进程都换。
+    两头一起 → **存的库 / 归类 / 感想 / 偏好 / 消息，关掉窗口全丢**。
+
+    也就是说「固定端口 = 固定源 = 数据留住」这条教训，**只管住了浏览器那一路；
+    pywebview 这条路上它从来没生效过** —— 因为 WebView2 自带一套存储，
+    与端口无关。所有持久化验证此前都跑在无头 Chrome 上（`_t_desktop_launch.py`），
+    pywebview 是验证盲区。
+
+    所以这里两个参数缺一不可：
+      · `private_mode=False` → 允许落盘（否则同在固定目录里也照样丢）；
+      · `storage_path=<固定目录>` → 目录固定（否则每次随机 = 每次都换一份存储）。
+    """
+    home = os.environ.get("GV_DESKTOP_HOME") or ""
+    if not home:
+        home = os.path.join(os.environ.get("LOCALAPPDATA")
+                            or os.path.expanduser("~"), "MyGameVault")
+    return os.path.join(home, "webview")
+
+
 def open_window(url):
     """开 pywebview 窗口；装不上/起不来就降级用系统浏览器，不让用户啥也看不到。"""
     try:
@@ -171,7 +220,21 @@ def open_window(url):
         # Windows 上会自动挑 Edge WebView2（本机已装运行时，不需要用户额外装东西）
         webview.create_window(WINDOW_TITLE, url,
                               width=1280, height=860, min_size=(900, 600))
-        webview.start()
+        data_dir = webview_data_dir()          # 见上面的说明，这两个参数缺一不可
+        print("数据目录：%s" % data_dir)
+
+        # ⚠️ 仅自动化验收 / 排错用：打开 WebView2 的远程调试端口，让外部脚本
+        #    能读写页面里的存储 —— `_e2e_desktop_exe.py` 靠它验「关掉重开数据还在」。
+        #    不设这个环境变量时行为**完全不变**。
+        dbg = os.environ.get("GV_WEBVIEW_DEBUG_PORT", "").strip()
+        if dbg:
+            try:
+                webview.settings["REMOTE_DEBUGGING_PORT"] = int(dbg)
+                print("调试端口：%s（仅验收/排错用）" % dbg)
+            except ValueError:
+                print("GV_WEBVIEW_DEBUG_PORT 得是数字，收到 %r —— 已忽略。" % dbg)
+
+        webview.start(private_mode=False, storage_path=data_dir)
     except Exception as e:
         print("窗口启动失败（%r）—— 降级为系统浏览器打开。" % (e,))
         webbrowser.open(url)
