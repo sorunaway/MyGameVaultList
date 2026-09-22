@@ -321,6 +321,110 @@
     };
   }
 
+  // ============================================================
+  // 联网同步（可选，需要 SteamID + Web API Key）
+  // ============================================================
+  // 为什么要有这条路 —— 它补的是本机文件**结构上看不到**的那部分：
+  //   本机 Steam 文件只记录「装过 / 玩过 / 在某个收藏夹里」的款（本机约 300 款），
+  //   而 Steam 账号侧有全量（约 400 款）。差的那些是「买了但一次都没碰过」的。
+  //
+  // 🔴 两条"绝不能做"，每一条都能静默毁掉用户已有的数据：
+  //
+  //   ① **绝不能带 `collections`**。`mergeSteam` 对它是
+  //      `if (Array.isArray(src.collections)) old.collections = src.collections`
+  //      —— 带了就**无条件覆盖**；而 Steam 的库接口**给不出收藏夹**（它只回
+  //      游戏/时长/图标），于是"联网同步"会把「完结撒花」「已隐藏」全清成空数组，
+  //      数十款「已通关」当场掉回「正在游玩/已暂停」。
+  //      ⇒ 收藏夹永远只由**本机那次同步**写（它读的是 cloud-storage 文件）。
+  //      ⇒ 因此顺序也不能反：**先本机、再联网**。
+  //
+  //   ② **绝不能带 `header`**。本机封面是离线可用的本地图（`/api/local/cover`），
+  //      而联网记录里根本没有封面字段 —— 一旦带上一个空串/别的 URL，
+  //      就会把「不联网也能看到的图」换掉或堵死（`src.header || old.header`）。
+  //      新进来的款没有封面是正常的，交给 `fillMeta` 按部就班补。
+  var ONLINE_LIB_TIMEOUT = 60000;   // 服务端 LIB_TOTAL_BUDGET 42s + 昵称 6s，客户端给宽一点
+
+  /**
+   * 联网读全量库并合并。返回 `{ok, ...}`；失败时带 `reason` + 可执行指引。
+   *
+   * `reason` 取值：no_datastore / no_steamid / fetch_failed / bad_response /
+   *                no_key / profile_private / steam_unreachable / empty
+   */
+  async function syncOnline(steamid) {
+    if (!window.DataStore) return { ok: false, reason: 'no_datastore' };
+    var sid = String(steamid == null ? '' : steamid).trim();
+    if (!/^\d{17}$/.test(sid)) return { ok: false, reason: 'no_steamid' };
+
+    // 合并前拍快照：用来判「哪些是这次新进来的」（新进来的没有本机封面，值得优先补图）
+    var before = [];
+    try { before = await window.DataStore.all(); } catch (e) { console.warn('读旧数据失败', e); }
+    var prev = {};
+    (before || []).forEach(function (g) { if (g.appid != null) prev[String(g.appid)] = g; });
+
+    var d = null;
+    try {
+      d = await getJSON('/api/steam/library?steamid=' + encodeURIComponent(sid),
+                        ONLINE_LIB_TIMEOUT);
+    } catch (e) {
+      return { ok: false, reason: 'fetch_failed', error: String((e && e.message) || e) };
+    }
+    if (!d) return { ok: false, reason: 'bad_response' };
+    if (d.error) {
+      // 服务端把「为什么读不到」和「怎么修」都给了 —— 原样透上去，别在这儿改写文案
+      return { ok: false, reason: d.error, message: d.message || '',
+               howToFix: d.howToFix || [], stale: !!d.stale };
+    }
+
+    var games = d.games || [];
+    if (!games.length) return { ok: false, reason: 'empty' };
+
+    var newIds = [];
+    var recs = games.map(function (g) {
+      if (!g || g.appid == null) return null;
+      var k = String(g.appid);
+      var fresh = !prev[k];
+      if (fresh) newIds.push(g.appid);
+      return {
+        appid: g.appid,
+        title: g.title || '',
+        icon: g.icon || '',
+        totalMinutes: g.totalMinutes || 0,
+        recentMinutes: g.recentMinutes || 0,
+        lastPlayedTs: g.lastPlayedTs || 0
+        // ⚠️ 这里**故意**不写 collections / header / achievements —— 见本段开头那两条。
+      };
+    }).filter(Boolean);
+
+    var res = await window.DataStore.mergeSteam(recs);
+    return {
+      ok: true,
+      total: recs.length,
+      newIds: newIds,
+      added: res.added, updated: res.updated,
+      recollected: res.recollected, locked: res.locked, abandoned: res.abandoned,
+      stale: !!d.stale,
+      staleMessage: d.message || '',
+      namesOk: d.namesOk !== false
+    };
+  }
+
+  /**
+   * 统一的设置写入。**返回形状统一成 `{ok, reason, data}`** ——
+   * 调用方不该去分辨"这是 HTTP 400 还是网络断了"，两种都是"没设成"，
+   * 区别只在给用户看的原因。
+   */
+  function saveSettings(body) {
+    return postJSON('/api/local/settings', body, 10000)
+      .then(function (r) {
+        var b = r.body || {};
+        return { ok: !!b.ok, reason: b.reason || b.message || '', data: b };
+      })
+      .catch(function (e) {
+        return { ok: false, reason: '本机服务没有响应（' + ((e && e.message) || e) + '）',
+                 data: null };
+      });
+  }
+
   window.GVLocal = {
     probe: probe,
     load: load,
@@ -353,15 +457,34 @@
      * 区别只在给用户看的原因。
      */
     setSteamDir: function (p) {
-      return postJSON('/api/local/settings', { steamDir: p || '' }, 10000)
-        .then(function (r) {
-          var b = r.body || {};
-          return { ok: !!b.ok, reason: b.reason || '', data: b };
-        })
-        .catch(function (e) {
-          return { ok: false, reason: '本机服务没有响应（' + ((e && e.message) || e) + '）',
-                   data: null };
-        });
-    }
+      return saveSettings({ steamDir: p || '' });
+    },
+
+    // ---- Steam 账号 / API Key（联网同步用，可选）----
+    /**
+     * 存凭证。传空串 = 清掉那一项；不传的项 = 不动。
+     * 只写本机 `desktop.json`，不上传、不进日志。
+     */
+    setCredentials: function (steamId, apiKey) {
+      var body = {};
+      if (steamId !== undefined) body.steamId = steamId || '';
+      if (apiKey !== undefined) body.steamApiKey = apiKey || '';
+      if (!Object.keys(body).length) {
+        return Promise.resolve({ ok: false, reason: '没有要改的字段', data: null });
+      }
+      return saveSettings(body);
+    },
+
+    /**
+     * 把用户填的东西解析成 SteamID64。支持：
+     *   17 位数字 / `steamcommunity.com/profiles/765...` / `/id/<个性网址>` / 个性网址本身。
+     * ⚠️ 个性网址那两种要联网问 Steam，所以「验证」这一步顺便也验了 key 通不通。
+     */
+    resolveSteamId: function (q) {
+      return getJSON('/api/steam/resolve?q=' + encodeURIComponent(q || ''), 20000);
+    },
+
+    // ---- 联网同步全量库（需要上面那两个）----
+    syncOnline: syncOnline
   };
 })();

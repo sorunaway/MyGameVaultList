@@ -1112,6 +1112,19 @@ input, textarea, select { font-family: inherit; }
 
 .set-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
+/* 区块标题里的括号说明（「Steam 账号（可选 · 联网同步用）」）——
+   和 .field > span em 一个待遇，别用默认斜体（暗色下斜体小字很难看） */
+.set-sec-title em {
+  color: var(--text-faint);
+  font-style: normal;
+  font-size: 11.5px;
+  font-weight: 400;
+}
+/* 说明文字里的外链。全局没定义 a 样式，不写就会是默认的蓝色/紫红 visited，
+   跟暗色主题打架。 */
+.set-hint a { color: var(--accent); text-decoration: none; }
+.set-hint a:hover { text-decoration: underline; }
+
 /* 候选目录的圆片：比收藏夹圆片多一行来源说明，且要放得下长路径 */
 .set-chip-dir {
   display: inline-flex;

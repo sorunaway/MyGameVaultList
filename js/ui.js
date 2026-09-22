@@ -92,8 +92,15 @@
     syncCancel:  $('#syncCancel'),
     syncApply:   $('#syncApply'),
     syncFile:    $('#syncFile'),
+    syncFileSec: $('#syncFileSec'),
+    syncFileHint:$('#syncFileHint'),
+    syncFileEm:  $('#syncFileEm'),
     syncStatus:  $('#syncStatus'),
     syncDiff:    $('#syncDiff'),
+    syncLocalSec:$('#syncLocalSec'),
+    syncLocalInfo:$('#syncLocalInfo'),
+    syncLocalBtn:$('#syncLocalBtn'),
+    syncLocalSetup:$('#syncLocalSetup'),
 
     setMask:     $('#setMask'),
     setClose:    $('#setClose'),
@@ -103,6 +110,15 @@
     setHidden:   $('#setHidden'),
     setCollList: $('#setCollList'),
     setColls:    $('#setColls'),
+
+    // 设置里的「Steam 账号（联网同步）」（仅桌面版可见）
+    setAcctSec:    $('#setAcctSec'),
+    setAcctId:     $('#setAcctId'),
+    setAcctKey:    $('#setAcctKey'),
+    setAcctState:  $('#setAcctState'),
+    setAcctDetect: $('#setAcctDetect'),
+    setAcctVerify: $('#setAcctVerify'),
+    setAcctClear:  $('#setAcctClear'),
 
     // 设置里的「Steam 安装目录」一节（仅桌面版可见）
     setSteamSec:   $('#setSteamSec'),
@@ -1086,11 +1102,42 @@
   }
 
   // ===== Steam 同步 =====
+  /**
+   * 打开同步面板。**两条完全不同的路，按模式分**：
+   *
+   *   · 桌面版 —— 应用的本机进程**本来就能读盘**，所以主路径是"直接同步"。
+   *     「先去项目目录跑 scripts/sync.py、再回来选 JSON」那套是给**浏览器**用的
+   *     （浏览器读不到盘），搬到桌面版来纯属多此一举 —— 面板打开即自动同步一次。
+   *   · 其它（线上版 / 双击 index.html）—— 只能选文件，行为不变。
+   *
+   * 桌面版**保留**文件入口：那是「导出备份」的导入端，换机器时要靠它。
+   */
   function openSyncModal() {
     el.syncFile.value = '';
-    el.syncPayload = null;
+    state.syncPayload = null;
     el.syncApply.disabled = true;
     el.syncDiff.innerHTML = '';
+
+    if (state.desktop) {
+      el.syncLocalSec.hidden = false;
+      el.syncApply.hidden = true;      // 桌面版同步即刻生效，没有"待应用"这一步
+      // 文件入口在桌面版是「导入备份」用的 —— 标签上也别再说"由 scripts/sync 生成"，
+      // 那会让用户以为还得先去项目目录跑一次脚本（正是这次要消掉的那一步）。
+      el.syncFileEm.textContent = '（换机器时导入用）';
+      el.syncFileHint.innerHTML =
+        '也可以导入以前用「导出备份」存下的 JSON（换机器时用）。';
+      setSyncStatus('正在读取本机 Steam…', '');
+      el.syncMask.hidden = false;
+      syncDesktop();                   // 故意不 await：面板先显示出来，别让点击看起来没反应
+      return;
+    }
+
+    el.syncLocalSec.hidden = true;
+    el.syncApply.hidden = false;
+    el.syncFileEm.textContent = '（由 scripts/sync 生成）';
+    el.syncFileHint.innerHTML =
+      '在项目目录运行 <code>python scripts/sync.py</code>，会生成 ' +
+      '<code>data/steam_sync.json</code>，然后在这里选它载入。';
     setSyncStatus('选择一个由 scripts/sync 生成的 JSON 文件。', '');
     el.syncMask.hidden = false;
   }
@@ -1100,6 +1147,149 @@
   function setSyncStatus(text, cls) {
     el.syncStatus.className = 'sync-status' + (cls ? ' ' + cls : '');
     el.syncStatus.textContent = text;
+  }
+
+  let syncBusy = false;
+
+  /** 本机同步失败时，把 reason 翻成能指导下一步动作的话 */
+  function localFailText(r) {
+    return {
+      steam_not_found: '没找到 Steam 安装目录 —— 去「设置」里指定，或点「扫描磁盘」找一下',
+      no_account: '读不到已登录的 Steam 账号 —— 请先在本机登录一次 Steam',
+      fetch_failed: '读本机数据失败（本机服务没有响应）',
+      no_datastore: '本地存储没准备好'
+    }[(r && r.reason)] || ('读取本机 Steam 数据失败（' + ((r && r.reason) || '原因不明') + '）');
+  }
+
+  /** 联网同步失败时同理 */
+  function onlineFailText(reason) {
+    return {
+      profile_private: 'Steam 的「游戏详情」没有设为公开，读不到你的库',
+      steam_unreachable: '连不上 Steam（跨境链路抖动），过几秒再点一次「同步」通常就好了',
+      no_key: '还没有填 Steam Web API Key',
+      no_steamid: '还没有绑定 SteamID',
+      fetch_failed: '本机服务没有响应',
+      empty: 'Steam 返回的游戏库是空的'
+    }[reason] || ('联网同步失败（' + (reason || '原因不明') + '）');
+  }
+
+  /** 面板里的"现在会拿什么去同步"一行 —— 让用户在点之前就知道结果从哪来 */
+  function renderSyncLocalInfo() {
+    const st = desktopStatus || {};
+    const bits = [];
+    bits.push('本机目录：' + (st.steamDir || '未找到'));
+    const auto = st.autoAccount || {};
+    const sid = (st.steamId || '').trim() || auto.steamId || '';
+    if (sid) {
+      const who = st.steamId ? '已绑定' : '本机检测到';
+      bits.push(who + '账号：' + sid + (auto.accountName ? '（' + auto.accountName + '）' : ''));
+    } else {
+      bits.push('未绑定 Steam 账号（只同步本机数据）');
+    }
+    bits.push((st.hasApiKey || st.hasEnvKey) ? 'API Key：已配置' : 'API Key：未配置');
+    el.syncLocalInfo.className = 'set-status';
+    el.syncLocalInfo.textContent = bits.join('　·　');
+  }
+
+  /**
+   * 桌面版同步：**先本机、再联网**。
+   *
+   * 🔴 顺序不能反：联网那一步拿不到收藏夹（Steam 库接口只回游戏/时长/图标），
+   *    而 `mergeSteam` 对 `collections` 是"有数组就无条件覆盖" ——
+   *    收藏夹只能由**本机那次**写。`GVLocal.syncOnline` 里更是干脆不带这个字段。
+   *
+   * 联网是**可选**的：没绑账号 / 没填 Key 就只做本机那半 ——
+   * 不报错、不算失败，只是少一批"买了但没碰过"的。
+   */
+  async function syncDesktop() {
+    if (syncBusy) return;                 // 面板能连点，别叠起来跑
+    syncBusy = true;
+    el.syncLocalBtn.disabled = true;
+    renderSyncLocalInfo();
+
+    const rows = [];
+    let localOk = false;
+    let newIds = [];
+    let onlineBad = '';
+
+    try {
+      // ---- ① 本机（永远做）----
+      setSyncStatus('正在读取本机 Steam…', '');
+      let r = null;
+      try { r = await window.GVLocal.sync(); } catch (e) { r = null; }
+      if (r && r.ok) {
+        localOk = true;
+        const st = r.stats || {};
+        rows.push(['本机 Steam', (r.total || 0) + ' 款']);
+        rows.push(['已安装 / 有名字 / 有封面 / 有时长',
+          (st.installed || 0) + ' / ' + (st.named || 0) + ' / ' +
+          (st.withCover || 0) + ' / ' + (st.played || 0)]);
+        rows.push(['新增 / 更新', (r.added || 0) + ' / ' + (r.updated || 0)]);
+        if (r.recollected) rows.push(['被收藏夹拉回「已通关」', r.recollected + ' 款']);
+        setSyncStatus('本机数据已同步。', 'ok');
+      } else {
+        setSyncStatus(localFailText(r), 'err');
+      }
+
+      // ---- ② 联网（可选；本机没读成就不做，免得把真原因盖掉）----
+      const st = desktopStatus || {};
+      const auto = st.autoAccount || {};
+      const sid = (st.steamId || '').trim() || (auto.steamId || '').trim();
+
+      if (localOk) {
+        if (!sid) {
+          rows.push(['联网补全量', '未绑定账号 —— 设置 →「Steam 账号」']);
+        } else if (!st.hasApiKey && !st.hasEnvKey) {
+          rows.push(['联网补全量', '未填 API Key —— 设置 →「Steam 账号」']);
+        } else {
+          setSyncStatus('正在问 Steam 要全量库…（本机这次已经生效）', '');
+          let o = null;
+          try { o = await window.GVLocal.syncOnline(sid); } catch (e) { o = null; }
+          if (o && o.ok) {
+            rows.push(['Steam 账号全量', (o.total || 0) + ' 款（新增 ' + (o.added || 0) + '）']);
+            if (o.newIds && o.newIds.length) newIds = o.newIds;
+            if (o.stale) {
+              onlineBad = o.staleMessage || '这次没连上 Steam，用的是上次的结果';
+              rows.push(['⚠️ 这次没连上 Steam', '显示的是上一次的结果']);
+            }
+          } else {
+            const reason = (o && o.reason) || 'unknown';
+            onlineBad = onlineFailText(reason);
+            rows.push(['联网补全量失败', onlineBad]);
+            // 隐私设置是最常见的失败原因，而且"怎么改"能写得很具体 ——
+            // 提示条 3 秒就没了，所以既弹提示也**记进「消息」**，事后能翻照着做。
+            if (o && o.howToFix && o.howToFix.length) {
+              note('读不到你的游戏库。' + (o.message || '') + '\n' +
+                   o.howToFix.map((s, i) => (i + 1) + '. ' + s).join('\n'), 'err');
+            }
+          }
+        }
+      }
+    } catch (err) {
+      setSyncStatus('同步出错：' + ((err && err.message) || err), 'err');
+    } finally {
+      syncBusy = false;
+      el.syncLocalBtn.disabled = false;
+    }
+
+    el.syncDiff.innerHTML = rows.map((p) =>
+      '<div class="dl"><span>' + esc(p[0]) + '</span><b>' + esc(p[1]) + '</b></div>'
+    ).join('');
+
+    if (localOk) {
+      await reload();
+      if (el.setMask.hidden) render();
+
+      const total = state.games.length;
+      let msg = '同步完成：共 ' + total + ' 款';
+      if (newIds.length) msg += '（联网新补 ' + newIds.length + ' 款）';
+      if (onlineBad) msg += '。' + onlineBad;
+      setSyncStatus(msg + '。', onlineBad ? 'warn' : 'ok');
+      note(msg, onlineBad ? 'warn' : 'ok');
+
+      // 联网新进来的款本机没有封面，优先去补它们（不 await，后台跑）
+      fillMetaInBackground(newIds);
+    }
   }
 
   async function onSyncFile(e) {
@@ -1204,12 +1394,19 @@
     // ⚠️ 顺序：先让面板亮出来，再去问服务端。
     //    反过来（await 完再显示）在网络慢时会表现为"点了设置没反应"。
     el.setSteamSec.hidden = !state.desktop;
+    el.setAcctSec.hidden = !state.desktop;
     if (state.desktop) {
       el.setSteamDir.value = '';
       el.setSteamFound.hidden = true;
       el.setSteamFound.innerHTML = '';
       el.setSteamState.className = 'set-status';
       el.setSteamState.textContent = '正在读取…';
+      el.setAcctId.value = '';
+      el.setAcctKey.value = '';
+      el.setAcctDetect.hidden = true;
+      el.setAcctDetect.innerHTML = '';
+      el.setAcctState.className = 'set-status';
+      el.setAcctState.textContent = '正在读取…';
     }
     el.setMask.hidden = false;
 
@@ -1259,6 +1456,129 @@
     el.setSteamState.textContent = line;
 
     renderSteamFound(st.auto || [], '另外还检测到（点一下填进上面的框）：', '');
+
+    // 账号那一节和目录共用同一份状态，一次刷新一起渲染
+    renderAcctState();
+  }
+
+  // ===== 桌面版：Steam 账号 / API Key（联网同步，可选）=====
+
+  /**
+   * 「检测到本机账号」那一行。
+   *
+   * 🔴 **只当提示，不当结论** —— `loginusers.vdf` 里列的是"在这台机器上登录过"的账号，
+   *    共用机器上未必是当前这个人。所以显示成"检测到"并给一个「填入」按钮，
+   *    要不要用由用户点一下决定，绝不自动拿去联网读库（那会读到别人的库）。
+   */
+  function renderAcctState() {
+    const st = desktopStatus;
+    if (!st) {
+      el.setAcctState.className = 'set-status is-err';
+      el.setAcctState.textContent = '读不到本机状态（本机服务没有响应）';
+      return;
+    }
+    // 输入框只填**用户显式绑过的**那个；没绑过就留空（空 = 不联网、只读本机）
+    el.setAcctId.value = st.steamId || '';
+    // key 是敏感值，服务端只回布尔 —— 所以输入框**永远不回填**，
+    // 留空 = 不改动（见 onAcctVerify），想换就把新的粘进去。
+    el.setAcctKey.value = '';
+
+    if (st.steamId) {
+      el.setAcctState.className = 'set-status is-ok';
+      el.setAcctState.textContent = '已绑定账号 ' + st.steamId +
+        ((st.hasApiKey || st.hasEnvKey) ? '，API Key 已配置' : '，但还没填 API Key');
+    } else {
+      el.setAcctState.className = 'set-status';
+      el.setAcctState.textContent = '未绑定 —— 同步只读本机 Steam 文件（少一批"买了没碰过"的）';
+    }
+
+    const auto = st.autoAccount;
+    if (auto && auto.steamId && auto.steamId !== st.steamId) {
+      el.setAcctDetect.hidden = false;
+      el.setAcctDetect.innerHTML =
+        '<span class="set-colls-label">检测到本机账号（点一下填入上面的框）：</span>' +
+        '<button type="button" class="set-chip set-chip-dir" data-sid="' + esc(auto.steamId) + '">' +
+          '<b>' + esc(auto.accountName || auto.steamId) + '</b>' +
+          '<em>' + esc(auto.steamId) + (auto.others ? '　另有 ' + auto.others + ' 个账号' : '') + '</em>' +
+        '</button>';
+    } else {
+      el.setAcctDetect.hidden = true;
+      el.setAcctDetect.innerHTML = '';
+    }
+  }
+
+  function onAcctDetectClick(e) {
+    const btn = e.target.closest('.set-chip-dir');
+    if (!btn) return;
+    el.setAcctId.value = btn.getAttribute('data-sid') || '';
+  }
+
+  /**
+   * 「验证并保存」：先把用户填的**解析成 SteamID64**，再落盘。
+   *
+   * 为什么要先解析：`/id/<个性网址>` 和整条资料链接都得联网问 Steam 才知道对应谁，
+   * 而存一个没解析的东西进去，之后每次同步都会莫名其妙地失败。
+   * 顺带 —— 这一步同时验了 Key 通不通（`resolve_vanity` 是要 key 的），
+   * 所以用户点一下就知道自己填的这两样到底能不能用。
+   */
+  async function onAcctVerify() {
+    const rawId = (el.setAcctId.value || '').trim();
+    const rawKey = (el.setAcctKey.value || '').trim();
+    el.setAcctVerify.disabled = true;
+    el.setAcctState.className = 'set-status';
+    el.setAcctState.textContent = '正在验证…';
+
+    try {
+      let id = rawId;
+
+      // 不是 17 位数字（可能是个性网址 / 资料链接）→ 让服务端解析
+      if (id && !/^\d{17}$/.test(id)) {
+        let r = null;
+        try { r = await window.GVLocal.resolveSteamId(id); } catch (e) { r = null; }
+        if (!r || r.error) {
+          el.setAcctState.className = 'set-status is-err';
+          el.setAcctState.textContent = (r && (r.message || r.error)) ||
+            '解析失败：本机服务没有响应';
+          return;
+        }
+        id = r.steamId || (r.steamid) || '';
+        if (!id) {
+          el.setAcctState.className = 'set-status is-err';
+          el.setAcctState.textContent = '没能解析出 SteamID64';
+          return;
+        }
+      }
+
+      const body = { steamId: id };
+      // key 留空 = **不改动**（不是"清空"）。服务端只回布尔、不回填明文，
+      // 所以面板里平时就是空的；要清空得用「清除账号」。
+      if (rawKey) body.steamApiKey = rawKey;
+
+      const res = await window.GVLocal.setCredentials(body.steamId, body.steamApiKey);
+      if (!res.ok) {
+        el.setAcctState.className = 'set-status is-err';
+        el.setAcctState.textContent = res.reason || '保存失败';
+        return;
+      }
+      await refreshSteamStatus();
+      note('Steam 账号已保存：' + (id || '（已清空）') +
+           (rawKey ? '，API Key 已更新' : ''), 'ok');
+    } finally {
+      el.setAcctVerify.disabled = false;
+    }
+  }
+
+  /** 清除账号 + Key —— 之后同步就只读本机 */
+  async function onAcctClear() {
+    el.setAcctClear.disabled = true;
+    try {
+      const res = await window.GVLocal.setCredentials('', '');
+      if (!res.ok) { note('清除失败：' + (res.reason || '原因不明'), 'err'); return; }
+      await refreshSteamStatus();
+      note('已清除 Steam 账号与 API Key，同步只读本机数据', 'ok');
+    } finally {
+      el.setAcctClear.disabled = false;
+    }
   }
 
   /**
@@ -1352,10 +1672,21 @@
    *    让启动时间取决于本机文件，而不是外网快不快。
    * ⚠️ 补完只在**没有弹窗打开**时重绘：用户可能正开着「设置」在填东西，
    *    这时整页重绘会把他的输入冲掉。
+   *
+   * `priorityIds` —— 排在队首的 appid（联网刚补进来的款，本机没有封面，
+   * 最该先补）。会去重：`fillMeta` 内部不对入参去重，重复的会变成重复请求。
    */
-  function fillMetaInBackground() {
+  function fillMetaInBackground(priorityIds) {
     if (!window.GVLocal || !window.GVLocal.fillMeta) return;
-    const ids = state.games.map(g => g.appid).filter(a => a != null);
+    const seen = {};
+    const ids = [];
+    (priorityIds || []).concat(state.games.map(g => g.appid)).forEach(a => {
+      if (a == null) return;
+      const k = String(a);
+      if (seen[k]) return;
+      seen[k] = 1;
+      ids.push(a);
+    });
     if (!ids.length) return;
 
     window.GVLocal.fillMeta(ids).then(async (r) => {
@@ -1609,6 +1940,23 @@
       if (e.key === 'Enter') saveSettings();
     });
 
+    // 账号那一节（联网同步）
+    el.setAcctDetect.addEventListener('click', onAcctDetectClick);
+    el.setAcctVerify.addEventListener('click', onAcctVerify);
+    el.setAcctClear.addEventListener('click', onAcctClear);
+    [el.setAcctId, el.setAcctKey].forEach((box) => {
+      box.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') onAcctVerify();
+      });
+    });
+
+    // 同步面板里的两个按钮（桌面版才有）
+    el.syncLocalBtn.addEventListener('click', syncDesktop);
+    el.syncLocalSetup.addEventListener('click', async () => {
+      closeSyncModal();
+      await openSettings();
+    });
+
     // 快捷键
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
@@ -1734,6 +2082,11 @@
       // &scan=1 —— 面板打开后顺便点一次「扫描磁盘」（同上，只为让扫盘那条路可被自动验收）
       if (sp.get('scan') === '1') state._scanOnOpen = true;
 
+      // ?sync=1 —— 直接打开同步面板。桌面版会**顺手跑一次本机同步**（见 openSyncModal）。
+      //   同步面板只能靠点顶栏按钮打开，无头验收（--dump-dom 拿不到点击）就没有入口了，
+      //   和 ?settings=1 / ?select=1 一个路子，平时也能当书签用。
+      if (sp.get('sync') === '1') state._openSync = true;
+
       // ?open=<appid> —— 直接打开某款游戏的详情页。
       // 详情页顶部是**另一处画框**（.d-hero，同样 460/215），
       // 无头验收拿不到「点击卡片」这个动作，只能给它留个入口；平时也能当书签用。
@@ -1832,6 +2185,13 @@
       state._scanOnOpen = false;
       await openSettings();
       if (wantScan) await onSteamScan();
+    }
+
+    // ?sync=1：渲染完直接打开同步面板。桌面版这里会当场跑一次本机同步 ——
+    // 故意不 await（和点按钮时一样，面板先出来，别让用户看着像卡住）。
+    if (state._openSync) {
+      state._openSync = false;
+      openSyncModal();
     }
   }
 

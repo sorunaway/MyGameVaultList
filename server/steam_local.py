@@ -171,6 +171,10 @@ SETTINGS_NAME = "desktop.json"
 _AUTO_TTL = 20.0
 _AUTO_CACHE = {"ts": 0.0, "val": None}
 
+# 凭证（Steam ID / API Key）的缓存。见 credentials() 的说明。
+_CRED_TTL = 5.0
+_CRED_CACHE = {"ts": 0.0, "val": None}
+
 
 def settings_path():
     """
@@ -421,9 +425,10 @@ def auto_candidates(force=False):
 
 
 def invalidate_cache():
-    """清掉自动检测缓存。改了设置、或用户点「重新检测」时调一下。"""
-    global _AUTO_CACHE
+    """清掉自动检测缓存与凭证缓存。改了设置、或用户点「重新检测」时调一下。"""
+    global _AUTO_CACHE, _CRED_CACHE
     _AUTO_CACHE = {"ts": 0.0, "val": None}
+    _CRED_CACHE = {"ts": 0.0, "val": None}
 
 
 def auto_steam_dir():
@@ -467,6 +472,10 @@ def desktop_status():
     返回 `{ok, steamDir, source, savedDir, savedInvalid, savedReason, auto, settingsPath, reason}`
         source — `settings`（用户设的）/ `auto`（自动检测）/ None（没找到）
         auto   — **除当前这个之外**的自动检测候选，供界面「换一个」用
+
+    另外带上网联同步那一节的状态（见 credentials / auto_account）：
+        steamId / hasApiKey —— 用户填的凭证（key 只回布尔）
+        autoAccount         —— 本机 loginusers 里最后登录的账号，供界面「一键填入」
     """
     saved_raw = str(read_settings().get("steamDir") or "").strip()
     saved_info = looks_like_steam(saved_raw, with_accounts=True) if saved_raw else None
@@ -490,6 +499,7 @@ def desktop_status():
     else:
         reason = "没有找到 Steam 安装目录"
 
+    cred = credentials()
     return {
         "ok": bool(used),
         "steamDir": used,
@@ -501,6 +511,13 @@ def desktop_status():
         "auto": others,
         "settingsPath": settings_path(),
         "reason": reason,
+        # ---- 联网同步（可选）----
+        # ⚠️ 只回「有没有」，**绝不回 key 本身**（连末四位都不回）——
+        #    这个响应会被前端任意代码读到，少一个泄漏面是一个。
+        "steamId": cred["steamId"],
+        "hasApiKey": bool(cred["apiKey"]),
+        # 本机 loginusers.vdf 里的账号（只是**猜**，界面显示成"检测到"并允许用户改）
+        "autoAccount": auto_account(),
     }
 
 
@@ -529,8 +546,149 @@ def set_steam_dir(raw):
             "settingsPath": w["path"]}
 
 
+# ------------------------------------------------------------
+# Steam 账号 / API Key（联网同步用，**可选**）
+# ------------------------------------------------------------
+# 为什么本机明明能读库，还要让用户填这两个：
+#   本机 Steam 文件只包含「装过 / 玩过 / 在某个收藏夹里」的款 —— 实测
+#   **约 300 / 约 400**。差的那一批是「买了但一次都没碰过」的，它们**只存在于 Steam 账号侧**，
+#   本机文件里根本没有痕迹。所以联网这条路不是"绕远"，而是补上本机**结构上就看不到**
+#   的那一部分。
+#
+# 🔴 凭证只落本机 `desktop.json`（和 steamDir 同一个文件），
+#    **不上传、不写任何日志、不出现在任何 GET 响应里** ——
+#    `/api/local/status` 最多回一个 `hasApiKey: true/false`，连末四位都不回。
+#    key 在本机就是**明文**（和浏览器记住的密码一个性质），设置面板里对用户明说，
+#    不假装"加密了"。
+#
+# ⚠️ 服务端的 key 优先级是「**用户填的 > .env**」：
+#    .env 那份是开发机/自用留下的，对外发的桌面版不会带 .env；
+#    别人的机器上只有用户自己填的那一份。
+
+
+def credentials():
+    """
+    读出生效的凭证 `{steamId, apiKey}`（没有就是空串）。
+
+    缓存 5 秒：`/api/steam/achievements` 这种一次问几百款的路由会反复取用它，
+    每次都去读盘没必要。写设置时 `write_settings()` → `invalidate_cache()` 会清掉。
+    """
+    now = time.time()
+    if _CRED_CACHE["val"] is not None and (now - _CRED_CACHE["ts"]) < _CRED_TTL:
+        return dict(_CRED_CACHE["val"])
+    s = read_settings()
+    val = {
+        "steamId": str(s.get("steamId") or "").strip(),
+        "apiKey": str(s.get("steamApiKey") or "").strip(),
+    }
+    _CRED_CACHE.update({"ts": now, "val": val})
+    return dict(val)
+
+
+def normalize_steam_id(raw):
+    """
+    SteamID64 校验。返回 `(值, 错误)`；错误为空串表示通过。
+
+    🔴 只接受**已解析好的 17 位 SteamID64**，不收个性网址/链接 ——
+       后者得联网问 Steam 才知道对应谁，而"存进去的那一刻"未必连得上网，
+       存一个没解析的东西进去，之后每次同步都会莫名其妙地失败。
+       （界面上的「验证并保存」会先拿 `/api/steam/resolve` 解析成数字再存。）
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "", ""
+    if not s.isdigit():
+        return "", "SteamID 应当是 17 位数字；个人资料链接请先点「验证并保存」"
+    if len(s) != 17:
+        return "", "SteamID 应当是 17 位数字，收到 %d 位" % len(s)
+    return s, ""
+
+
+_HEX = "0123456789abcdefABCDEF"
+
+
+def normalize_api_key(raw):
+    """
+    Steam Web API Key 校验。返回 `(值, 错误)`。
+
+    Steam 的 key 是 32 位十六进制。这里**故意严格** —— 填错的典型情形是
+    把 SteamID、个人资料链接、或者整段 `?key=...` 粘进来了；不拦的话要等到
+    同步时报一个 401，用户根本不知道错在哪。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "", ""
+    if len(s) != 32 or any(c not in _HEX for c in s):
+        return "", "API Key 应当是 32 位十六进制字符（你粘的可能是 SteamID 或链接）"
+    return s, ""
+
+
+def set_credentials(steam_id=None, api_key=None):
+    """
+    存（或清空）SteamID / API Key。**校验通过才落盘**。
+
+    传 `None` = 这一项不动；传空串 = 清掉这一项。
+    两条都为空串时等于把这一节整个清掉 —— 之后同步就只走本机。
+    """
+    patch, remove = {}, []
+    out = {"ok": True, "changed": []}
+
+    if steam_id is not None:
+        val, err = normalize_steam_id(steam_id)
+        if err:
+            return {"ok": False, "reason": err, "field": "steamId"}
+        if val:
+            patch["steamId"] = val
+        else:
+            remove.append("steamId")
+        out["changed"].append("steamId")
+
+    if api_key is not None:
+        val, err = normalize_api_key(api_key)
+        if err:
+            return {"ok": False, "reason": err, "field": "steamApiKey"}
+        if val:
+            patch["steamApiKey"] = val
+        else:
+            remove.append("steamApiKey")
+        out["changed"].append("steamApiKey")
+
+    if not patch and not remove:
+        out["status"] = desktop_status()
+        return out
+
+    w = write_settings(patch, remove=tuple(remove))
+    if not w["ok"]:
+        return {"ok": False, "reason": "设置写不进去：" + w["reason"]}
+    out["status"] = desktop_status()
+    return out
+
+
+def auto_account():
+    """
+    本机 Steam 登录过的账号里**最可能属于当前用户**的那个。
+
+    判据：`config/loginusers.vdf` 里 `Timestamp` 最大（= 最后登录过）。
+    新版 Steam 已经不写 `MostRecent` 了，只能靠时间戳排。
+    ⚠️ 这只是**猜** —— 所以界面上显示成「检测到本机账号」并允许用户改，
+       绝不拿它当"用户就是他"的结论去自动联网（那会在共用机器上读错人的库）。
+    """
+    accs = read_accounts(find_steam())
+    if not accs:
+        return None
+    a = accs[0]
+    return {
+        "steamId": a.get("steamId") or "",
+        "accountName": a.get("accountName") or "",
+        "personaName": a.get("personaName") or "",
+        "lastLoginTs": a.get("lastLoginTs") or 0,
+        "others": len(accs) - 1,
+    }
+
+
 def _looks_like_library(path):
     """
+    判断一个目录**是不是 Steam 游戏库根目录**（不等于 Steam 安装目录）。
     判断一个目录**是不是 Steam 游戏库根目录**（不等于 Steam 安装目录）。
 
     🔴 判据不能用 `steamapps/libraryfolders.vdf` —— 2026-09-21 实测：

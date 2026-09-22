@@ -81,6 +81,37 @@ def parse_steam_input(raw):
 
     return None, None, "unrecognized"
 
+def api_key():
+    """
+    生效的 Steam Web API Key。优先级：**用户自己填的 > .env**。
+
+    为什么是这个顺序（2026-09-22 加）：
+      · `.env` 那份是**开发机 / 自用**留下的（开发机的 key，随 `pack_deploy.py` 一起走线上）。
+        对外发的桌面版**故意不带 `.env`** —— 所以别人的机器上只有"用户自己填的"这一份，
+        这里是空的，联网同步会给出「还没填 Key」+ 申请指引，而不是一个 500。
+      · 反过来，用户在自己机器上填了 key 却还在用 `.env` 那份，就会莫名其妙地
+        消耗别人的配额 —— 这个顺序同时解决了这件事。
+
+    🔴 这个值**永远不许进日志、不许进任何 HTTP 响应**。要告诉前端"能不能联网"，
+       只回布尔（见 `desktop_status()` 的 `hasApiKey`）。
+    """
+    try:
+        user = (steam_local.credentials() or {}).get("apiKey") or ""
+    except Exception:
+        user = ""
+    return user or config.STEAM_API_KEY
+
+
+def api_key_source():
+    """key 是哪来的：`user`（用户自己填的）/ `env`（.env）/ `none`。给界面显示用，不含 key 本身。"""
+    try:
+        if (steam_local.credentials() or {}).get("apiKey"):
+            return "user"
+    except Exception:
+        pass
+    return "env" if config.STEAM_API_KEY else "none"
+
+
 MIME_FIX = {
     ".js": "application/javascript; charset=utf-8",
     ".mjs": "application/javascript; charset=utf-8",
@@ -356,8 +387,24 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _guard_steam_key(self):
-        if not config.STEAM_API_KEY:
-            self._json({"error": "服务端未配置 STEAM_API_KEY"}, 500)
+        """没有可用的 key 就别往下走。
+
+        桌面版多给一条可执行的指引：key 是**用户自己填**的（存本机 desktop.json），
+        不像线上版那样由部署方配 .env —— 所以不能说"服务端未配置"，那话对用户没有意义。
+        """
+        if not api_key():
+            if config.DESKTOP_MODE:
+                self._json({
+                    "error": "no_key",
+                    "message": "还没有填 Steam Web API Key，读不到联网数据。",
+                    "howToFix": [
+                        "去 Steam 官方申请一个（免费）：https://steamcommunity.com/dev/apikey",
+                        "打开顶栏「设置」→「Steam 账号（联网同步）」把 Key 粘进去",
+                        "点「验证并保存」",
+                    ],
+                }, 200)
+            else:
+                self._json({"error": "服务端未配置 STEAM_API_KEY"}, 500)
             return False
         return True
 
@@ -372,7 +419,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({
                 "ok": True,
                 "version": VERSION,
-                "hasKey": bool(config.STEAM_API_KEY),
+                "hasKey": bool(api_key()),
+                "keySource": api_key_source(),
                 "time": int(time.time()),
             })
 
@@ -458,6 +506,10 @@ class Handler(BaseHTTPRequestHandler):
             "desktop": True,
             "available": bool(st.get("steamDir")),
             "steamDir": st.get("steamDir"),
+            # 「能不能联网同步」由前端判断，所以这里把两个**事实**都给出去：
+            # 用户自己填了 key 没有、以及 .env 里有没有一份（开发机/自用那套）。
+            # ⚠️ 只给布尔 —— key 本身永不出现在响应里，连末四位都不给。
+            "hasEnvKey": bool(config.STEAM_API_KEY),
         }, **st))
 
     def _api_local_library(self):
@@ -491,7 +543,15 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(steam_local.scan_for_steam())
 
     def _api_local_settings(self):
-        """保存（或清空）用户指定的 Steam 目录。校验通过才落盘。"""
+        """
+        桌面版设置：Steam 安装目录 / SteamID / API Key。校验通过才落盘。
+
+        🔴 **按"字段是否出现"处理，不是按"字段有没有值"** ——
+           这一条以前踩过：旧实现写死 `body.get("steamDir", "")`，
+           于是任何一个**不含 steamDir** 的请求都等于"把目录清空"。
+           现在多带两个字段，若不改就变成「存一下 API Key，顺手把 Steam 目录删了」。
+           所以：键不出现 = 不动；键出现且为空串 = 清掉。
+        """
         try:
             body = json.loads(self._read_body().decode("utf-8") or "{}")
         except Exception:
@@ -500,9 +560,40 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             return self._json({"error": "bad_json",
                                "hint": "请求体应当是一个 JSON 对象"}, 400)
-        res = steam_local.set_steam_dir(body.get("steamDir", ""))
+
+        touched = [k for k in ("steamDir", "steamId", "steamApiKey") if k in body]
+        if not touched:
+            return self._json({"error": "no_fields",
+                               "hint": "请求体里至少要有一个可写字段",
+                               "fields": ["steamDir", "steamId", "steamApiKey"]}, 400)
+
+        res = {"ok": True, "changed": []}
+        try:
+            if "steamDir" in body:
+                r = steam_local.set_steam_dir(body.get("steamDir"))
+                if not r.get("ok"):
+                    r["status"] = steam_local.desktop_status()
+                    return self._json(r, 400)
+                # 把 `cleared` / `steamDir` / `probe` 这些一并回给前端
+                # （`cleared` 是既有契约：测试与前端都读它判断"是否已清空回到自动检测"）
+                res.update({k: v for k, v in r.items() if k != "status"})
+                res["changed"].append("steamDir")
+
+            if "steamId" in body or "steamApiKey" in body:
+                r = steam_local.set_credentials(
+                    steam_id=body.get("steamId") if "steamId" in body else None,
+                    api_key=body.get("steamApiKey") if "steamApiKey" in body else None)
+                if not r.get("ok"):
+                    r["status"] = steam_local.desktop_status()
+                    return self._json(r, 400)
+                res["changed"].extend(r.get("changed") or [])
+        except Exception as e:                      # 兜底：绝不把栈信息抛给前端
+            log("保存设置失败：%r" % (e,))
+            return self._json({"error": "save_failed",
+                               "message": "保存设置时出错：%s" % e}, 500)
+
         res["status"] = steam_local.desktop_status()
-        return self._json(res, 200 if res.get("ok") else 400)
+        return self._json(res, 200)
 
     # ---------- 诊断 ----------
     def _api_diag(self):
@@ -679,7 +770,7 @@ class Handler(BaseHTTPRequestHandler):
                                "message": "这看起来不是 Steam ID，也不是个人资料链接"}, 400)
 
         if vanity:
-            sid, rerr = steam_client.resolve_vanity(config.STEAM_API_KEY, vanity,
+            sid, rerr = steam_client.resolve_vanity(api_key(), vanity,
                                                    budget=RESOLVE_BUDGET)
             if rerr == "network":
                 return self._json({"error": "steam_unreachable",
@@ -693,12 +784,12 @@ class Handler(BaseHTTPRequestHandler):
         # 但仍然要封顶：默认的 timeout=20 × (1 次重试) 最坏 41 秒，
         # 两次尝试就是 82 秒，早就被反代掐断了。
         info = steam_client.get_player_summary(
-            config.STEAM_API_KEY, steamid, budget=RESOLVE_BUDGET)
+            api_key(), steamid, budget=RESOLVE_BUDGET)
         if not info:
             # 同上：区分「偶发抽风」和「查无此人」，别丢一个误导性的 404
             time.sleep(0.6)
             info = steam_client.get_player_summary(
-                config.STEAM_API_KEY, steamid, budget=RESOLVE_BUDGET)
+                api_key(), steamid, budget=RESOLVE_BUDGET)
         if not info:
             return self._json({"error": "player_unavailable",
                                "message": "拿不到这个账号的资料，请稍后重试"}, 502)
@@ -712,7 +803,7 @@ class Handler(BaseHTTPRequestHandler):
         if not steamid.isdigit():
             return self._json({"error": "steamid 不合法"}, 400)
         info = steam_client.get_player_summary(
-            config.STEAM_API_KEY, steamid, budget=RESOLVE_BUDGET)
+            api_key(), steamid, budget=RESOLVE_BUDGET)
         if not info:
             # GetPlayerSummaries 偶发抽风（实测线上大约几十次里会碰到一次），
             # 而 get_player_summary 把「偶发失败」和「查无此人」都归成 None。
@@ -720,7 +811,7 @@ class Handler(BaseHTTPRequestHandler):
             # 而不是丢一个会让人以为账号不存在的 404。
             time.sleep(0.6)
             info = steam_client.get_player_summary(
-                config.STEAM_API_KEY, steamid, budget=RESOLVE_BUDGET)
+                api_key(), steamid, budget=RESOLVE_BUDGET)
         if not info:
             return self._json({"error": "Steam 接口暂时不可用，请稍后重试"}, 502)
         return self._json({"player": info})
@@ -743,7 +834,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(cached)
 
         games, is_private, names_ok = steam_client.get_owned_games(
-            config.STEAM_API_KEY, steamid)
+            api_key(), steamid)
 
         if games is None:
             # 上游彻底拉不动了。手里有旧数据就顶上去 ——
@@ -782,7 +873,7 @@ class Handler(BaseHTTPRequestHandler):
         player = None
         if left > 2:
             player = steam_client.get_player_summary(
-                config.STEAM_API_KEY, steamid,
+                api_key(), steamid,
                 budget=min(LIB_PLAYER_BUDGET_MAX, left))
 
         out = []
@@ -855,7 +946,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "steamid 不合法"}, 400)
 
         items, state = steam_client.get_wishlist(
-            config.STEAM_API_KEY, steamid, budget=WISH_BUDGET)
+            api_key(), steamid, budget=WISH_BUDGET)
 
         if state == "error":
             return self._json({
@@ -934,7 +1025,7 @@ class Handler(BaseHTTPRequestHandler):
             if not single.isdigit():
                 return self._json({"error": "参数不合法"}, 400)
             ach = steam_client.get_player_achievements(
-                config.STEAM_API_KEY, steamid, single)
+                api_key(), steamid, single)
             return self._json({"steamid": steamid, "appid": int(single),
                                "achievements": ach})
 
@@ -951,7 +1042,7 @@ class Handler(BaseHTTPRequestHandler):
 
         ach_stats = {}   # 由 get_player_achievements_many 填：失败原因分类 + 链路质量
         items = steam_client.get_player_achievements_many(
-            config.STEAM_API_KEY, steamid, ordered,
+            api_key(), steamid, ordered,
             workers=config.STEAM_MAX_CONCURRENCY,
             deadline=time.time() + ACH_DEADLINE,
             item_budget=ACH_ITEM_BUDGET,
@@ -1075,7 +1166,8 @@ def main():
     log("=" * 52)
     log("我的游戏生涯 服务端 v%s" % VERSION)
     log("监听 %s:%d" % server.server_address[:2])
-    log("Steam API Key：%s" % ("已配置" if config.STEAM_API_KEY else "【缺失】"))
+    log("Steam API Key：%s" % ({"user": "用户自己填的", "env": ".env 里的", "none": "【缺失】"}
+                               [api_key_source()]))
     log("静态目录：%s" % config.WEB_DIR)
     log("本机模式：%s" % ("开（桌面版）" if config.DESKTOP_MODE else "关"))
     log("=" * 52)

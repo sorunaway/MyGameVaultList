@@ -206,15 +206,32 @@
     </div>
     <div class="modal-body">
       <div class="sync-status" id="syncStatus"></div>
-      <label class="field">
-        <span>游戏库数据文件 <em>（由 scripts/sync 生成）</em></span>
-        <input id="syncFile" type="file" accept=".json">
-      </label>
-      <p class="hint">
-        在项目目录运行 <code>python scripts/sync.py</code>，会生成
-        <code>data/steam_sync.json</code>，然后在这里选它载入。
-      </p>
       <div class="sync-diff" id="syncDiff"></div>
+
+      <!-- ===== 桌面版主路径：一键同步本机 =====
+           桌面版的应用进程**本来就能直接读盘**，所以不需要「先去项目目录跑脚本、
+           再回来选文件」那一套 —— 那套是给浏览器（读不到盘）用的。
+           打开这个面板时自动跑一次；这个按钮是"再跑一次"。 -->
+      <div class="set-sec" id="syncLocalSec" hidden>
+        <div class="set-status" id="syncLocalInfo"></div>
+        <div class="set-actions">
+          <button class="btn btn-ghost" id="syncLocalBtn" type="button">重新同步</button>
+          <button class="btn btn-ghost" id="syncLocalSetup" type="button">账号设置</button>
+        </div>
+      </div>
+
+      <!-- ===== 手动选文件 =====
+           线上版（浏览器读不到盘）的主路径；桌面版保留，用来导入以前导出的备份。 -->
+      <div id="syncFileSec">
+        <label class="field">
+          <span>游戏库数据文件 <em id="syncFileEm">（由 scripts/sync 生成）</em></span>
+          <input id="syncFile" type="file" accept=".json">
+        </label>
+        <p class="hint" id="syncFileHint">
+          在项目目录运行 <code>python scripts/sync.py</code>，会生成
+          <code>data/steam_sync.json</code>，然后在这里选它载入。
+        </p>
+      </div>
     </div>
     <div class="modal-foot">
       <button class="btn btn-ghost" id="syncCancel">关闭</button>
@@ -275,6 +292,40 @@
           <button class="btn btn-ghost" id="setSteamScan" type="button">扫描磁盘</button>
         </div>
         <div class="set-colls" id="setSteamFound" hidden></div>
+      </div>
+
+      <!-- ===== 桌面版专属：Steam 账号（联网同步用，可选）=====
+           本机 Steam 文件只含「装过 / 玩过 / 在收藏夹里」的款；这一节是补上
+           「买了但从没碰过」的那些（本机约 300 款 → 账号侧约 400 款）。不填也能用，只是少了这一批。 -->
+      <div class="set-sec" id="setAcctSec" hidden>
+        <h4 class="set-sec-title">Steam 账号 <em>（可选 · 联网同步用）</em></h4>
+        <p class="set-hint">
+          本机 Steam 文件只记录<b>装过 / 玩过 / 在收藏夹里</b>的游戏。
+          填上账号后，同步时会再问一次 Steam，把<b>买了但从没碰过</b>的那些也补进来。
+        </p>
+        <label class="field">
+          <span>SteamID 或个人资料链接</span>
+          <input id="setAcctId" type="text" placeholder="7656119xxxxxxxxxx"
+                 autocomplete="off" spellcheck="false">
+        </label>
+        <div class="set-status" id="setAcctDetect"></div>
+        <label class="field">
+          <span>Steam Web API Key</span>
+          <input id="setAcctKey" type="password" placeholder="32 位十六进制字符"
+                 autocomplete="off" spellcheck="false">
+        </label>
+        <div class="set-status" id="setAcctState"></div>
+        <div class="set-actions">
+          <button class="btn btn-ghost" id="setAcctVerify" type="button">验证并保存</button>
+          <button class="btn btn-ghost" id="setAcctClear" type="button">清除账号</button>
+        </div>
+        <p class="set-hint">
+          Key 在 <a href="https://steamcommunity.com/dev/apikey" target="_blank"
+                   rel="noopener">这里免费申请</a>（Steam 官方页面）。
+          <b>只存在这台机器上</b>（<code>desktop.json</code>），不会上传、
+          不会写进日志、也不会跟着「导出备份」走 —— 但它在本机是<b>明文</b>，
+          和浏览器记住的密码一个性质。
+        </p>
       </div>
     </div>
     <div class="modal-foot">
