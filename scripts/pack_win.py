@@ -371,6 +371,16 @@ def build(stage_dir, onefile, windowed):
     if onefile:
         args.append("--onefile")
     args.append("--windowed" if windowed else "--console")
+
+    # 图标：PyInstaller 只吃 .ico（不是 .svg）。`assets/icon.ico` 由
+    # `_make_icon.py` 从 `assets/icon.svg` 生成（Chrome 渲染 PNG → 按 ICO 规范拼装）。
+    icon = os.path.join(BASE_DIR, "assets", "icon.ico")
+    if os.path.isfile(icon):
+        args += ["--icon", icon]
+    else:
+        log("  ⚠️ 没有 assets/icon.ico —— 用 PyInstaller 默认图标。"
+            "想要自己的图标：python _make_icon.py")
+
     args.append(ENTRY)
 
     log("--- PyInstaller ---")

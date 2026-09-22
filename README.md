@@ -761,12 +761,21 @@ python _e2e_desktop_exe.py
 
 # 给打包出来的 exe 截一张真窗口图
 python _shot_desktop_exe.py
+
+# 换图标时（改完 assets/icon.svg 之后）
+python _make_icon.py
 ```
+
+### 图标
+
+图标走 `assets/icon.ico` —— 它由 `_make_icon.py` 从 `assets/icon.svg` 生成
+（用本机 Chrome 渲成 256/48/32/16 四张 PNG，再按 ICO 规范拼起来，不引额外依赖）。
+`pack_win.py` 看到它就自动带上；换图标就改 `icon.svg` 再跑一次 `python _make_icon.py`。
 
 ### 还没做的
 
-- **图标**：现在用的是 PyInstaller 默认图标（仓库里只有 `assets/icon.svg`，需要先转成 `.ico`）。
-- **无控制台版**：`--windowed` 还没出。原因很实际 —— 找不到 Steam、端口被占用（退出码 3）
-  这些提示都走 `print`，去掉控制台用户就什么也看不见了。要对外发得先给这些错误补弹窗兜底。
+- **无控制台版**（`--windowed`）还没出，而且**自用测试阶段不该出**：找不到 Steam、
+  端口被占用（退出码 3）这些提示都走控制台输出，去掉控制台就什么都看不见了 ——
+  而那些提示正是排错要看的东西。要对外发得先给这些错误补弹窗兜底。
 - 首次启动的设置向导。
 
