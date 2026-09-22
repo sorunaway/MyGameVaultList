@@ -1519,6 +1519,11 @@
         app: '我的游戏生涯', version: 1,
         exportedAt: new Date().toISOString(),
         steamId: profile && profile.steam_id,
+        // 🔴 收藏夹设置必须跟着走（2026-09-22 补）：它决定「哪个收藏夹算已通关」。
+        //    以前这里只写 steamId，不写 prefs —— 于是云端用户换台机器导入备份，
+        //    归类会按**默认名**（「已完结」）重算，而本机用的是「完结撒花」，
+        //    数十款「已通关」会整片落回「我的游戏单」。导入端也一并补了恢复。
+        prefs: DS.getPrefs(),
         games: all
       }, null, 1)], { type: 'application/json' });
       const a = document.createElement('a');
@@ -1546,6 +1551,11 @@
         const games = Array.isArray(obj) ? obj : (obj.games || []);
         if (!games.length) throw new Error('文件里没有游戏数据');
         if (!confirm('将导入 ' + games.length + ' 款游戏，覆盖同 appid 的现有记录。继续？')) return;
+        // 🔴 恢复「哪个收藏夹算已通关」——顺序必须在 mergeSteam 之前，
+        //    否则这次导入的归类会按默认名算。放在 confirm 之后：
+        //    用户点了"取消"就不该有任何副作用（连设置都不动）。
+        if (obj && obj.prefs) DS.setPrefs(obj.prefs);
+        DS.adoptLegacyCollection(games);
         const incoming = games.map(function (g) {
           return Object.assign({}, g, { suggestedStatus: g.status });
         });

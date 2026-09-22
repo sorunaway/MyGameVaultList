@@ -137,7 +137,13 @@
     btnSync:     $('#btnSync'),
     btnSettings: $('#btnSettings'),
     btnMenu:     $('#btnMenu'),
-    btnExport:   $('#btnExport'),
+
+    // 设置里的「数据备份」（仅本地/桌面版可见）
+    setBackupSec:   $('#setBackupSec'),
+    setBackupExport:$('#setBackupExport'),
+    setBackupImport:$('#setBackupImport'),
+    setBackupFile:  $('#setBackupFile'),
+    setBackupState: $('#setBackupState'),
 
     // 设置里的「危险操作」+ 它弹出的二级确认窗（#wipeMask）
     setDangerSec: $('#setDangerSec'),
@@ -1126,7 +1132,8 @@
    *     （浏览器读不到盘），搬到桌面版来纯属多此一举 —— 面板打开即自动同步一次。
    *   · 其它（线上版 / 双击 index.html）—— 只能选文件，行为不变。
    *
-   * 桌面版**保留**文件入口：那是「导出备份」的导入端，换机器时要靠它。
+   * 桌面版**保留**文件入口：那是「设置 → 数据备份」里导出的文件的导入端，
+   * 换机器时要靠它。
    */
   function openSyncModal() {
     el.syncFile.value = '';
@@ -1141,7 +1148,7 @@
       // 那会让用户以为还得先去项目目录跑一次脚本（正是这次要消掉的那一步）。
       el.syncFileEm.textContent = '（换机器时导入用）';
       el.syncFileHint.innerHTML =
-        '也可以导入以前用「导出备份」存下的 JSON（换机器时用）。';
+        '换机器时用它导入以前备份的 JSON —— 导出入口在「设置 → 数据备份」。';
       setSyncStatus('正在读取本机 Steam…', '');
       el.syncMask.hidden = false;
       syncDesktop();                   // 故意不 await：面板先显示出来，别让点击看起来没反应
@@ -1312,27 +1319,15 @@
     const f = e.target.files && e.target.files[0];
     if (!f) return;
     try {
-      const text = await f.text();
-      const data = JSON.parse(text);
-      const list = Array.isArray(data) ? data : (data.games || []);
-      if (!list.length) {
-        setSyncStatus('这个文件里没有游戏数据。', 'warn');
+      // 解析统一走 readBackupFile —— 和设置里的「从文件导入」是**同一份实现**。
+      // （prefs 恢复 / 旧分类名认领 / 建议状态 的顺序都在里面，见那个函数的注释）
+      const r = await readBackupFile(f);
+      if (!r.ok) {
+        setSyncStatus(r.reason, 'warn');
         el.syncApply.disabled = true;
         return;
       }
-      // 备份文件里带着收藏夹设置（导出备份时会写进去）—— 在算建议状态之前
-      // 先恢复它，否则换台设备导入备份，归类会按默认名重算一遍。
-      if (data && data.prefs) DS.setPrefs(data.prefs);
-      // 同理：先认下旧版的分类名，再算建议状态（顺序反了这些款会落成「我的游戏单」）
-      DS.adoptLegacyCollection(list);
-
-      // 预处理：补上建议状态
-      const prepared = list.map(src => {
-        const g = DS.makeGame(src);
-        return Object.assign({}, g, {
-          suggestedStatus: DS.suggestStatus(g)
-        });
-      });
+      const prepared = r.prepared;
 
       const existing = state.games;
       const byAppid = new Map();
@@ -1373,6 +1368,10 @@
     try {
       const res = await DS.mergeSteam(state.syncPayload);
       await reload();
+      // 🔴 reload() 只刷新 state.games，**不重绘** —— 少了这一行，
+      //    写完库之后界面还是旧的（这张弹窗 1.1 秒后自动关掉，用户回到列表
+      //    看到的还是导入前那份，得点一下筛选/切个区块才刷新）。
+      render();
       const msg = '同步完成：新增 ' + res.added + ' 款，更新 ' + res.updated + ' 款';
       setSyncStatus(msg + '。', 'ok');
       // 这个弹窗 1.1 秒后自动关闭，光靠弹窗里的状态文字用户多半没看清，
@@ -1384,6 +1383,129 @@
       note('同步写入失败：' + err.message, 'err');
       el.syncApply.disabled = false;
     }
+  }
+
+  // ===== 备份：导出 / 导入（设置 →「数据备份」）=====
+  // 2026-09-22 需求提的：这两个动作是「换电脑搬数据」一件事的两半，原来却被拆到
+  // 两个地方 —— 导出在页脚的小文字链（#btnExport），导入藏在「同步」弹窗里。
+  // 现在都收进设置，并且**导出与导入共用同一份字段表/解析函数**（见下）。
+
+  /**
+   * 导出载荷。导出与导入必须用同一份字段表 —— 少一个字段，换台机器导回去
+   * 就是一次静默的数据缺失（用户不会发现，直到发现归类全变了）。
+   *
+   * 🔴 `prefs` 不能漏。它决定「哪个收藏夹算已通关」：不带上的话，新机器会按
+   * 默认名（「已完结」）重算归类 —— 旧版本默认名「完结撒花」下的数十款会整片落回
+   * 「我的游戏单」。线上版早期就是这么漏的。
+   */
+  function backupPayload(all) {
+    return {
+      app: '我的游戏生涯', version: 1,
+      exportedAt: new Date().toISOString(),
+      prefs: DS.getPrefs(),
+      games: all
+    };
+  }
+
+  /** 导出到文件（设置里的按钮；以前是页脚的 #btnExport） */
+  async function exportBackupToFile() {
+    setBackupState('', '');
+    try {
+      const all = await DS.all();
+      if (!all.length) {
+        setBackupState('当前没有可导出的数据。', 'warn');
+        note('当前没有可导出的数据', 'warn');
+        return;
+      }
+      const blob = new Blob([JSON.stringify(backupPayload(all), null, 1)],
+                            { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'gamevault-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      setBackupState('已导出 ' + all.length + ' 款记录。', 'ok');
+      note('已导出 ' + all.length + ' 款数据', 'ok');
+    } catch (e) {
+      const m = '导出失败：' + ((e && e.message) || e);
+      setBackupState(m, 'err');
+      note(m, 'err');
+    }
+  }
+
+  /**
+   * 解析一个文件 -> 可以直接喂给 DS.mergeSteam 的数组。
+   *
+   * **同步弹窗（onSyncFile）和「数据备份」共用这一个**：两条入口对"文件里是什么"
+   * 的理解必须一致，各抄一份迟早分叉（复制粘贴的代码不会一起改）。
+   *
+   * 三件必须按顺序做的事（顺序反了归类会错）：
+   *   1. 先恢复 prefs —— 第 3 步算状态要用它判断"哪个收藏夹算已通关"
+   *   2. 再 adoptLegacyCollection —— 认下旧版的分类名，否则那些款会落回「我的游戏单」
+   *   3. 最后算 suggestedStatus
+   */
+  async function readBackupFile(file) {
+    const data = JSON.parse(await file.text());
+    const list = Array.isArray(data) ? data : (data.games || []);
+    if (!list.length) return { ok: false, reason: '这个文件里没有游戏数据。' };
+
+    if (data && data.prefs) DS.setPrefs(data.prefs);
+    DS.adoptLegacyCollection(list);
+
+    const prepared = list.map(src => {
+      const g = DS.makeGame(src);
+      return Object.assign({}, g, {
+        // 🔴 `src.status || …`：**有就沿用、没有才推算**。
+        //   · 备份文件（本应用自己导出的）每款都带 status，那是用户的归类结果 ——
+        //     重新推算等于把"手动标的已通关 / 放弃"抹掉，这正是「换电脑搬数据」
+        //     最不能出错的地方。
+        //   · 同步文件（scripts/sync.py 生成的）字段表里**没有** status，
+        //     所以照旧走推算 —— 与本次改动前逐字一致。
+        suggestedStatus: src.status || DS.suggestStatus(g)
+      });
+    });
+    return { ok: true, prepared };
+  }
+
+  /**
+   * 从文件导入（设置里的按钮）：**直接合并**，不走"先预览再应用"那一步。
+   * 为什么可以省掉预览：这是用户从设置里主动点的，且 mergeSteam 是**合并不是替换**
+   * —— 删不掉任何东西，最坏情况是覆盖同 appid 的几个字段。失败/数量都会走
+   * note() 记进消息历史，事后能查。
+   */
+  async function importBackupFile(file) {
+    setBackupState('正在读取文件…', '');
+    try {
+      const r = await readBackupFile(file);
+      if (!r.ok) {
+        setBackupState(r.reason, 'warn');
+        note(r.reason, 'warn');
+        return;
+      }
+      const res = await DS.mergeSteam(r.prepared);
+      await reload();
+      // 🔴 必须无条件重绘：这里是从**设置面板里**点的，面板还开着 ——
+      //    以前写的 `if (el.setMask.hidden) render()` 会让重绘被跳过，
+      //    于是关掉设置之后网格和顶部统计还是导入前那份（数据其实已经进去了，
+      //    界面在骗人）。面板开着时重绘是看不见的，代价为零。
+      render();
+      let msg = '备份导入完成：新增 ' + res.added + ' 款，更新 ' + res.updated + ' 款';
+      if (res.locked) msg += '（' + res.locked + ' 款手动锁定的记录未改动）';
+      setBackupState(msg + '。', 'ok');
+      note(msg, 'ok');
+    } catch (e) {
+      const m = '导入失败：' + ((e && e.message) || e);
+      setBackupState(m, 'err');
+      note(m, 'err');
+    }
+  }
+
+  function setBackupState(text, kind) {
+    el.setBackupState.className = 'set-status' + (kind ? ' is-' + kind : '');
+    el.setBackupState.textContent = text || '';
   }
 
   // ===== 设置：收藏夹 -> 状态 =====
@@ -1412,6 +1534,10 @@
     //    反过来（await 完再显示）在网络慢时会表现为"点了设置没反应"。
     el.setSteamSec.hidden = !state.desktop;
     el.setAcctSec.hidden = !state.desktop;
+    // 「数据备份」：跟下面「危险操作」同一套判断 —— 云端模式的备份在右上角「⋮」
+    // 账号菜单里已经有一对（导出我的数据 / 导入），不在这儿再摆一份。
+    el.setBackupSec.hidden = !!state.cloud;
+    setBackupState('', '');
     // 「危险操作」：云端模式的记录挂在云上，这套只清本机库 —— 不给它看，
     // 免得用户按了之后以为云上的也没了（反过来也一样）。
     el.setDangerSec.hidden = !!state.cloud;
@@ -1487,7 +1613,7 @@
     el.wipeKeep.innerHTML =
       '不会动：<code>Steam 账号与 API Key</code>、<code>Steam 安装目录</code>、' +
       '「哪个收藏夹算已通关」的设置、消息记录 —— 这些要单独在上面几节里改。<br>' +
-      '手滑了的话：页脚「导出备份」存下的 JSON 可以导回来。';
+      '手滑了的话：上面「数据备份 → 从文件导入」可以把之前导出的 JSON 导回来。';
 
     resetWipeAck();
     el.wipeMask.hidden = false;
@@ -2104,33 +2230,21 @@
       if (e.target === el.wipeMask) closeWipeConfirm();   // 点空白 = 取消
     });
 
-    // 导出备份 -> 下载 JSON（与云端版导出格式一致，可直接被「同步」弹窗导入）
-    if (el.btnExport) {
-      el.btnExport.addEventListener('click', async () => {
-        try {
-          const all = await DS.all();
-          if (!all.length) { note('当前没有可导出的数据', 'warn'); return; }
-          const blob = new Blob([JSON.stringify({
-            app: '我的游戏生涯', version: 1,
-            exportedAt: new Date().toISOString(),
-            // 收藏夹设置跟着走：它决定「哪个收藏夹算已通关」，
-            // 不带上的话换设备导入备份会按默认名重算归类。
-            prefs: DS.getPrefs(),
-            games: all
-          }, null, 1)], { type: 'application/json' });
-          const a = document.createElement('a');
-          a.href = URL.createObjectURL(blob);
-          a.download = 'gamevault-backup-' + new Date().toISOString().slice(0, 10) + '.json';
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-          note('已导出 ' + all.length + ' 款数据', 'ok');
-        } catch (e) {
-          note('导出失败：' + ((e && e.message) || e), 'err');
-        }
-      });
-    }
+    // ===== 数据备份（设置里那一节）=====
+    // 导出原来是页脚的 #btnExport，2026-09-22 搬进来；导入是它的对偶，
+    // 一起待在这一节里（以前只能去「同步」弹窗选文件）。
+    // 导入用一个**静态**的 hidden file input（不是临时 createElement）——
+    // 无头测试要能往它上面挂文件、派 change，动态建的够不着。
+    el.setBackupExport.addEventListener('click', exportBackupToFile);
+    el.setBackupImport.addEventListener('click', () => {
+      el.setBackupFile.value = '';      // 同一个文件连选两次也要能触发 change
+      el.setBackupFile.click();
+    });
+    el.setBackupFile.addEventListener('change', async (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (f) await importBackupFile(f);
+      e.target.value = '';              // 同上：别把上次的选择留着
+    });
   }
 
   // ===== 启动 =====

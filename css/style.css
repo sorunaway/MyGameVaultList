@@ -1187,6 +1187,9 @@ svg.ico.wipe-ico, .wipe-title .ico { width: 16px; height: 16px; }
 }
 .set-status.is-warn { color: var(--accent); }
 .set-status.is-err  { color: #f85149; }
+/* 成功态：以前没人定义，于是「已导出 480 款」「已绑定账号」都跟普通说明一样是暗灰的
+   —— 报喜和报忧该看得出区别。用正文色而不是绿色：绿色在这套主题里是"跌"的语义。 */
+.set-status.is-ok   { color: var(--text); }
 
 .set-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 

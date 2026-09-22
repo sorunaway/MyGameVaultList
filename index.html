@@ -328,8 +328,38 @@
           Key 在 <a href="https://steamcommunity.com/dev/apikey" target="_blank"
                    rel="noopener">这里免费申请</a>（Steam 官方页面）。
           <b>只存在这台机器上</b>（<code>desktop.json</code>），不会上传、
-          不会写进日志、也不会跟着「导出备份」走 —— 但它在本机是<b>明文</b>，
+          不会写进日志、也不会跟着「数据备份 → 导出到文件」走 —— 但它在本机是<b>明文</b>，
           和浏览器记住的密码一个性质。
+        </p>
+      </div>
+
+      <!-- ===== 数据备份 =====
+           2026-09-22 需求提的：「『数据导出到文件』这个功能也放在设置里面，这个功能
+           也比较重要，相当于玩家可以自己手动做一个备份，或者是换电脑的时候转移数据」。
+           它原来是页脚的一个小文字链接（#btnExport），两个毛病：
+             · 和它的对偶（从文件导入）本该是一件事的两半，却被拆到两个地方 ——
+               导出在页脚、导入在「同步」弹窗里
+             · 「换电脑搬数据」这种事，用户不会想到去页脚找
+           位置**刻意贴着下面那节「危险操作」**：滚下去准备删东西的时候，
+           正上方就是「先备份一份」。
+           只在本地/桌面模式显示 —— 云端模式的备份在右上角「⋮」账号菜单里
+           已经有一对（导出我的数据 / 导入），不重复摆。 -->
+      <div class="set-sec" id="setBackupSec" hidden>
+        <h4 class="set-sec-title">数据备份</h4>
+        <p class="set-hint">
+          把<b>这台设备上</b>的全部记录存成一个文件 —— 库、状态归类、手写感想、
+          隐蔽标记、收藏夹设置都在里面。<b>换电脑时</b>在新机器上用「从文件导入」
+          选它，数据就搬过去了。
+        </p>
+        <div class="set-actions">
+          <button class="btn btn-primary" id="setBackupExport" type="button">导出到文件…</button>
+          <button class="btn btn-ghost" id="setBackupImport" type="button">从文件导入…</button>
+        </div>
+        <div class="set-status" id="setBackupState"></div>
+        <input id="setBackupFile" type="file" accept=".json,application/json" hidden>
+        <p class="set-hint">
+          导入是<b>合并</b>、不是替换：文件里多出来的款会新增进来；
+          同 appid 的记录，<b>你手动标记过的状态、锁定的记录都不会被覆盖</b>。
         </p>
       </div>
 
@@ -401,10 +431,11 @@
   </div>
 </div>
 
+<!-- 页脚只剩一行统计。以前这里还挂着一个「导出备份」文字链（#btnExport）——
+     2026-09-22 搬进「设置 → 数据备份」：它不是那种"顺手点一下"的动作，
+     而且和它的对偶（从文件导入）本来就该待在一起，不该一个在页脚一个在同步弹窗。 -->
 <footer class="foot">
   <span id="footInfo"></span>
-  <button class="footlink" id="btnExport" type="button"
-          title="导出为 JSON 文件，可用于备份或迁移到云端版">导出备份</button>
 </footer>
 
 <script src="js/msglog.js"></script>
