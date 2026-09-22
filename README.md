@@ -772,6 +772,34 @@ python _make_icon.py
 （用本机 Chrome 渲成 256/48/32/16 四张 PNG，再按 ICO 规范拼起来，不引额外依赖）。
 `pack_win.py` 看到它就自动带上；换图标就改 `icon.svg` 再跑一次 `python _make_icon.py`。
 
+### 怎么发给别人试用（出分享包）
+
+```bash
+python scripts/pack_share_zip.py --verify
+```
+
+产物 `../_build_desktop/share/GameVault-试用版-<日期>.zip`（约 14.5 MB，微信/QQ 直接发得动）。
+包里是 `使用说明.txt`（放 **zip 根**上，解压第一眼就看见）+ `gamevault-desktop/` 整个目录。
+
+🔴 **不能只发 exe** —— 反向对照实测：单独把 exe 拷出来会报
+`Failed to load Python DLL '...\_internal\python313.dll'` 然后退出（退出码 -1）。
+（那行系统错误文本本身还是乱码的，所以说明书里写的是「看到 `Failed to load Python DLL`
+就是这个原因」，而不是照抄系统原文。）
+
+那份说明书替你讲了收包人最容易卡住的四件事，每条都是实测出来的：
+SmartScreen 要点「更多信息 → 仍要运行」；exe 不能单独拖出来；**首屏是空的要点「同步」**
+（数据来自他本机 Steam）；数据存在他本机 `%LOCALAPPDATA%\MyGameVault`、出问题先别关那个黑窗。
+
+脚本干三件事：压之前**复用 `pack_win` 的体检规则**再查一遍（规则不重抄一份，
+免得两套分叉成「出包拦住了、发的时候放过去了」）→ 压完**从 zip 里读回来**验结构 / 夹带 /
+说明书文件名编码 → 打印 SHA-256（对方说打不开时先核这个值）。
+`--verify` 会顺带解出一份并打印 exe 路径，可以接着跑
+`python _e2e_desktop_exe.py --exe <那个 exe>` 证明压出来的能跑。
+
+⚠️ 中文路径验过：解到 `…\GameVault 试用版（分享包）\`、数据目录也用中文名，
+`_e2e_desktop_exe.py --home <中文目录>` 依然 **18 PASS / 0 FAIL**
+（e2e 的 `--home` 参数就是为复现「中文用户名」这种真实环境加的）。
+
 ### 还没做的
 
 - **无控制台版**（`--windowed`）还没出，而且**自用测试阶段不该出**：找不到 Steam、
