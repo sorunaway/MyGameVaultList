@@ -1025,6 +1025,84 @@ input, textarea, select { font-family: inherit; }
   flex: none;
 }
 
+/* ======================================================================
+   二级确认窗：清空游戏记录（#wipeMask）
+   ----------------------------------------------------------------------
+   它和普通弹窗是一套骨架，刻意做了两处区别：
+     · 比常规弹窗窄（430 vs 460）→ 视线更集中，一眼看出「换了一层」
+     · 头尾走红调（边线 + 标题 + 底色），和刚才那个设置面板视觉上断开
+   之所以不惜代价不复用 native confirm()：那个只有一行字，
+   既说不清删的是哪几样东西，也没有任何「需要用户动手」的阻力 ——
+   连续回车就能点掉。这一层把「代价」摊开写，再用勾选框卡住确认键。
+   层级：设置弹窗本身是 .modal-mask(z-index 50)，本层必须压在上面。 */
+#wipeMask { z-index: 55; }
+.modal-wipe {
+  width: min(430px, 100%);
+  border-color: rgba(248,81,73,.45);
+}
+.modal-wipe .modal-head {
+  background: rgba(248,81,73,.07);
+  border-bottom-color: rgba(248,81,73,.28);
+}
+.wipe-title {
+  font-size: 15px; font-weight: 640; color: #f85149;
+  display: flex; align-items: center; gap: 7px;
+}
+svg.ico.wipe-ico, .wipe-title .ico { width: 16px; height: 16px; }
+
+/* 要删的东西：逐条列出来，每条前面一个红点。
+   用真实数量而不是「所有数据」这种笼统说法 —— 看得见代价才叫确认。 */
+.wipe-ask { font-size: 13px; color: var(--text-dim); }
+.wipe-list {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 7px;
+}
+.wipe-list li {
+  position: relative;
+  padding-left: 17px;
+  font-size: 13px; line-height: 1.5; color: var(--text);
+}
+.wipe-list li::before {
+  content: '';
+  position: absolute; left: 3px; top: 7px;
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #f85149;
+}
+.wipe-list li b { color: #f85149; font-weight: 640; }
+.wipe-list li em { color: var(--text-dim); font-style: normal; }
+
+/* 「这些不会被删」—— 写出来是为了打消「会不会把账号/目录也清掉」的顾虑，
+   用户才敢按下确认键；不然他会去别处乱试。 */
+.wipe-keep {
+  font-size: 12.5px; line-height: 1.65; color: var(--text-faint);
+  border-top: 1px solid var(--border-soft);
+  padding-top: 11px;
+}
+.wipe-keep code {
+  background: var(--bg); padding: 1px 5px; border-radius: 4px;
+  font-size: 11.5px; color: var(--text-dim);
+  border: 1px solid var(--border-soft);
+}
+
+/* 勾选框是「确认键的闸门」：没勾上，确认键就是 disabled 的。
+   这是全流程里唯一一处**主动动作**，成本故意设计得比点一下高。 */
+.wipe-ack {
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 10px 11px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13px; line-height: 1.5; color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.wipe-ack:hover { border-color: rgba(248,81,73,.5); }
+.wipe-ack input {
+  width: 15px; height: 15px; margin: 1px 0 0;
+  flex: none; accent-color: #f85149; cursor: pointer;
+}
+.wipe-ack b { color: #f85149; font-weight: 640; }
+
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field > span { font-size: 12.5px; color: var(--text-dim); font-weight: 500; }
 .field > span b { color: var(--accent); }
@@ -1124,6 +1202,55 @@ input, textarea, select { font-family: inherit; }
    跟暗色主题打架。 */
 .set-hint a { color: var(--accent); text-decoration: none; }
 .set-hint a:hover { text-decoration: underline; }
+
+/* ======================================================================
+   设置弹窗：危险操作（清空本机游戏记录）
+   ----------------------------------------------------------------------
+   红不是装饰。这一节干的事和上面几节**性质完全不同**（那些是改配置，
+   这一节是删数据），所以整节用红调把它隔离出来：左侧竖色条 + 红底微光 +
+   红标题 + 实心红按钮 —— 用户滚到这里，不必读字就知道「这里不能乱点」。
+   以前它是右上角「⋮」里的一个 native confirm，和「同步」并排；
+   挪进来之后再叠一层 #wipeMask 确认窗（见上面那一节）。 */
+.set-sec-danger {
+  border-top: none;
+  border-left: 3px solid #f85149;
+  background: rgba(248,81,73,.055);
+  border-radius: 10px;
+  padding: 14px 13px;
+}
+.set-sec-danger .set-sec-title {
+  color: #f85149;
+  display: flex; align-items: center; gap: 7px;
+}
+.set-sec-danger .set-sec-title .ico { width: 15px; height: 15px; }
+.set-sec-danger .set-hint b { color: #f85149; }
+
+/* 高危按钮：**实心红**，是整个设置面板里最扎眼的一个。
+   刻意不复用 .btn-danger（那是详情页「删除这款游戏」的描边款，
+   还自带 margin-left:auto），两者场景不同，混用会互相牵制。
+   红底上的字用深色 —— 白字在 #f85149 上对比度只有 3:1，读起来费劲。 */
+.btn-wipe {
+  height: 36px;
+  padding: 0 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid #f85149;
+  background: #f85149;
+  color: #1a0d0c;
+  font-size: 13.5px;
+  font-weight: 640;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.btn-wipe:hover { background: #ff6a63; border-color: #ff6a63; }
+.btn-wipe:active { background: #e03a32; }
+/* 闸门没开（没勾确认框）时彻底熄火：留个红边框提醒「它是红的」，
+   但没有任何可点的暗示 —— 别让它看起来像能按。 */
+.btn-wipe:disabled,
+.btn-wipe:disabled:hover {
+  background: none;
+  border-color: var(--border);
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
 
 /* 候选目录的圆片：比收藏夹圆片多一行来源说明，且要放得下长路径 */
 .set-chip-dir {

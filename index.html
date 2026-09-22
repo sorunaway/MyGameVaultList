@@ -53,6 +53,11 @@
       <svg viewBox="0 0 24 24" class="ico"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>
       设置
     </button>
+    <!-- 「⋮」：**只有云端模式用它**（js/cloud.js takeoverUI 把它换成账号菜单）。
+         它原来在本地/桌面模式下装着「清空所有本地数据」—— 一个一键删库的高危动作，
+         却和「同步」「设置」并排放在最外层，误触一下就没了。2026-09-22 移除：
+         危险动作搬进「设置 → 危险操作」，本地/桌面模式下这个按钮由 ui.js 直接隐藏
+         （留着也是空的）。⚠️ 别在本地模式下往里塞新功能 —— 会和云账号菜单打架。 -->
     <button class="btn btn-ghost" id="btnMenu" title="更多">
       <svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
     </button>
@@ -327,10 +332,71 @@
           和浏览器记住的密码一个性质。
         </p>
       </div>
+
+      <!-- ===== 危险操作 =====
+           以前「清空数据」挂在右上角「⋮」上（一个和「同步」并排的灰色小点），
+           点一下就是全库记录蒸发 —— 误触的代价太大。2026-09-22 搬进设置：
+             · 位置：设置弹窗**最底部**，要主动滚下来才看得见
+             · 颜色：整节走红色，和上面几节明显不是一类
+             · 二次确认：#wipeMask 是一层**独立**的确认窗（不是 native confirm），
+               必须勾掉「我知道找不回来」那个框，「确认清空」才会亮
+           只在本地/桌面模式显示（云端模式的本地库里没有这些记录，
+           它的「⋮」是账号菜单，本来也没这个入口）。 -->
+      <div class="set-sec set-sec-danger" id="setDangerSec" hidden>
+        <h4 class="set-sec-title">
+          <svg viewBox="0 0 24 24" class="ico"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01"/></svg>
+          危险操作
+        </h4>
+        <p class="set-hint">
+          清空<b>这台设备上</b>的游戏记录 —— 库、状态归类、手写感想、隐蔽标记全在里面。
+          Steam 那边的时长和成就重新同步就能回来，
+          <b>但手写的东西删了就真的没了</b>。
+        </p>
+        <div class="set-actions">
+          <button class="btn btn-wipe" id="setWipe" type="button">
+            清空全部游戏记录…
+          </button>
+        </div>
+      </div>
     </div>
     <div class="modal-foot">
       <button class="btn btn-ghost" id="setReset">恢复默认</button>
       <button class="btn btn-primary" id="setSave">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 二级确认窗：清空游戏记录 =====
+     刻意**不复用** native confirm()：那个只有一行字、两个按钮，
+     既说不清「删的是哪些东西」，也没法要求用户做任何动作就点掉了。
+     这层要满足三件事：
+       1. 列出真实数量（多少款记录、其中多少款有手写感想）—— 让代价看得见
+       2. 明确写出**不会**被删的东西（Steam 账号 / 安装目录 / 收藏夹设置）
+       3. 勾选「我知道找不回来」才解锁「确认清空」，避免连点/回车误触
+     Esc 和点空白处一律视为取消（关掉不执行）。 -->
+<div class="modal-mask" id="wipeMask" hidden>
+  <div class="modal modal-wipe">
+    <div class="modal-head">
+      <h3 class="wipe-title">
+        <svg viewBox="0 0 24 24" class="ico"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01"/></svg>
+        清空全部游戏记录？
+      </h3>
+      <button id="wipeClose" class="iconbtn" aria-label="关闭">
+        <svg viewBox="0 0 24 24" class="ico"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="wipe-ask">这一步无法撤销。将要删掉的是：</div>
+      <ul class="wipe-list" id="wipeList"></ul>
+      <div class="wipe-keep" id="wipeKeep"></div>
+      <label class="wipe-ack">
+        <input type="checkbox" id="wipeAck">
+        <span>我知道上面这些记录删掉之后<b>找不回来</b>（除非之前导出过备份）</span>
+      </label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="wipeCancel" type="button">取消</button>
+      <button class="btn btn-wipe" id="wipeGo" type="button" disabled>确认清空</button>
     </div>
   </div>
 </div>

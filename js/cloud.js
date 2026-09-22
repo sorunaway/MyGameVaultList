@@ -1433,6 +1433,10 @@
     if (oldMenu) {
       const fresh = oldMenu.cloneNode(true);
       oldMenu.parentNode.replaceChild(fresh, oldMenu);
+      // 本地/桌面模式下 ui.js 会把这个按钮隐藏（它原来装的「清空数据」已搬进
+      // 「设置 → 危险操作」，按钮空了）；云端模式要把它拿回来当账号菜单 ——
+      // cloneNode 会把 hidden 属性一起复制过来，所以这里显式冲掉。
+      fresh.hidden = false;
       fresh.addEventListener('click', function (e) {
         e.stopPropagation();
         toggleMenu();

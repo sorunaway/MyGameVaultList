@@ -25,7 +25,12 @@
     selected: {},           // 已选中的游戏 id（当 Set 用：{ id: true }）
     noteTargetId: null,
     syncPayload: null,
-    desktop: false          // 是否跑在桌面版里（boot 里探测出来后置真）
+    desktop: false,         // 是否跑在桌面版里（boot 里探测出来后置真）
+    // 是否云端模式（boot 里算出来的）。用途：
+    //  · 决定右上角「⋮」按钮留不留（云端那边它被账号菜单接管，本地这边已清空）
+    //  · 决定设置里「危险操作」那一节显不显示（云端模式的记录在云上，
+    //    这套清除只清本机库，给它看只会误导）
+    cloud: false
   };
 
   /**
@@ -132,7 +137,18 @@
     btnSync:     $('#btnSync'),
     btnSettings: $('#btnSettings'),
     btnMenu:     $('#btnMenu'),
-    btnExport:   $('#btnExport')
+    btnExport:   $('#btnExport'),
+
+    // 设置里的「危险操作」+ 它弹出的二级确认窗（#wipeMask）
+    setDangerSec: $('#setDangerSec'),
+    setWipe:      $('#setWipe'),
+    wipeMask:     $('#wipeMask'),
+    wipeList:     $('#wipeList'),
+    wipeKeep:     $('#wipeKeep'),
+    wipeAck:      $('#wipeAck'),
+    wipeGo:       $('#wipeGo'),
+    wipeCancel:   $('#wipeCancel'),
+    wipeClose:    $('#wipeClose')
   };
 
   // ===== 工具 =====
@@ -1384,6 +1400,7 @@
    * 把它们叫什么，纯靠手敲很容易差一个字，然后归类静默不生效。
    *
    * 桌面版还多一节「Steam 安装目录」（别的玩家的 Steam 不一定装在哪）。
+   * 底部固定有「危险操作」一节（清空本机记录）—— 本地/桌面模式才显示。
    */
   async function openSettings() {
     const p = DS.getPrefs();
@@ -1395,6 +1412,13 @@
     //    反过来（await 完再显示）在网络慢时会表现为"点了设置没反应"。
     el.setSteamSec.hidden = !state.desktop;
     el.setAcctSec.hidden = !state.desktop;
+    // 「危险操作」：云端模式的记录挂在云上，这套只清本机库 —— 不给它看，
+    // 免得用户按了之后以为云上的也没了（反过来也一样）。
+    el.setDangerSec.hidden = !!state.cloud;
+    // 每次重开设置都把确认窗的闸门复位：上次勾过/点开过，不该带进这一次。
+    // （不然「关闭设置 → 再打开 → 点清空」会直接出现一个已经勾好的确认框）
+    el.wipeMask.hidden = true;
+    resetWipeAck();
     if (state.desktop) {
       el.setSteamDir.value = '';
       el.setSteamFound.hidden = true;
@@ -1414,6 +1438,87 @@
   }
 
   function closeSettings() { el.setMask.hidden = true; }
+
+  // ===== 危险操作：清空本机游戏记录（二级确认）=====
+  // 路径：设置面板底部「清空全部游戏记录…」→ #wipeMask 确认窗 → 勾掉授权框
+  // → 「确认清空」才真删。以前这条路挂在右上角「⋮」上、用两个 native confirm，
+  // 2026-09-22 提出：那是高危动作，不该待在最外层，误触一下全库就没了。
+
+  /** 闸门复位：没勾授权框，「确认清空」就一直是 disabled */
+  function resetWipeAck() {
+    el.wipeAck.checked = false;
+    el.wipeGo.disabled = true;
+  }
+
+  /**
+   * 数出「这一下会删掉什么」。
+   * 刻意用**真实数量**而不是「所有数据」这种笼统说法 —— 确认窗的全部价值就在于
+   * 让代价看得见。手写感想单独拎出来数：它是这里唯一「重新同步也补不回来」的东西，
+   * 也是用户最该停下来想一秒的地方。
+   */
+  function wipeSummary() {
+    const all = state.games || [];
+    return {
+      total: all.length,
+      withNote: all.filter(g => g.myNote && String(g.myNote).trim()).length,
+      manual:   all.filter(g => g.source === 'manual').length,
+      wishlist: all.filter(g => g.source === 'wishlist').length,
+      tidied:   all.filter(g => g.statusManualAt || g.statusLocked || g.favorite ||
+                                g.hidden || g.status !== S.LIBRARY).length
+    };
+  }
+
+  function openWipeConfirm() {
+    const s = wipeSummary();
+    const li = ['<li><b>' + s.total + '</b> 款游戏记录 <em>（整库，包含工具与已隐藏的）</em></li>'];
+    if (s.tidied) {
+      li.push('<li>状态归类与标记，<b>' + s.tidied + '</b> 款受影响 ' +
+              '<em>（已通关 / 放弃区 / 锁定 / 隐藏）</em></li>');
+    }
+    if (s.withNote) {
+      li.push('<li><b>' + s.withNote + '</b> 条你手写的感想 <em>（重新同步也补不回来）</em></li>');
+    }
+    if (s.manual)   li.push('<li><b>' + s.manual + '</b> 款手动添加的游戏</li>');
+    if (s.wishlist) li.push('<li><b>' + s.wishlist + '</b> 款愿望单里的记录</li>');
+    el.wipeList.innerHTML = li.join('');
+
+    // 顺带写清「哪些不会动」。不写的话两头都会出事：
+    // 想清干净的人以为没清干净，怕误删的人以为连账号一起删了。
+    el.wipeKeep.innerHTML =
+      '不会动：<code>Steam 账号与 API Key</code>、<code>Steam 安装目录</code>、' +
+      '「哪个收藏夹算已通关」的设置、消息记录 —— 这些要单独在上面几节里改。<br>' +
+      '手滑了的话：页脚「导出备份」存下的 JSON 可以导回来。';
+
+    resetWipeAck();
+    el.wipeMask.hidden = false;
+    // 焦点给「取消」：默认落在安全的那一边（回车不会误确认）
+    try { el.wipeCancel.focus(); } catch (e) { /* ignore */ }
+  }
+
+  function closeWipeConfirm() {
+    el.wipeMask.hidden = true;
+    resetWipeAck();
+  }
+
+  async function doWipe() {
+    if (el.wipeGo.disabled) return;     // 闸门没开（防脚本/回车误触）
+    const s = wipeSummary();
+    el.wipeGo.disabled = true;          // 防连点：删一次就够
+    try {
+      await DS.clear();
+      await reload();
+      closeWipeConfirm();
+      closeSettings();
+      render();
+      note('已清空本机 ' + s.total + ' 款记录' +
+           (s.withNote ? '（含 ' + s.withNote + ' 条手写感想）' : '') +
+           ' —— 要找回只能用之前导出的备份', 'warn');
+    } catch (e) {
+      el.wipeGo.disabled = false;
+      closeWipeConfirm();
+      note('清空失败：' + ((e && e.message) || e), 'err');
+    }
+  }
 
   // ===== 桌面版：Steam 安装目录 =====
 
@@ -1961,6 +2066,8 @@
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
         if (!el.noteMask.hidden) return closeNoteEditor();
+        // 确认窗叠在设置之上 → 必须比设置先收掉，否则 Esc 会连设置一起关掉
+        if (!el.wipeMask.hidden) return closeWipeConfirm();
         if (!el.modalMask.hidden) return closeAddModal();
         if (!el.syncMask.hidden) return closeSyncModal();
         if (!el.setMask.hidden) return closeSettings();
@@ -1978,13 +2085,23 @@
       }
     });
 
-    // 菜单按钮 -> 清空数据（带二次确认）
-    el.btnMenu.addEventListener('click', async () => {
-      if (!confirm('是否清空所有本地数据？\n\n（Steam 数据可以重新同步，但手写的记录会一并删除）')) return;
-      if (!confirm('再确认一次：真的要清空吗？')) return;
-      await DS.clear();
-      await reload();
-      render();
+    // 🔴 右上角「⋮」**不再**挂「清空数据」（2026-09-22 移除）。
+    //    它原来和「同步」「设置」并排，点一下就走 native confirm 删库 ——
+    //    位置太外露、确认太轻。现在这条路只剩「设置 → 危险操作」一个入口。
+    //    本地/桌面模式下这个按钮已无内容（由 boot 里的 state.cloud 决定是否隐藏），
+    //    云端模式下它被 js/cloud.js 接管成账号菜单 —— 两边都别在这里抢着绑事件。
+
+    // ===== 危险操作：清空本机记录（设置里的入口 + 独立的确认窗）=====
+    el.setWipe.addEventListener('click', openWipeConfirm);
+    el.wipeCancel.addEventListener('click', closeWipeConfirm);
+    el.wipeClose.addEventListener('click', closeWipeConfirm);
+    // 勾选框就是确认键的闸门：不勾，按钮是 disabled 的
+    el.wipeAck.addEventListener('change', () => {
+      el.wipeGo.disabled = !el.wipeAck.checked;
+    });
+    el.wipeGo.addEventListener('click', doWipe);
+    el.wipeMask.addEventListener('click', (e) => {
+      if (e.target === el.wipeMask) closeWipeConfirm();   // 点空白 = 取消
     });
 
     // 导出备份 -> 下载 JSON（与云端版导出格式一致，可直接被「同步」弹窗导入）
@@ -2049,6 +2166,16 @@
     // 桌面版**也**不走云模式：它要的是「离线 + 本机数据」，
     // 云登录在桌面版里既没必要（数据就在本机），也走不通（OpenID 回调要注册过的 HTTPS 域）。
     const cloudMode = !!(window.Cloud && window.Cloud.enabled && !forceLocal && !desktopMode);
+    state.cloud = cloudMode;
+
+    // 右上角「⋮」的处理（与 js/cloud.js takeoverUI 分工，别互相抢）：
+    //   · 云端模式 -> 留给 cloud.js，它会把按钮换成账号菜单
+    //   · 其余模式 -> 这个按钮已经没有任何内容了（原来的「清空数据」搬进了设置），
+    //     直接隐藏，别留一个点了没反应的死按钮
+    // ⚠️ 必须在这里按 cloudMode 隐藏，而不是在 index.html 上写 `hidden`：
+    //    cloud.js 是 cloneNode(true) 接管按钮的，属性会被一起复制过去 ——
+    //    写在 HTML 上会把云端模式的账号菜单一起藏掉。
+    if (!cloudMode && el.btnMenu) el.btnMenu.hidden = true;
 
     // ---- URL 参数先解析进 state ----
     // 必须放在「云端登录」之前：登录界面期间 state 已经就位，
