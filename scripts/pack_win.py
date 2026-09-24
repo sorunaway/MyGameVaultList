@@ -111,6 +111,16 @@ RE_STEAMID = re.compile(r"7656119\d{9,11}")
 # ⚠️ 例外：SteamID64 的**公开基准常量**（accountID = 0），做换算的代码都会写它，
 #    不含任何个人信息。必须**精确相等**才放行。
 STEAMID64_BASE = "76561197960265728"
+
+# 🔴 **这份名单与 `scripts/check_repo_leak.py` 的 `PUBLIC_STEAMIDS` 必须一致** ——
+#    两套规则一分叉，早晚是「出包时拦住了、发的时候放过去了」（`pack_share_zip` 顶部
+#    也是这个理由直接 import 本模块的体检规则）。
+#    目前它对本模块**没有实际作用**（`server/app.py` 是冻进 exe 的 PYZ、不落地成文本，
+#    所以这里扫不到），但规则一旦不对齐，等哪天它落地了就会出现两边结论不一致。
+PUBLIC_STEAMIDS = {
+    STEAMID64_BASE,
+    "76561197960287930",   # Valve 官方账号（`VERIFY_PROBE_STEAMID`，公开探活用）
+}
 RE_HEXKEY = re.compile(r"\b[0-9A-Fa-f]{32}\b")
 
 # 体检时跳过的文件：二进制 / 已压缩
@@ -222,7 +232,7 @@ def audit_dir(root, label):
             continue
 
         for m in RE_STEAMID.finditer(text):
-            if m.group(0) == STEAMID64_BASE:
+            if m.group(0) in PUBLIC_STEAMIDS:
                 continue
             problems.append("[%s] %s 含 SteamID：%s" % (label, rel, m.group(0)))
         for m in RE_HEXKEY.finditer(text):

@@ -1010,7 +1010,11 @@
       // 那句话把判断带偏过两次（见 .workbuddy/memory/DESIGN.md）。
       // 现在原因标识由服务端给（server/steam_client.py 的 _ERROR_KINDS），
       // 中文措辞留在前端 —— 以后改文案不用动服务端。
-      if (achStat.linkDown) {
+      if (achStat.linkDown && achStat.fatal === 'denied') {
+        // 和"链路断"分开说：网络会自己好（下次同步自动继续），Key 被拒不会。
+        // 不明说"去换 Key"的话，用户会一直点同步、一直失败。
+        tail.push('API Key 被 Steam 拒绝，成就核对整轮跳过 —— 去「设置」里换一把 Key，重试没有用');
+      } else if (achStat.linkDown) {
         tail.push('这次连不上 Steam（网络不通），成就核对整轮跳过，下次同步自动继续');
       } else if (achStat.unknown) {
         const tally = achStat.reasons || {};
@@ -1201,6 +1205,9 @@
     dns: '域名解析失败',
     ratelimit: '被限流',
     private: '这款档案不公开',
+    // Key 被 Steam 明确拒绝。**和上面那些不是一类**：网络类会自己好，这个不会 ——
+    // 用户看到"超时/连接被中断"会想"等会儿再试"，看到这条才该去换 Key。
+    denied: 'API Key 被拒绝',
     other: '其他错误'
   };
 
@@ -1300,8 +1307,9 @@
     try {
       const p = await apiGet('/api/steam/ping');
       if (p && p.ok === false) {
+        // 预检只回答"链路通不通"（403 也算通），所以这里永远没有 fatal。
         return { scanned: 0, perfect: 0, unknown: 0, left: noData.length,
-                 linkDown: true, reasons: {} };
+                 linkDown: true, fatal: '', reasons: {} };
       }
     } catch (e) {
       console.warn('链路预检不可用（按「未断」处理，继续扫描）', e);
@@ -1310,6 +1318,9 @@
     const total = work.length;
     let doneCount = 0, patch = [], unknown = 0, perfect = 0;
     let cursor = 0, batchSize = ACH_BATCH, linkDown = false;
+    // fatal：link 变 down 时，原因是**永久性**的（Key 被拒）就记在这 ——
+    // 措辞时必须和"链路断"分开，否则用户会对着一个永远好不了的错误反复点同步。
+    let fatalReason = '';
     const reasonTally = {};
 
     // 用 while + 游标，而不是 for…of chunk：批大小要**按服务端回报的链路质量
@@ -1338,6 +1349,9 @@
       // 而实测 4000+ 次请求一个 429 都没有，失败全在 TLS/读取层，那句话是错的。
       // 现在按真实原因措辞，并据此决定「还值不值得往下扫」「下一批开多大」。
       if (d && d.link === 'down') linkDown = true;
+      // 服务端判定"别再问了"时，如果是**永久性**原因（Key 被拒）会带上 fatal，
+      // 前端据此换一套措辞 —— 不然"Key 不对"会被说成"网络不通，下次自动继续"。
+      if (d && d.fatal) fatalReason = d.fatal;
       if (d && d.link === 'degraded') batchSize = ACH_BATCH_DEGRADED;
       if (d && d.reasons) {
         Object.keys(d.reasons).forEach(function (k) {
@@ -1401,7 +1415,7 @@
     if (!patch.length) {
       if (fullDone) await markAchFull();
       return { scanned: 0, perfect: 0, unknown: unknown, left: left,
-               reasons: reasonTally, linkDown: linkDown };
+               reasons: reasonTally, linkDown: linkDown, fatal: fatalReason };
     }
 
     // 走原有的合并规则：全成就的会被自动归到「已通关」，
@@ -1414,7 +1428,7 @@
 
     if (fullDone) await markAchFull();
     return { scanned: n, perfect: perfect, unknown: unknown, left: left,
-             reasons: reasonTally, linkDown: linkDown };
+             reasons: reasonTally, linkDown: linkDown, fatal: fatalReason };
   }
 
   // ============================================================

@@ -455,6 +455,69 @@
     ).join('');
   }
 
+  // ============================================================
+  // 界面选项的持久化（筛选开关 + 排序 + 全成就分组）
+  // ============================================================
+  //
+  // 🔴 为什么要有（2026-09-24 用户实测投诉）：
+  //    「筛选选项我每次启动后都默认是隐藏家庭库…我手动修改并退出后，我修改的
+  //      筛选选项不保存，每次启动都必须要重新设置」。
+  //    根因：`state` 里这几个开关**只活在内存里** —— 全项目搜一遍，没有任何一处
+  //    把它们写进 localStorage / IndexedDB，于是每次启动都回落到默认值。
+  //    （`state.filterOpen` 是例外：「面板展开没展开」是纯瞬时状态，**故意不存**。）
+  //
+  // 存哪儿：单独一个键。**故意不并进 `store.js` 的 `gv_prefs_v1`**，两个理由：
+  //   · 那份 prefs 是「哪个 Steam 收藏夹算「已通关」」的**数据语义**配置，会被
+  //     备份导出带上、被导入时的 `DS.setPrefs(data.prefs)` 生效 —— 把界面开关塞进去，
+  //     等于「导入一份别人的备份顺手改掉自己的界面」；
+  //   · 这一份丢了只影响观感，不该跟任何数据有连锁。
+  //
+  // 🔴 与 URL 参数的关系：**URL 参数优先**。`?hidedone=1` 这类是「这一次打开就要
+  //    这样」的明确指令（也给自动化验收留的入口），不能被上次存下来的值盖掉。
+  //    所以 `boot()` 里的顺序是：**先读存档 → 再让 URL 参数覆盖**。
+  //
+  // ⚠️ 边界（刻意的）：**`view`（当前在哪个区块）不存**。区块切换是"导航"，
+  //    而这里存的是"这个区块该怎么显示"。启动落在「正在游玩」是既有设计
+  //    （空库时会自动退到「待游玩」），改成"上次停在哪就回哪"会让人一打开
+  //    就掉进「已通关」这类次级区块里，反而更难回到主界面。
+  const UI_KEY = 'gv_ui_v1';
+
+  /** 会被记住的选项 —— 与下面 `filterToggles()` 一一对应，外加减少了排序与全成就分组 */
+  const UI_BOOL_KEYS = ['hideTools', 'hideCompleted', 'hideAbandoned', 'hideFamily',
+                        'groupPerfect'];
+
+  function loadUiPrefs() {
+    let saved = null;
+    try {
+      const raw = window.localStorage.getItem(UI_KEY);
+      saved = raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      // 隐私模式 / 禁用存储 / 存档被手改坏成非法 JSON —— 一律用默认值继续，
+      // 这里**绝不能抛**：它跑在 boot 最前面，抛出去就是整个界面起不来。
+      saved = null;
+    }
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return false;
+
+    // 逐项**显式**校验类型，别用 `if (saved[k])`：
+    // 这份存档是用户机器上的字符串，可能是旧版本写的、也可能被手改过。
+    // 一个 `"hideTools": "false"`（字符串）在真值判断下会被当成 `true` ——
+    // 而症状是"我明明没开这个开关，它却总是开着"，属于最难查的那类"改了不见效"。
+    UI_BOOL_KEYS.forEach(k => {
+      if (typeof saved[k] === 'boolean') state[k] = saved[k];
+    });
+    // 排序要落在白名单里：旧版本可能存过一个后来被删掉的排序键，
+    // 直接用会让 `sortGames` 走进没有分支的 default（列表顺序会变得莫名其妙）。
+    if (SORTS.indexOf(saved.sort) >= 0) state.sort = saved.sort;
+    return true;
+  }
+
+  function saveUiPrefs() {
+    const snap = { sort: state.sort };
+    UI_BOOL_KEYS.forEach(k => { snap[k] = !!state[k]; });
+    try { window.localStorage.setItem(UI_KEY, JSON.stringify(snap)); }
+    catch (e) { /* 存不下就算了 —— 界面开关丢了不影响任何数据 */ }
+  }
+
   /**
    * 总表（我的游戏单）的三个过滤开关：隐藏非游戏 / 隐藏已通关 / 隐藏已放弃。
    * 三者互相独立、可叠加；数量为 0 的开关不显示；只与总库有关，其他区块整个隐藏。
@@ -505,6 +568,9 @@
     b.addEventListener('click', () => {
       const t = filterToggles().find(x => x.id === id);
       if (t) t.run();
+      // 开关一改就落盘 —— 不能等到关窗再存（桌面版可能被直接 kill，
+      // 浏览器版也没有可靠的"退出前"事件），见 UI_KEY 那段。
+      saveUiPrefs();
       render();
     });
     el.filterPanel.appendChild(b);
@@ -1285,12 +1351,40 @@
   function onlineFailText(reason) {
     return {
       profile_private: 'Steam 的「游戏详情」没有设为公开，读不到你的库',
+      // ⚠️ 这条和 steam_unreachable 是**解法完全相反**的两种失败：
+      //    上面那条等一会儿就好，这条**重试到天亮也不会好** ——
+      //    所以必须明说"去换 Key"，否则用户会一直点同步、一直失败。
+      steam_key_rejected: 'Steam 拒绝了这个 API Key（失效或填错了）—— 去「设置」里换一把，重试没有用',
       steam_unreachable: '连不上 Steam（跨境链路抖动），过几秒再点一次「同步」通常就好了',
       no_key: '还没有填 Steam Web API Key',
       no_steamid: '还没有绑定 SteamID',
       fetch_failed: '本机服务没有响应',
       empty: 'Steam 返回的游戏库是空的'
     }[reason] || ('联网同步失败（' + (reason || '原因不明') + '）');
+  }
+
+  /**
+   * 愿望单那一行的失败文案。
+   *
+   * ⚠️ 这里只兜「服务端没说清」的兜底情况 —— 服务端给了 `message` 就**优先用它**
+   *    （它知道究竟是没 Key、Key 被拒、还是资料没公开）。所以下面的 key 与
+   *    `local-src.js` 里 `syncWishlist` 的 `reason` 一一对应，
+   *    别在这儿改成另一套词，否则同一件事会有两种说法。
+   */
+  function wishFailText(reason) {
+    return {
+      // 「空」和「没公开」Steam 返回的是同一份数据，分不开 —— 别把话说死
+      // ⚠️ 这里是**纯文本**（会过 esc() 塞进 <b> 里），写 Markdown 的 `**` 只会被原样显示
+      unavailable: '愿望单没读到（可能是空的，也可能是没公开）',
+      empty: '愿望单这次返回的是空的，已跳过（不做任何删除）',
+      // 和 onlineFailText 同一个道理：Key 失效不会自己好，重试没有出口
+      steam_key_rejected: 'Steam 拒绝了这个 API Key —— 去「设置」里换一把，重试没有用',
+      steam_unreachable: '连不上 Steam（跨境链路抖动），过几秒再点一次「同步」通常就好了',
+      no_key: '还没有填 Steam Web API Key',
+      fetch_failed: '本机服务没有响应',
+      no_steamid: '还没有绑定 SteamID',
+      bad_response: '服务端回了个看不懂的响应'
+    }[reason] || ('愿望单没读到（' + (reason || '原因不明') + '）');
   }
 
   // 「去申请 API Key」的官方地址。写成常量：同步面板和账号设置两处都要用，
@@ -1442,6 +1536,7 @@
     return {
       profile_private: '他的「游戏详情」没有设为公开，读不到他的库',
       no_key: '缺 API Key（读别人的库也要 key）',
+      steam_key_rejected: 'API Key 被 Steam 拒绝 —— 换一把，重试没有用',
       steam_unreachable: '连不上 Steam（跨境链路抖动）',
       fetch_failed: '本机服务没有响应',
       bad_response: '返回内容看不懂',
@@ -1531,8 +1626,13 @@
                      (o.total || 0) + ' 款（新增 ' + (o.added || 0) + '）']);
           if (o.newIds && o.newIds.length) newIds = o.newIds;
           if (o.stale) {
-            onlineBad = o.staleMessage || '这次没连上 Steam，用的是上次的结果';
-            rows.push(['⚠️ 这次没连上 Steam', '显示的是上一次的结果']);
+            // stale 有两种原因，解法相反：Key 被拒要**去换一把**，链路抖动等一会儿就好。
+            // 都用"这次没连上 Steam"会把用户指向错的方向（而这正是修这条链路的起因）。
+            onlineBad = o.staleMessage ||
+              (o.keyRejected ? 'API Key 被拒绝，用的是上次的结果'
+                             : '这次没连上 Steam，用的是上次的结果');
+            rows.push([o.keyRejected ? '⚠️ API Key 被拒绝' : '⚠️ 这次没连上 Steam',
+                       '显示的是上一次的结果']);
           }
         } else {
           const reason = (o && o.reason) || 'unknown';
@@ -1548,6 +1648,56 @@
         }
       } else {
         rows.push(['联网补全量', '未绑定账号 —— 设置 →「Steam 账号」']);
+      }
+
+      // ---- ②.5 Steam 愿望单（「愿望单 -> 待游玩」）----
+      //
+      // 🔴 为什么这一步以前不存在、现在必须有（2026-09-24 用户实测：
+      //    绑好 STEAMID + 新 Key、同步跑完，「待游玩」还是 0）：
+      //    愿望单那条链（`/api/steam/wishlist` + `DS.mergeWishlist` + 卡片上的
+      //    「未入库」角标）**早就全写好了**，但唯一的调用点在 `cloud.js` 的
+      //    `syncNow` —— 那是浏览器 / 云端路径。桌面版的同步入口是这个函数，
+      //    它原来只有 ①本机 ②联网 ③家庭库三步，**从来没有拉过愿望单**，
+      //    于是 `status='backlog'` 的记录一条都建不出来，那个数字永远是 0，
+      //    而且**没有任何报错**（静默缺失，比报错难查得多）。
+      //
+      // 顺序：排在 ② 之后、③ 之前。两条理由：
+      //   · 和 ② 一样要"有账号 + 能出网"，紧跟 ② 失败信息才连得起来；
+      //   · **必须在 ③ 之前** —— `store.js` 的 `mergeFamily` 对"我库里已有"的
+      //     appid 一律跳过（连标记都不写）。愿望单先落记录，愿望单里的款就
+      //     不会先被家庭库抢走 `source='family'`；被抢走的话它既不在「待游玩」、
+      //     默认又被「家人拥有」开关藏着 = 在界面里**凭空消失**。
+      //
+      // ⚠️ 与 ② 同一条纪律：**不自己判「有没有 Key」**。缺 Key / Key 被拒是两种
+      //    不同的原因（一个要申请、一个要更换），只有服务端分得清 —— 前端一旦
+      //    自己短路，那段「为什么不行 + 怎么修」的文案就永远到不了用户眼前。
+      //    所以只要有账号就**一律发出去**，由服务端归因。
+      let wishOk = false, wishReason = '', wishBad = '', wishCount = 0, wishAdded = 0;
+      let wishIds = [];
+      if (p.sid) {
+        setSyncStatus('正在读 Steam 愿望单…', '');
+        let w = null;
+        try { w = await window.GVLocal.syncWishlist(p.sid); } catch (e) { w = null; }
+        if (w && w.ok) {
+          wishOk = true;
+          wishCount = w.count || 0;
+          wishAdded = w.added || 0;
+          wishIds = w.appids || [];
+          rows.push(['Steam 愿望单', wishCount + ' 款（导入「待游玩」 ' + wishAdded + ' 款）']);
+          if (w.removed) rows.push(['已从愿望单移除', w.removed + ' 款，一并删掉了']);
+          if (w.kept) rows.push(['已不在愿望单但保留着', w.kept + ' 款（你动过它，不删）']);
+        } else {
+          wishReason = (w && w.reason) || 'unknown';
+          wishBad = (w && w.message) || wishFailText(wishReason);
+          rows.push(['Steam 愿望单', wishBad]);
+          // 服务端给了修法就**记进「消息」**：提示条 3 秒就没了，而"把愿望单改成公开"
+          // 这种要切到 Steam 去操作的事，用户得能回头照着做。
+          if (w && w.howToFix && w.howToFix.length) {
+            note('读不到你的 Steam 愿望单。' + (w.message || '') + '\n' +
+                 w.howToFix.map((s, i) => (i + 1) + '. ' + s).join('\n'),
+                 wishReason === 'steam_key_rejected' ? 'err' : 'warn');
+          }
+        }
       }
 
       // ---- ③ 家庭库（桌面版专有）----
@@ -1649,6 +1799,14 @@
         msg += '（仅本机：' + onlineBad + '）';
       }
       if (newIds.length) msg += '，联网新补 ' + newIds.length + ' 款';
+      // 愿望单的结果要进**状态行**（那是用户唯一会读的一行）：
+      // 导入成功就说清进了几款到哪儿；失败就说原因 —— 不然用户只能看到
+      // 「同步完成」却找不到那些想玩的游戏，而这就是他点同步的目的。
+      if (wishOk) {
+        msg += '，愿望单 ' + wishCount + ' 款（新进「待游玩」 ' + wishAdded + ' 款）';
+      } else if (wishBad) {
+        msg += '。愿望单没读成：' + wishBad;
+      }
       if (familyOk) {
         msg += '，家庭库 ' + familyTotal + ' 款（新进来 ' + familyAdded + ' 款）';
         // 有家人没读到就必须在**状态行**上也点到 —— 状态行才是用户真正会读的那一行，
@@ -1662,7 +1820,15 @@
       if (!localOk && localBad) msg += '。本机没读成：' + localBad;
       // 本机那半失败、家庭库有家人没读到，都要算"需要看一眼" ——
       // 否则状态行一句干净的「同步完成」会把它们盖掉。
-      const bad = !!onlineBad || !localOk || !!familyBad || familyMissing.length > 0;
+      //
+      // ⚠️ 愿望单那半有个刻意的区分：`unavailable`（愿望单为空**或**没公开）
+      //    Steam 给的是同一份数据，分不开 —— 它既可能是"你本来就没愿望单"
+      //    （完全正常），也可能是"隐私没开"（要去改）。这种情况**不算 bad**，
+      //    只在明细里如实写两种可能，免得每月看十几遍黄字。
+      //    其余原因（没 Key / Key 被拒 / 链路不通）是**真的没读到**，算 bad。
+      const wishHard = !!wishBad && wishReason !== 'unavailable' && wishReason !== 'empty';
+      const bad = !!onlineBad || !localOk || !!familyBad || wishHard ||
+                  familyMissing.length > 0;
       setSyncStatus(msg + '。', bad ? 'warn' : 'ok');
       note(msg, bad ? 'warn' : 'ok');
 
@@ -1673,8 +1839,20 @@
              '想看就点「筛选」→ 打开「家人拥有」。', 'ok');
       }
 
-      // 联网新进来的款本机没有封面，优先去补它们（不 await，后台跑）
-      fillMetaInBackground(newIds);
+      // 愿望单刚进来的款**连名字都还没有**（愿望单接口只给 appid），卡面会先显示成
+      // 「App <appid>」占位。这句话要主动说，否则用户会以为导入进来一堆坏数据 ——
+      // 他打开「待游玩」看到的第一眼就是这个。
+      if (wishAdded > 0) {
+        note('愿望单进来了 ' + wishAdded + ' 款，都在「待游玩」区块。' +
+             '名字和封面正在后台补（补之前卡面显示「App <appid>」占位，下次同步还会接着补）。',
+             'ok');
+      }
+
+      // 联网新进来的款本机没有封面，愿望单刚进来的**连名字都没有** ——
+      // 两类都优先去补，愿望单的排最前（「App 12345」比"有名字没封面"更难看）。
+      // ⚠️ 这里给大额度（META_BULK_LIMIT）：用户刚点完同步人就在屏幕前等，
+      //    而 45 一款一款地补，愿望单一次进来几百款就是几百张占位卡。
+      fillMetaInBackground(wishIds.concat(newIds), META_BULK_LIMIT);
     } else {
       // ---- 两半都没成 ----
       //
@@ -2136,12 +2314,16 @@
   }
 
   /**
-   * 「验证并保存」：先把用户填的**解析成 SteamID64**，再落盘。
+   * 「验证并保存」：先把用户填的**解析成 SteamID64**，再落盘，**最后真问一次 Steam**。
    *
    * 为什么要先解析：`/id/<个性网址>` 和整条资料链接都得联网问 Steam 才知道对应谁，
    * 而存一个没解析的东西进去，之后每次同步都会莫名其妙地失败。
-   * 顺带 —— 这一步同时验了 Key 通不通（`resolve_vanity` 是要 key 的），
-   * 所以用户点一下就知道自己填的这两样到底能不能用。
+   *
+   * 🔴 为什么最后那一步必须单独做（2026-09-24 修）：
+   *    解析这一步**只对个性网址 / 资料链接生效** —— 填 17 位数字 ID 时它一个请求都不发。
+   *    而绝大多数人填的就是数字 ID，于是「验证并保存」其实**从来没验证过 Key**：
+   *    用户以为验过了，等真点同步才失败，而那时的报错又指向"网络"。
+   *    所以这里显式调 `/api/steam/verify-key`，把"验 Key"变成一件**确定发生**的事。
    */
   async function onAcctVerify() {
     const rawId = (el.setAcctId.value || '').trim();
@@ -2186,6 +2368,45 @@
       // 只绑了 ID、没填 Key 的话，联网那半其实还没通 —— 别报成一句干净的
       // 「已保存」（那会让用户以为配置齐了，实测就是这么误判的）。
       const keyNow = !!(desktopStatus && (desktopStatus.hasApiKey || desktopStatus.hasEnvKey));
+
+      if (id && keyNow) {
+        // 🔴 真问一次 Steam。这一步以前缺了（见函数头注释）。三种结果**必须分开说**：
+        //    验过了 / 被 Steam 拒绝（去换一把）/ 没问到（**没测出来**，别吓用户）。
+        el.setAcctState.className = 'set-status';
+        el.setAcctState.textContent = '正在问 Steam 确认这把 Key…';
+        let v = null;
+        try { v = await window.GVLocal.verifyKey(id); } catch (e) { v = null; }
+
+        if (!v) {
+          // 连本机服务都没答复 —— 这和"Key 不对"是两回事，不能混为一谈
+          el.setAcctState.className = 'set-status is-warn';
+          el.setAcctState.textContent = '已保存，但没能确认 Key（本机服务没有响应）';
+          return;
+        }
+        if (v.ok === false) {
+          el.setAcctState.className = 'set-status is-err';
+          el.setAcctState.textContent = '已保存，但 Steam 拒绝了这个 Key —— ' +
+            (v.message || '换一把再试');
+          note('API Key 被 Steam 拒绝，联网同步暂时用不了。' +
+               ((v.howToFix && v.howToFix.length)
+                 ? '\n' + v.howToFix.map((s, i) => (i + 1) + '. ' + s).join('\n') : ''),
+               'err');
+          return;
+        }
+        if (v.ok === null) {
+          // ⚠️ 「没问到」不等于「Key 不对」—— 这里绝不能报警，否则网络一抖用户就去白换 Key
+          el.setAcctState.className = 'set-status is-warn';
+          el.setAcctState.textContent = '已保存。' +
+            (v.message || '这次没能问到 Steam，Key 是否有效没测出来');
+          return;
+        }
+        el.setAcctState.className = 'set-status is-ok';
+        el.setAcctState.textContent = '已绑定账号 ' + id +
+          '，API Key 有效 —— 同步会联网取全量库';
+        note('Steam 账号已保存：' + id + '，API Key 验证通过 —— 同步会联网取全量库', 'ok');
+        return;
+      }
+
       note('Steam 账号已保存：' + (id || '（已清空）') +
            (rawKey ? '，API Key 已更新' : '') +
            (id && !keyNow ? '\n⚠️ 还缺 API Key —— 没有它同步只能读本机（少一批"买了没碰过"的）。' +
@@ -2290,34 +2511,63 @@
   }
 
   /**
+   * 手动同步那一次「后台补名字/封面」的额度。
+   *
+   * 为什么比默认的 45 大出一截：45 是给**启动**那种"后台慢慢补、别拖慢开屏"
+   * 的场景定的；而手动同步是用户**主动点、人就在屏幕前等**的场景，
+   * 愿望单一次能进来几百款，45 一款一款地补意味着他接下来好几次启动都要
+   * 面对一片「App 12345」。取 240 与 `cloud.js` 的 `ACH_PER_RUN` 同量级
+   * （那条注释写的是「一次同步就能覆盖整个库」），也是同一套取舍。
+   */
+  const META_BULK_LIMIT = 240;
+
+  /**
    * 桌面版：后台补全游戏名字与封面。
    *
    * 本机 Steam 文件只有已安装的款带名字（本机约 300 款里九成没名字），
    * 其余名字只能联网问商店接口（**免 key**）。几百款一款一次会很慢，
-   * 所以每次启动只补一批（`GVLocal.fillMeta` 上限 45 款），进度存本机、下次接着补。
+   * 所以默认每次只补一批（`GVLocal.fillMeta` 默认上限 45 款），
+   * 进度存本机、下次接着补。
    *
    * ⚠️ **故意不 await**：先把界面交给用户，补全在后台推进 ——
    *    让启动时间取决于本机文件，而不是外网快不快。
    * ⚠️ 补完只在**没有弹窗打开**时重绘：用户可能正开着「设置」在填东西，
    *    这时整页重绘会把他的输入冲掉。
    *
-   * `priorityIds` —— 排在队首的 appid（联网刚补进来的款，本机没有封面，
-   * 最该先补）。会去重：`fillMeta` 内部不对入参去重，重复的会变成重复请求。
+   * `priorityIds` —— 排在队首的 appid（联网刚补进来的款、愿望单刚导入的款，
+   * 本机没有名字也没有封面，最该先补）。会去重：`fillMeta` 内部不对入参去重，
+   * 重复的会变成重复请求。
+   *
+   * `limit` —— 这一轮最多补多少款，默认交给 `GVLocal` 自己的上限（45）。
+   * 手动同步那一次由 `syncDesktop` 传 `META_BULK_LIMIT`，见下面那个常量。
+   *
+   * 🔑 排完 `priorityIds` 之后**不是**直接铺 `state.games`（2026-09-24 改）：
+   *    先排「**完全没名字**」的，再排其余。理由很实在 ——
+   *    有名字没封面的卡只是不好看，完全没有名字的卡会渲染成「App 12345」，
+   *    看上去像数据坏了。而"没名字"的款主要就来自愿望单那条路
+   *    （愿望单接口只给 appid），所以它们必须优先挤进这 45 个名额，
+   *    否则愿望单导进来 200 款、每轮只能补到其中零星几个，
+   *    「待游玩」会长期是一片占位卡。
    */
-  function fillMetaInBackground(priorityIds) {
+  function fillMetaInBackground(priorityIds, limit) {
     if (!window.GVLocal || !window.GVLocal.fillMeta) return;
     const seen = {};
     const ids = [];
-    (priorityIds || []).concat(state.games.map(g => g.appid)).forEach(a => {
+    const push = (a) => {
       if (a == null) return;
       const k = String(a);
       if (seen[k]) return;
       seen[k] = 1;
       ids.push(a);
-    });
+    };
+    (priorityIds || []).forEach(push);
+    // ① 没名字的（愿望单导入的款就在这一档）—— 卡面退化成「App <appid>」，最该先补
+    state.games.forEach(g => { if (!g.title) push(g.appid); });
+    // ② 其余（有名字缺封面 / 都已经有了的，后者会被 fillMeta 自己滤掉）
+    state.games.forEach(g => push(g.appid));
     if (!ids.length) return;
 
-    window.GVLocal.fillMeta(ids).then(async (r) => {
+    window.GVLocal.fillMeta(ids, limit).then(async (r) => {
       if (!r || !r.filled) return;
       await reload();
       if (el.setMask.hidden) render();      // 面板开着就别动它（见上面的说明）
@@ -2472,6 +2722,7 @@
     el.sortSeg.querySelectorAll('button').forEach(b => {
       b.addEventListener('click', () => {
         state.sort = b.dataset.sort;
+        saveUiPrefs();
         render();
       });
     });
@@ -2480,6 +2731,7 @@
     if (el.groupPerfectBtn) {
       el.groupPerfectBtn.addEventListener('click', () => {
         state.groupPerfect = !state.groupPerfect;
+        saveUiPrefs();
         render();
       });
     }
@@ -2687,6 +2939,13 @@
     //    cloud.js 是 cloneNode(true) 接管按钮的，属性会被一起复制过去 ——
     //    写在 HTML 上会把云端模式的账号菜单一起藏掉。
     if (!cloudMode && el.btnMenu) el.btnMenu.hidden = true;
+
+    // ---- 先恢复上次存下的界面选项，再让 URL 参数覆盖 ----
+    // 🔴 顺序不能反：URL 参数是"这一次打开就要这样"的明确指令
+    //    （也是自动化验收的唯一入口），必须优先于存档值。
+    //    放这么早还有个原因：它在 `reload()` / `render()` 之前，
+    //    所以首屏就是用户上次离开时的样子，不会先闪一下默认值。
+    loadUiPrefs();
 
     // ---- URL 参数先解析进 state ----
     // 必须放在「云端登录」之前：登录界面期间 state 已经就位，

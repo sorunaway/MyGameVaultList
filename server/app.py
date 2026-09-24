@@ -166,6 +166,17 @@ LIB_PLAYER_BUDGET_MAX = 6
 # 实测这两个接口健康时 1.0~3.1 秒返回，10 秒（≈2 次尝试 × 4.4 秒）足够宽松。
 RESOLVE_BUDGET = 10
 
+# `/api/steam/verify-key` 的出网预算（秒）。见 _api_steam_verify_key。
+# 它回答的是**是/否**（Key 被拒没有），响应约 1 KB；给 10 秒足够「2 次尝试 × 4.4 秒」，
+# 和 RESOLVE_BUDGET 同量级 —— 用户在设置面板里点一下，不该等出"卡住了"的感觉。
+VERIFY_BUDGET = 10
+
+# 验 Key 时用它当一次"合法参数"。**它只用来让请求合法，判定不看返回内容** ——
+# 所以填哪个 id 不影响结论（挑 76561197960287930 是因为那是 Valve 自家账号，
+# 长期存在、资料公开，不会哪天消失导致我们把"key 有效"误判成别的）。理由见
+# _api_steam_verify_key；调用方传了自己的 steamid 就优先用调用方的。
+VERIFY_PROBE_STEAMID = "76561197960287930"
+
 # `/api/steam/wishlist` 的出网预算（秒）。
 # 愿望单响应约 16 KB（300 款），健康时实测 1.2 秒返回；给 15 秒
 # 能容纳「2 次尝试 × 4.4 秒」，链路抽风时还有一次重试机会。
@@ -408,6 +419,37 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _key_rejected_payload(self):
+        """「Steam 拒绝了这个 Key」的统一响应体 —— library / resolve / player / verify-key 共用。
+
+        为什么要抽出来（2026-09-24）：这条路以前根本没有 —— 4 个接口遇到 403 各说各话，
+        而且全都说成了「连不上 Steam（跨境链路波动），稍等几秒再点一次」。
+        那是**方向性错误**：Key 失效不会自己好，用户对着提示反复重试永远没有出口。
+        文案一旦散开，改一处漏三处 —— 而这句恰恰是他唯一能自救的指引。
+
+        ⚠️ 状态码是 **200 而不是 5xx**：这不是服务故障，是**用户可修**的配置问题。
+           做成 5xx 会让前端和用户都按「暂时性错误」对待，继续重试。
+        """
+        if config.DESKTOP_MODE:
+            howto = [
+                "去 Steam 官方重新申请一个（免费）：https://steamcommunity.com/dev/apikey",
+                "打开顶栏「设置」→「Steam 账号（联网同步）」，把新 Key 粘进去",
+                "点「验证并保存」—— 它会当场问一次 Steam，确认这把能用",
+            ]
+        else:
+            # 线上版的 Key 由部署方配在 .env 里，用户手里**没有**可改的东西 ——
+            # 让他"去设置里填 Key"等于指了一条走不通的路。
+            howto = [
+                "本站服务端配置的 Steam API Key 已被拒绝（失效 / 被吊销 / 填错）",
+                "这不是你的账号问题，重试也没有用 —— 请联系本站部署者更换 Key",
+            ]
+        return {
+            "error": "steam_key_rejected",
+            "message": "Steam 拒绝了这个 API Key，读不到联网数据。",
+            "howToFix": howto,
+            "steamKeyUrl": "https://steamcommunity.com/dev/apikey",
+        }
+
     # ---------- 路由 ----------
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
@@ -447,6 +489,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/steam/ping":
             return self._api_steam_ping()
+
+        if path == "/api/steam/verify-key":
+            return self._api_steam_verify_key()
 
         if path == "/api/steam/achievements":
             return self._api_achievements()
@@ -804,6 +849,10 @@ class Handler(BaseHTTPRequestHandler):
         if vanity:
             sid, rerr = steam_client.resolve_vanity(api_key(), vanity,
                                                    budget=RESOLVE_BUDGET)
+            if rerr == "denied":
+                # 不是"连不上"，是"被拒绝" —— 报成网络问题会让用户去查自己的网、
+                # 反复重试，而真正该做的是去换一把 Key。
+                return self._json(self._key_rejected_payload(), 200)
             if rerr == "network":
                 return self._json({"error": "steam_unreachable",
                                    "message": "服务器暂时连不上 Steam，请稍后重试"}, 502)
@@ -815,13 +864,16 @@ class Handler(BaseHTTPRequestHandler):
         # 昵称/头像是这个端点的主产物，所以预算给得比游戏库那边宽 ——
         # 但仍然要封顶：默认的 timeout=20 × (1 次重试) 最坏 41 秒，
         # 两次尝试就是 82 秒，早就被反代掐断了。
-        info = steam_client.get_player_summary(
+        info, pkind = steam_client.get_player_summary_ex(
             api_key(), steamid, budget=RESOLVE_BUDGET)
-        if not info:
-            # 同上：区分「偶发抽风」和「查无此人」，别丢一个误导性的 404
+        if not info and pkind not in steam_client.FATAL_ERROR_KINDS:
+            # 区分「偶发抽风」和「查无此人」，别丢一个误导性的 404。
+            # ⚠️ 被拒（denied）是确定性结论，**不重试** —— 多问一次等来的还是 403。
             time.sleep(0.6)
-            info = steam_client.get_player_summary(
+            info, pkind = steam_client.get_player_summary_ex(
                 api_key(), steamid, budget=RESOLVE_BUDGET)
+        if pkind in steam_client.FATAL_ERROR_KINDS:
+            return self._json(self._key_rejected_payload(), 200)
         if not info:
             return self._json({"error": "player_unavailable",
                                "message": "拿不到这个账号的资料，请稍后重试"}, 502)
@@ -834,16 +886,19 @@ class Handler(BaseHTTPRequestHandler):
         steamid = self._q1("steamid")
         if not steamid.isdigit():
             return self._json({"error": "steamid 不合法"}, 400)
-        info = steam_client.get_player_summary(
+        info, pkind = steam_client.get_player_summary_ex(
             api_key(), steamid, budget=RESOLVE_BUDGET)
-        if not info:
+        if not info and pkind not in steam_client.FATAL_ERROR_KINDS:
             # GetPlayerSummaries 偶发抽风（实测线上大约几十次里会碰到一次），
             # 而 get_player_summary 把「偶发失败」和「查无此人」都归成 None。
             # 所以这里再补一次尝试：仍失败时明确报 502（暂时不可用），
             # 而不是丢一个会让人以为账号不存在的 404。
+            # ⚠️ 被拒（denied）不重试，理由同 _api_resolve。
             time.sleep(0.6)
-            info = steam_client.get_player_summary(
+            info, pkind = steam_client.get_player_summary_ex(
                 api_key(), steamid, budget=RESOLVE_BUDGET)
+        if pkind in steam_client.FATAL_ERROR_KINDS:
+            return self._json(self._key_rejected_payload(), 200)
         if not info:
             return self._json({"error": "Steam 接口暂时不可用，请稍后重试"}, 502)
         return self._json({"player": info})
@@ -865,7 +920,7 @@ class Handler(BaseHTTPRequestHandler):
             cached["cached"] = True
             return self._json(cached)
 
-        games, is_private, names_ok = steam_client.get_owned_games(
+        games, is_private, names_ok, kind = steam_client.get_owned_games_ex(
             api_key(), steamid)
 
         if games is None:
@@ -876,8 +931,19 @@ class Handler(BaseHTTPRequestHandler):
                 stale = dict(hit[1])
                 stale["cached"] = True
                 stale["stale"] = True
-                stale["message"] = "这次没连上 Steam，先显示上一次同步的结果。"
+                if kind in steam_client.FATAL_ERROR_KINDS:
+                    # 被拒绝时必须**把原因说清楚**：否则用户会读成"又只是网络抖一下"，
+                    # 继续点同步 —— 而这条路重试永远不会通。
+                    stale["keyRejected"] = True
+                    stale["message"] = ("这次没能读 Steam：API Key 被拒绝了。"
+                                        "下面是上一次同步的结果。")
+                else:
+                    stale["message"] = "这次没连上 Steam，先显示上一次同步的结果。"
                 return self._json(stale)
+            if kind in steam_client.FATAL_ERROR_KINDS:
+                # 🔴 绝不能报成「连不上 Steam（跨境链路波动），稍等几秒再点一次」——
+                # Key 失效不会自己好，那句提示会把用户困在无限重试里。
+                return self._json(self._key_rejected_payload(), 200)
             return self._json({
                 "error": "steam_unreachable",
                 "message": "连不上 Steam（跨境链路波动），稍等几秒再点一次「同步」通常就好了。",
@@ -977,10 +1043,13 @@ class Handler(BaseHTTPRequestHandler):
         if not steamid.isdigit():
             return self._json({"error": "steamid 不合法"}, 400)
 
-        items, state = steam_client.get_wishlist(
+        items, state, kind = steam_client.get_wishlist_ex(
             api_key(), steamid, budget=WISH_BUDGET)
 
         if state == "error":
+            if kind in steam_client.FATAL_ERROR_KINDS:
+                # 同 library：被拒不是"网络抽风"，说成后者会让用户白等。
+                return self._json(self._key_rejected_payload(), 200)
             return self._json({
                 "error": "steam_unreachable",
                 "message": "连不上 Steam（跨境链路波动），稍等几秒再点一次「同步」通常就好了。",
@@ -1034,6 +1103,54 @@ class Handler(BaseHTTPRequestHandler):
                            "ms": r.get("ms"),
                            "error": (r.get("error") or "")[:120]})
 
+    def _api_steam_verify_key(self):
+        """用**当前生效的 Key** 真问一次 Steam，回答「它认不认这把 Key」。
+
+        为什么需要它（2026-09-24 加）：设置面板的「验证并保存」在填 **17 位数字 ID**
+        时**根本不联网** —— 只有个性网址 / 资料链接才会走 resolve_vanity。
+        于是用户以为 Key 验过了，实际从来没验过；等真的点同步才失败，
+        而那时的报错又被归成「连不上 Steam」。这条链路上一处能识别「Key 被拒」的都没有。
+        这个端点把"验 Key"变成一件**确定发生**的事。
+
+        挑 GetPlayerSummaries 而不是更"轻"的接口：GetServerInfo **不需要 key**（验不了），
+        GetOwnedGames 会拉上百 KB。这个约 1 KB，而且必须带 key ——
+        无效 / 被吊销的 key 会被 Steam 直接 403，正是我们要的那条判据。
+
+        返回**三种**结果，前端必须分开处理：
+            {"ok": true,  "kind": ""}         Key 有效（顺带拿到了资料）
+            {"ok": false, "kind": "denied"}   Key 被 Steam 拒绝 -> 跟 howToFix 走
+            {"ok": null,  "kind": "timeout"}  这次没问到（网络）—— **没测出来**。
+                                              ⚠️ 绝不能把这种情况说成"Key 不对"：
+                                              那会让用户在网络抽风时白去换 Key。
+        """
+        if not self._guard_steam_key():
+            return
+        sid = (self._q1("steamid") or "").strip()
+        if not sid.isdigit():
+            sid = VERIFY_PROBE_STEAMID
+        info, kind = steam_client.get_player_summary_ex(
+            api_key(), sid, budget=VERIFY_BUDGET)
+        if kind in steam_client.FATAL_ERROR_KINDS:
+            # 把统一的说明合并进来，多加一个 `ok:false` —— 调用方只读 ok 就能分三态，
+            # 而 message / howToFix 直接可用，不必再认识 steam_key_rejected 这个串。
+            payload = self._key_rejected_payload()
+            payload["ok"] = False
+            return self._json(payload, 200)
+        if kind:
+            return self._json({
+                "ok": None,
+                "kind": kind,
+                "message": "这次没能问到 Steam（%s）—— Key 对不对**没测出来**，"
+                           "过一会儿再点一次「验证并保存」。"
+                           % steam_client.ERROR_LABELS.get(kind, kind),
+            }, 200)
+        return self._json({
+            "ok": True,
+            "kind": "",
+            "player": info,
+            "message": "API Key 有效" + ("，账号资料也读到了" if info else ""),
+        }, 200)
+
     def _api_achievements(self):
         """取玩家在若干游戏里的成就进度。
 
@@ -1084,8 +1201,9 @@ class Handler(BaseHTTPRequestHandler):
         for appid in ordered:
             items.setdefault(appid, None)
         got = sum(1 for a in ordered if items.get(a) is not None)
-        log("成就批量查询 %s -> %d 款（拿到 %d，链路 %s）"
-            % (steamid, len(ordered), got, ach_stats.get("link")))
+        log("成就批量查询 %s -> %d 款（拿到 %d，链路 %s%s）"
+            % (steamid, len(ordered), got, ach_stats.get("link"),
+               ("/" + ach_stats["fatal"]) if ach_stats.get("fatal") else ""))
         return self._json({
             "steamid": steamid,
             "items": items,
@@ -1098,6 +1216,10 @@ class Handler(BaseHTTPRequestHandler):
             #  ③ 决定「下一批开多大」（link=degraded 时收窄，避免尾巴整段截断）
             # 这些字段是**附加信息**，旧前端忽略它们也能正常工作。
             "link": ach_stats.get("link", "ok"),
+            # fatal：link == "down" 且原因是**永久性**的（Key 被拒）时的标识，其余为 ""。
+            # ⚠️ 前端**必须**读它：link=="down" 有两种截然相反的解法（等一会儿 vs 去换 Key），
+            #    只说 link 会把后者说成「网络抖动，稍后再试」—— 用户就会一直重试下去。
+            "fatal": ach_stats.get("fatal", ""),
             "reasons": ach_stats.get("reasons") or {},
             "skipped": ach_stats.get("skipped", 0),
         })

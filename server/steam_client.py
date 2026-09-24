@@ -65,6 +65,24 @@ _ERROR_KINDS = (
     ("ratelimit", ("http429",), "被限流"),
     ("private",   ("profile is not public", "not public"), "档案不公开"),
     ("no_stats",  ("no stats",), "这款没有成就系统"),   # 上层已吃掉，这里只作兜底
+    # ── Key 被 Steam 明确拒绝（2026-09-24 加）───────────────────────────────
+    # 以前没有这一类，于是「HTTP403」掉进 other，后果是**整条链路都认不出来**：
+    #   · /api/steam/library 报「连不上 Steam（跨境链路波动），稍等几秒再点一次」
+    #     —— 方向完全错了，用户会一直重试一个永远好不了的错误；
+    #   · 成就批量因为「other 不在链路层集合里」而**不早停**，白跑几百个必然失败的请求。
+    #
+    # 🔴 它**必须排在 private / no_stats 之后** —— 这张表是**顺序匹配**。
+    #    Steam 的私密档案回的正是 `HTTP403 {"playerstats":{"error":"Profile is not public"}}`，
+    #    被下面那个 http403 抢先命中就全错了。而这两件事虽然都"用户可修"，
+    #    **改法完全相反**（改隐私设置 vs 换钥匙），混掉等于把指路指反。
+    #
+    # 判据只认 err 串的**第一段**：`_fetch_json_ex` 固定产出 "HTTP<码> <body>"，
+    # 所以 http401 / http403 比匹配 body 文案可靠得多；后两条是 Steam 会说出口的原话。
+    # ⚠️ 不要把 http400 收进来：成就接口的 400 是「这款没有 stats」这个**确定性答案**，
+    #    它在上层（get_player_achievements_ex）已被 _NO_STATS_MARK 吃掉；
+    #    收进来会让别的路径把参数错误也误报成「Key 被拒」。
+    ("denied",    ("http401", "http403", "invalid api key", "invalid key"),
+                  "API Key 被拒绝"),
     ("timeout",   ("timed out", "timeout", "10060", "connection attempt failed",
                    "read operation timed out"), "超时（对方无响应）"),
     # ⚠️ "TLS/SSL connection has been closed (EOF) (_ssl.c:992)" 是**云端链路抽风时
@@ -90,6 +108,17 @@ ERROR_LABELS[_ERROR_OTHER[0]] = _ERROR_OTHER[1]
 # （private / no_stats）性质完全不同 —— 前者该早停并提示稍后重试，
 # 后者是确定性答案，重试一万次也一样。
 CONNECTION_ERROR_KINDS = ("timeout", "tls", "refused", "dns", "ratelimit")
+
+# 「请求**发出去了**，但被对方**永久拒绝**」。
+#
+# 🔴 为什么不并进 CONNECTION_ERROR_KINDS：那一组的语义是「请求根本没发出去」
+#    （链路/本机问题，**会自己好**，所以值得重试、值得劝用户'过几秒再点一次'）。
+#    denied 正相反：链路完全正常，是钥匙不对 —— **重试一万次也还是 403**。
+#    两组都该「立刻收手」，但给用户的话必须是两句完全不同的话：
+#      CONNECTION -> "网络抖动，稍后再试"        （重试有用）
+#      FATAL      -> "你的 Key 被拒了，去换一把"  （重试没用，得动手）
+#    并成一组就等于把后者的可执行指引抹掉了。
+FATAL_ERROR_KINDS = ("denied",)
 
 
 def classify_error(err):
@@ -317,19 +346,24 @@ def resolve_vanity(key, vanity, budget=None):
     返回 (steamid, error)：
         ("7656119...", "")   成功
         (None, "network")    连不上 Steam（不是「查无此人」）
+        (None, "denied")     Steam 明确拒绝了这个 Key（401/403）—— 得去换 Key
         (None, "notfound")   确实没有这个自定义 ID
 
-    必须区分后两者 —— 把「连不上」当「查无此人」报给用户，
-    用户就会去反复检查自己的 ID 拼写，而问题其实在服务端出网。
+    必须区分后三者 —— 把「连不上」当「查无此人」报给用户，
+    用户就会去反复检查自己的 ID 拼写，而问题其实在服务端出网；
+    把「Key 被拒」也归进 network 更糟：那会让他一直重试一个永远好不了的错误。
 
     走的端点属于 api.steampowered.com，**不需要用户跳转去 Steam 授权**，
     这正是「手动填 ID」能绕开 steamcommunity.com 的原因。
     """
     url = ("%s/ISteamUser/ResolveVanityURL/v1/?key=%s&vanityurl=%s"
            % (API, key, urllib.parse.quote(vanity, safe="")))
-    d = _fetch_json(url, timeout=15, retries=1, budget=budget)
+    d, err = _fetch_json_ex(url, timeout=15, retries=1, budget=budget)
     if d is None:
-        return None, "network"
+        # 区分「连不上」和「被拒绝」：后者重试一万次也一样。归成 network 会让用户
+        # 去查自己的网络、反复点重试 —— 而真正该做的是去换一把 Key。
+        return None, ("denied" if classify_error(err)[0] in FATAL_ERROR_KINDS
+                      else "network")
     resp = (d.get("response") or {})
     if resp.get("success") != 1:
         return None, "notfound"
@@ -340,8 +374,19 @@ def resolve_vanity(key, vanity, budget=None):
 
 
 # ===== 玩家资料 =====
-def get_player_summary(key, steamid, budget=None):
-    """取昵称与头像。私密档案拿不到，返回 None。
+def get_player_summary_ex(key, steamid, budget=None):
+    """取昵称与头像，**并把失败原因一起返回**：(info, kind)。
+
+    kind 有四种取值，调用方必须分开处理：
+
+        ("", info)        请求通了，也读到了这个人
+        ("", None)        请求通了，但**没有这个人**（或资料不公开）—— 不是故障
+        ("denied", None)  Key 被 Steam 拒绝 —— 全项目里唯一能判定「钥匙不对」的地方
+        (其他, None)      这次没问到（timeout / tls / dns / other…），等于「不知道」
+
+    ⚠️ 判「Key 有没有效」**只看 HTTP 通不通**，不看 players 内容 ——
+       所以可以用一个"随便谁的"合法 steamid 来单独验 Key（见 `/api/steam/verify-key`）。
+       这正是它能当"验 Key 探测器"用的原因。
 
     budget：总耗时上限（秒）。**凡是在别处「顺带」调用它的地方都必须给** ——
     昵称/头像纯属装饰，默认的 timeout=20 × (1 次重试) 最坏要 41 秒，
@@ -352,10 +397,12 @@ def get_player_summary(key, steamid, budget=None):
            % (API, key, steamid))
     # retries=1 是给「主要目的就是拿档案」的调用方（resolve / player）留的余量；
     # 给了 budget 时单次超时会自动收缩，重试次数仍由 budget 兜住。
-    d = _fetch_json(url, timeout=20, retries=1, budget=budget)
-    players = ((d or {}).get("response") or {}).get("players") or []
+    d, err = _fetch_json_ex(url, timeout=20, retries=1, budget=budget)
+    if d is None:
+        return None, classify_error(err)[0]
+    players = ((d.get("response")) or {}).get("players") or []
     if not players:
-        return None
+        return None, ""          # HTTP 通了 —— 只是没有这个人，不是故障
     p = players[0]
     return {
         "steamid": p.get("steamid"),
@@ -363,7 +410,15 @@ def get_player_summary(key, steamid, budget=None):
         "avatar": p.get("avatarfull") or p.get("avatarmedium") or p.get("avatar"),
         "profileUrl": p.get("profileurl"),
         "visibility": p.get("communityvisibilitystate"),  # 3 = 公开
-    }
+    }, ""
+
+
+def get_player_summary(key, steamid, budget=None):
+    """取昵称与头像。私密档案拿不到，返回 None。
+
+    不需要失败归因的调用方用它；要归因用 get_player_summary_ex。
+    """
+    return get_player_summary_ex(key, steamid, budget)[0]
 
 
 # ===== 游戏库 =====
@@ -406,6 +461,37 @@ def _parse_owned(d):
     return games, False
 
 
+def get_owned_games_ex(key, steamid):
+    """
+    与 get_owned_games 同一套两趟法，但把**失败原因**一起返回：
+
+        (games, is_private, names_ok, kind)
+
+    kind 是 classify_error 的标识：成功是 ""；失败是 timeout / tls / denied / other …。
+    只有需要按原因措辞的调用方用它（`/api/steam/library`）—— 少了它，一把失效的 Key
+    会被报成「连不上 Steam（跨境链路波动），稍等几秒再点一次」，用户于是反复重试
+    一个**重试永远不会好**的错误。这是 2026-09-24 实测走到的死胡同。
+
+    实现放这里，get_owned_games 只是它的一层薄壳 —— 与 `_fetch_json_ex` / `_fetch_json`
+    同一套写法，这样既拿到归因，又不用改任何既有调用方的签名。
+    """
+    kind = ""
+    for with_appinfo, (timeout, retries, budget) in (
+            (True,  (20, 2, _LIB_BUDGET_MAIN)),
+            # 第一趟彻底失败后：去掉 appinfo 再来一次，体积小一半、成功率明显更高
+            (False, (15, 0, _LIB_BUDGET_LITE))):
+        d, err = _fetch_json_ex(_owned_games_url(key, steamid, with_appinfo),
+                                timeout=timeout, retries=retries, budget=budget)
+        games, is_private = _parse_owned(d)
+        if games is not None:
+            return games, is_private, with_appinfo, ""
+        kind = classify_error(err)[0]
+        if kind in FATAL_ERROR_KINDS:
+            # 被永久拒绝：换个参数再来一趟，等来的还是同一个 403 —— 省掉这次跨境请求。
+            break
+    return None, False, False, kind
+
+
 def get_owned_games(key, steamid):
     """
     返回 (games, is_private, names_ok)。
@@ -413,21 +499,11 @@ def get_owned_games(key, steamid):
     names_ok=False 表示这次走的是「不带名称」的降级路径 ——
     游戏条目里没有 name / img_icon_url，调用方要靠商店接口补名称，
     并且**不要把空名称当成真名字写进库**。
+
+    不需要失败归因的调用方用它；要归因（好向用户说清「为什么读不到」）用 _ex 版本。
     """
-    d = _fetch_json(_owned_games_url(key, steamid, True),
-                    timeout=20, retries=2, budget=_LIB_BUDGET_MAIN)
-    games, is_private = _parse_owned(d)
-    if games is not None:
-        return games, is_private, True
-
-    # 第一趟彻底失败：去掉 appinfo 再来一次，体积小一半、成功率明显更高
-    d = _fetch_json(_owned_games_url(key, steamid, False),
-                    timeout=15, retries=0, budget=_LIB_BUDGET_LITE)
-    games, is_private = _parse_owned(d)
-    if games is not None:
-        return games, is_private, False
-
-    return None, False, False
+    games, is_private, names_ok, _kind = get_owned_games_ex(key, steamid)
+    return games, is_private, names_ok
 
 
 # ===== 成就 =====
@@ -576,6 +652,11 @@ def get_player_achievements_many(key, steamid, appids, workers=None,
     :param stats        可选 dict；会被填上本次的观测值（**不改返回值契约**）：
                           reasons  {原因标识: **款数**}，按款去重、只含最终仍为 None 的
                           link     "ok" | "degraded" | "down"
+                          fatal    link=="down" 且原因是**永久性**的（Key 被拒）时的标识，
+                                   取值 "denied"；其余情况是 ""。
+                                   ⚠️ 前端**必须**读它：link=="down" 有两种截然不同的解法
+                                   （网络会好 -> 等一会儿；Key 被拒 -> 去换一把），
+                                   只说 link 会让用户收到一句"稍后再试"然后无限重试下去。
                           waves    实际跑了几波
                           skipped  因链路断 / 到点而**根本没问过**的款数
                           answered 拿到答案的款数
@@ -587,15 +668,17 @@ def get_player_achievements_many(key, steamid, appids, workers=None,
     out = {}
     reason_of = {}        # {appid: 最后一次失败的原因}；最后按「仍为 None 的款」去重统计
     link = "ok"
+    fatal = ""            # link 变 "down" 时，是**永久性**原因（Key 被拒）的话记在这
     waves = 0
     attempted = set()     # 真正发出过请求的款（失败也算）—— skipped 由它反推，避免重复计数
     budget_now = item_budget
     conn_kinds = set(CONNECTION_ERROR_KINDS)
+    fatal_kinds = set(FATAL_ERROR_KINDS)
 
     ids = [str(a) for a in (appids or [])]
     if not ids:
         if stats is not None:
-            stats.update({"reasons": {}, "link": "ok", "waves": 0,
+            stats.update({"reasons": {}, "link": "ok", "fatal": "", "waves": 0,
                           "skipped": 0, "answered": 0, "slots": 0})
         return out
 
@@ -661,8 +744,10 @@ def get_player_achievements_many(key, steamid, appids, workers=None,
             failed = len(wave_res) - answered
 
             if p == 0 and i == 0 and answered == 0 and failed:
-                # 首波全灭。只有在失败原因**全是链路层**时才判定「链路断」——
-                # 全是「档案不公开」的话那是确定性答案，不该早退（见 docstring）。
+                # 首波全灭。只有当失败原因**全是同一种「不是这款游戏的错」**时才收手：
+                #   · 全是链路层   -> 现在连不上 Steam（会自己好，值得下次再试）
+                #   · 全是 Key 被拒 -> 钥匙不对（**不会**自己好，继续问也是白问）
+                # 全是「档案不公开」这种确定性答案时不早退（见上面的警告）。
                 kinds = set(k for r, k in wave_res.values() if r is None)
                 if kinds and kinds <= conn_kinds:
                     link = "down"
@@ -670,6 +755,17 @@ def get_player_achievements_many(key, steamid, appids, workers=None,
                     for a in rest:
                         out.setdefault(a, None)
                     log_link_down(kinds)
+                    break
+                if kinds and kinds <= fatal_kinds:
+                    # Key 被拒：该立刻收手（重试永远没用），但这是**确定性**结论，
+                    # 必须单拎出来 —— 否则前端会说成「网络抖动，稍候再试」，
+                    # 用户就会对着一个永远好不了的错误无限重试。
+                    link = "down"
+                    fatal = sorted(kinds)[0]
+                    rest = todo[i + n:]
+                    for a in rest:
+                        out.setdefault(a, None)
+                    log_link_down(kinds, fatal)
                     break
             elif failed and answered < len(wave) * 0.5:
                 # 链路在抖：把单款预算压到下限，用「快速失败多次」换「更多槽位有机会」。
@@ -697,6 +793,7 @@ def get_player_achievements_many(key, steamid, appids, workers=None,
         stats.update({
             "reasons": reasons,
             "link": link,
+            "fatal": fatal,
             "waves": waves,
             "skipped": len(ids) - len(attempted),
             "answered": sum(1 for a in ids if out.get(a) is not None),
@@ -705,11 +802,16 @@ def get_player_achievements_many(key, steamid, appids, workers=None,
     return out
 
 
-def log_link_down(kinds):
-    """链路判定为「断」时打一行日志（原因集合是要留痕的，便于事后对时间线）。"""
+def log_link_down(kinds, fatal=""):
+    """批量判定为「别再问了」时打一行日志（原因集合要留痕，便于事后对时间线）。
+
+    fatal 非空 = 这是**永久性**原因（Key 被拒），不是链路抖动 —— 两种情况该查的
+    方向完全相反，日志里必须一眼分得开。
+    """
     try:
-        print("[gv] 成就批量：首波全灭且全为链路层失败 %s，已提前收手"
-              % sorted(kinds), flush=True)
+        why = "API Key 被 Steam 拒绝" if fatal else "全为链路层失败"
+        print("[gv] 成就批量：首波全灭且%s %s，已提前收手"
+              % (why, sorted(kinds)), flush=True)
     except Exception:
         pass
 
@@ -731,10 +833,10 @@ def log_link_down(kinds):
 _WISH_URL = ("%s/IWishlistService/GetWishlist/v1/?key=%s&steamid=%s")
 
 
-def get_wishlist(key, steamid, budget=None):
-    """取玩家的 Steam 愿望单。
+def get_wishlist_ex(key, steamid, budget=None):
+    """取玩家的 Steam 愿望单，**并把失败原因一起返回**：(items, state, kind)。
 
-    返回 (items, state)：
+    返回 (items, state) 的语义与 get_wishlist 完全一致：
 
         (list, "ok")            拿到了。items = [{"appid": int,
                                                   "priority": int,
@@ -746,8 +848,12 @@ def get_wishlist(key, steamid, budget=None):
                                 Steam 对这两种情况返回的东西**一模一样**
                                 （`{"response":{}}`，连 items 键都没有），
                                 所以**无法区分**。给用户的文案必须把两种可能都写上。
-        (None, "error")         这次没问到答案（网络/链路）。调用方**不要**
+        (None, "error")         这次没问到答案（网络/链路/被拒）。调用方**不要**
                                 把它当成「愿望单空了」——那会导致误删。
+
+    第三个返回值 kind 只在 state == "error" 时非空（成功 / unavailable 都是 ""）：
+    取值来自 classify_error —— 调用方靠它区分「网络抽风，重试有用」和
+    「Key 被拒，**重试没用**、得去换钥匙」。少了它，愿望单也会把 403 说成"连不上"。
 
     ⚠️ 调用方拿到 "unavailable" 时**不要**直接清空本地的愿望单记录：
     用户可能只是把隐私设置从「公开」改成了「仅好友」，而 Steam 的返回
@@ -755,17 +861,18 @@ def get_wishlist(key, steamid, budget=None):
 
     budget：总耗时上限（秒），语义同 _fetch_json。
     """
-    d = _fetch_json(_WISH_URL % (API, key, steamid),
-                    timeout=20, retries=1, budget=budget)
+    d, err = _fetch_json_ex(_WISH_URL % (API, key, steamid),
+                            timeout=20, retries=1, budget=budget)
     if d is None:
-        return None, "error"
+        return None, "error", classify_error(err)[0]
     resp = d.get("response")
     if not isinstance(resp, dict):
-        return None, "error"
+        # 拿到了响应但不是预期结构（比如一页 HTML 错误页）—— 不是网络问题
+        return None, "error", _ERROR_OTHER[0]
     raw = resp.get("items")
     if raw is None:
         # 没有 items 键 = 空 或 未公开（Steam 不区分，我们也分不了）
-        return [], "unavailable"
+        return [], "unavailable", ""
     out = []
     for it in raw:
         appid = it.get("appid")
@@ -776,7 +883,13 @@ def get_wishlist(key, steamid, budget=None):
             "priority": it.get("priority") or 0,
             "addedTs": it.get("date_added") or 0,
         })
-    return out, "ok"
+    return out, "ok", ""
+
+
+def get_wishlist(key, steamid, budget=None):
+    """（见 get_wishlist_ex）只返回 (items, state)；不需要失败归因的调用方用它。"""
+    items, state, _kind = get_wishlist_ex(key, steamid, budget)
+    return items, state
 
 
 # ===== 商店信息（公共数据）=====

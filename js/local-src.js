@@ -92,6 +92,45 @@
   }
 
   /**
+   * 和 `getJSON` **唯一**的区别：非 2xx 也把 body 交出来（只要它能解析成 JSON）。
+   *
+   * 🔴 为什么必须有这个变体（2026-09-24）：服务端的失败响应**本身就是说明书正文**——
+   *   · `502 {"error":"steam_unreachable","message":"连不上 Steam（跨境链路波动）…"}`
+   *   · `200 {"error":"steam_key_rejected","message":…,"howToFix":[…]}`（Key 被拒是**用户
+   *     可修**的配置问题，所以故意不是 5xx）
+   * 旧的 `getJSON` 遇到 502 直接 `throw new Error('HTTP 502')`，于是 `message` 和
+   * `howToFix` **全被吞掉**，用户只能看到一句「本机服务没有响应」——
+   * 而真正的原因（链路波动 vs Key 失效）解法完全相反。
+   *
+   * 判据与 `cloud.js` 的 `apiGet` 同源：`if (!r.ok && !d.error) throw`——
+   * 也就是「服务端给了结构化原因就照收，纯 HTTP 错误码才当失败」。
+   */
+  function getJSONLoose(url, timeoutMs) {
+    return new Promise(function (resolve, reject) {
+      var ctl = null, timer = null;
+      try {
+        ctl = new AbortController();
+        timer = setTimeout(function () { ctl.abort(); }, timeoutMs || STATUS_TIMEOUT);
+      } catch (e) { /* 同上：没有 AbortController 就不带超时 */ }
+      var opt = { cache: 'no-store' };
+      if (ctl) opt.signal = ctl.signal;
+      fetch(url, opt).then(function (r) {
+        return r.json().then(function (d) { return d; },
+                             function () { return {}; }).then(function (d) {
+          if (!r.ok && !(d && d.error)) throw new Error('HTTP ' + r.status);
+          return d;
+        });
+      }).then(function (d) {
+        if (timer) clearTimeout(timer);
+        resolve(d);
+      }).catch(function (e) {
+        if (timer) clearTimeout(timer);
+        reject(e);
+      });
+    });
+  }
+
+  /**
    * 探测本机服务。**任何失败都返回 null**（不抛）——
    * 「不是桌面版」是正常情况，不该让调用方写 try/catch。
    */
@@ -178,7 +217,7 @@
   //   · 这次没拿到答案（网络 / 限流，后端放在 `unknown` 里）→ **绝不能记**，
   //     否则那款游戏的名字/封面**永远**补不回来。
   var META_KEY = 'gv_local_meta_v1';
-  var META_PER_RUN = 45;    // 一轮最多补多少款
+  var META_PER_RUN = 45;    // 一轮最多补多少款（**默认值**；手动同步那一次会调大，见 fillMeta）
   var META_BATCH = 15;      // 一次请求带多少款（后端 STORE_MAX_IDS = 30，留一半余量）
   var META_TIMEOUT = 60000; // 后端单请求预算 STORE_DEADLINE = 34 秒，客户端给宽一点
   var META_DOWN_KEY = 'gv_local_meta_down_v1';
@@ -230,11 +269,22 @@
    * 且写回时**只带当前缺的那些字段**。理由：本机已有的封面是**离线可用**的本地图，
    * 用商店的远程图去盖它，会让离线版为了看图反而必须联网。
    *
+   * `limit` —— 这一次最多补多少款。**默认 `META_PER_RUN`（45）**，
+   * 给启动那种"后台慢慢补"的场景用。手动同步那一次由调用方给大值：
+   * 用户刚点完「同步」人就在屏幕前等，而愿望单一次能进来几百款 ——
+   * 45 一款一款地补，他看到的会是几百张写着「App 12345」的卡，
+   * 等于这个功能没接上（cloud.js 那边的成就核算是同一个思路：`ACH_PER_RUN = 240`，
+   * 注释写着「一次同步就能覆盖整个库」）。
+   * ⚠️ 只是上限，不会硬凑：`want` 里有多少补多少。
+   *
    * 返回 `{filled, left}`：`filled` = 这次真的补到内容的款数，
    * `left > 0` = 还有剩的，下次接着补。
    */
-  async function fillMeta(appids) {
+  async function fillMeta(appids, limit) {
     if (!window.DataStore) return { filled: 0, left: 0, reason: 'no_datastore' };
+    // ⚠️ 判断用 `> 0` 而不是真值：调用方可能传 undefined / null / 0，
+    //    三种都该回落到默认值（传 0 不是"一款都不补"的意思）。
+    var cap = (limit > 0) ? limit : META_PER_RUN;
 
     var all = await window.DataStore.all();
     var byId = {};
@@ -259,7 +309,7 @@
       return { filled: 0, left: want.length, skipped: 'link_down' };
     }
 
-    var work = want.slice(0, META_PER_RUN);
+    var work = want.slice(0, cap);
     var filled = 0, unanswered = 0, attempted = 0;
 
     for (var i = 0; i < work.length; i += META_BATCH) {
@@ -403,8 +453,97 @@
       added: res.added, updated: res.updated,
       recollected: res.recollected, locked: res.locked, abandoned: res.abandoned,
       stale: !!d.stale,
+      // stale 的两种原因解法相反：keyRejected=true 要**去换 Key**，
+      // 否则等一会儿再同步就好。透传上去让状态行能说对方向。
+      keyRejected: !!d.keyRejected,
       staleMessage: d.message || '',
       namesOk: d.namesOk !== false
+    };
+  }
+
+  // ============================================================
+  // Steam 愿望单（「愿望单 -> 待游玩」）—— 桌面版
+  // ============================================================
+  //
+  // 🔴 为什么必须有这段（2026-09-24，用户实测投诉）：
+  //    「绑定了 STEAMID 以及新的 KEY，并且同步完成后，愿望单功能没有像预期
+  //      那样工作，『待游玩项目』始终为 0」。
+  //    根因不是接口坏了、也不是数据层坏了 —— 是**桌面版这条路从来没调过它**：
+  //    `DS.mergeWishlist` 与 `/api/steam/wishlist` 都写好了，但唯一的调用点在
+  //    `cloud.js` 的 `syncNow`（浏览器 / 云端路径）。桌面版的同步入口是
+  //    `ui.js` 的 `syncDesktop`，它只有 ① 本机 ② 联网 ③ 家庭库三步 ——
+  //    于是桌面版**一次都没有拉过愿望单**，`status='backlog'` 的记录一条都建不出来，
+  //    「待游玩」永远是 0，且没有任何报错（静默缺失，最难查的那种）。
+  //
+  // ⚠️ 与 `cloud.js` 那边是**两份实现、一套语义**，故意不共用：
+  //    这条走本机服务的 `/api/steam/wishlist`（无登录态、读本机 desktop.json 里的 Key），
+  //    那条走云端 API + 云端登录态。数据源 / 身份确认 / 超时全都不同，
+  //    硬合并会两边互相绊。但返回形状**逐字一致**，且下面那条守卫必须一模一样。
+  var WISH_TIMEOUT = 30000;   // 服务端 WISH_BUDGET（出网预算）+ 回环余量
+
+  /**
+   * 拉一次 Steam 愿望单并合并进本地库。
+   *
+   * 返回 `{ok:true, count, added, removed, kept, appids}`，
+   * 或 `{ok:false, reason, message, howToFix, steamPrivacyUrl, steamKeyUrl}`。
+   * 调用方**不需要**在失败时做任何补偿 —— 这个函数自己保证失败即无副作用。
+   *
+   * `reason` 取值：no_datastore / no_steamid / fetch_failed / bad_response /
+   *                unavailable / empty / steam_key_rejected / steam_unreachable
+   *
+   * ## 🔴 空列表守卫（整个功能里最要紧的一段，与 cloud.js 那份同源）
+   *
+   * `DS.mergeWishlist` 会把「本地有、这次没返回」的款判定成「你把它从愿望单
+   * 删掉了」，删掉记录。而下面这两种情况返回的东西**完全一样**：
+   *   · 愿望单真的空了
+   *   · 隐私设置没公开（Steam 对空和未公开给的是同一份 `{"response":{}}`）
+   * 一次误判就是几百条记录没了，且不可恢复。所以：
+   *   · 接口失败 / 状态不可用 / 结果为空  -> **一律不调 mergeWishlist**，什么都不做
+   * 宁可这次不导入，也不能猜。
+   */
+  async function syncWishlist(steamid) {
+    if (!window.DataStore) return { ok: false, reason: 'no_datastore' };
+    var sid = String(steamid == null ? '' : steamid).trim();
+    if (!/^\d{17}$/.test(sid)) return { ok: false, reason: 'no_steamid' };
+
+    var d = null;
+    try {
+      // ⚠️ 用 getJSONLoose：502（steam_unreachable）的 message 就在 body 里，
+      //    用 getJSON 会被 throw 吞掉，只剩一句"本机服务没有响应"（指错方向）。
+      d = await getJSONLoose('/api/steam/wishlist?steamid=' + encodeURIComponent(sid),
+                             WISH_TIMEOUT);
+    } catch (e) {
+      return { ok: false, reason: 'fetch_failed',
+               message: '愿望单这次没拉到（本机服务没有响应），下次同步会自动重来。' };
+    }
+    if (!d) return { ok: false, reason: 'bad_response' };
+    if (d.error) {
+      // 服务端把「为什么读不到」和「怎么修」都给了 —— 原样透上去，别在这儿改写文案。
+      // 缺 Key / Key 被拒 / 链路不通 是**三种**不同的原因，解法各不相同。
+      return { ok: false, reason: d.error, message: d.message || '',
+               howToFix: d.howToFix || [], steamKeyUrl: d.steamKeyUrl || '' };
+    }
+    if (d.state === 'unavailable') {
+      // 「愿望单是空的」和「愿望单没公开」Steam 给的是同一份数据，分不开 ——
+      // 文案要把两种可能都写上（服务端已经写好，原样用）。
+      return { ok: false, reason: 'unavailable', message: d.message || '',
+               howToFix: d.howToFix || [], steamPrivacyUrl: d.steamPrivacyUrl || '' };
+    }
+
+    var items = (d.items || []).filter(function (x) { return x && x.appid; });
+    if (!items.length) {
+      return { ok: false, reason: 'empty',
+               message: '愿望单这次返回的是空的，已跳过（不做任何删除）。' };
+    }
+
+    var stat = await window.DataStore.mergeWishlist(items);
+    return {
+      ok: true,
+      count: items.length,
+      added: stat.added,
+      removed: stat.removed,
+      kept: stat.kept,
+      appids: items.map(function (x) { return x.appid; })
     };
   }
 
@@ -657,8 +796,35 @@
       return getJSON('/api/steam/resolve?q=' + encodeURIComponent(q || ''), 20000);
     },
 
+    /**
+     * 真问一次 Steam，验「**现在这把 Key** 认不认」。
+     *
+     * 🔴 为什么要单独一个接口（2026-09-24）：上面的 resolveSteamId 只在填
+     *    **个性网址 / 资料链接**时才联网 —— 填 17 位数字 ID 时它一个请求都不发。
+     *    而绝大多数人填的就是数字 ID，于是「验证并保存」从来没真的验证过 Key，
+     *    用户以为验过了，等点同步才失败，而那时的报错又指向"网络"。
+     *
+     * 返回三态，调用方必须分开处理：
+     *     {ok: true,  player}            Key 有效（顺带可能有账号资料）
+     *     {ok: false, message, howToFix} Key 被 Steam 拒绝 —— 跟 howToFix 走
+     *     {ok: null,  message, kind}     这次没问到（网络）—— **没测出来**，
+     *                                    ⚠️ 绝不能当成"Key 不对"，那会让人白换一把
+     */
+    verifyKey: function (steamid) {
+      var q = steamid ? ('?steamid=' + encodeURIComponent(steamid)) : '';
+      return getJSON('/api/steam/verify-key' + q, 20000);
+    },
+
     // ---- 联网同步全量库（需要上面那两个）----
     syncOnline: syncOnline,
+
+    /**
+     * 拉一次 Steam 愿望单并合并进本地库（愿望单 -> 待游玩）。
+     *
+     * ⚠️ 它是**桌面版这条路唯一的入口**：`syncDesktop` 不调它、这个功能就不存在
+     * （2026-09-24 之前正是这样，「待游玩」永远是 0）。
+     */
+    syncWishlist: syncWishlist,
 
     // ---- 家庭库（桌面版专有：成员名单在本机文件里）----
     loadFamily: loadFamily,

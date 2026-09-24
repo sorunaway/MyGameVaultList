@@ -38,6 +38,21 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # SteamID64 的公开基准常量：accountID = 0 时的取值，不含个人信息
 STEAMID64_BASE = "76561197960265728"
 
+# 另外几个**公开且可查证**的 SteamID64 —— 不是谁的私人数据，所以放行。
+# ⚠️ 加这里必须满足两条：① 是**公开知名账号**（不是身边任何人的）；② 在注释里写清是谁。
+#    2026-09-24 加 `76561197960287930`：那是 **Valve 自家账号**，
+#    用在 `server/app.py:VERIFY_PROBE_STEAMID` —— 「验证并保存 API Key」时拿它探一次
+#    `/GetOwnedGames`，只看接口认不认这把 key，不看返回内容（所以填哪个 id 结论都一样）。
+#    不改成假 ID 是因为**没有证据**证明假 id 的响应与真 id 同构（拒绝/无效账号可能
+#    走不同分支），而这个值又不含任何私人信息 —— 放行比"顺手换个值"风险小。
+# ⚠️ 放行是**名单制**，不是放宽正则：正则照旧拦截其他所有 7656119 开头的 17 位。
+# 🔴 **这份名单与 `scripts/pack_win.py` 的 `PUBLIC_STEAMIDS` 必须一致**（同一个值、
+#    同一条正则写在两个脚本里；不对齐就会两边结论不同）。
+PUBLIC_STEAMIDS = {
+    STEAMID64_BASE,
+    "76561197960287930",   # Valve 官方账号（公开基准用）
+}
+
 RE_STEAMID = re.compile(r"7656119\d{9,11}")
 RE_HEXKEY = re.compile(r"\b[0-9A-Fa-f]{32}\b")
 # 本机绝对路径：盘符 + Users/WorkBuddy 之类。
@@ -94,7 +109,7 @@ def audit(paths):
         scanned += 1
 
         for m in RE_STEAMID.finditer(text):
-            if m.group(0) == STEAMID64_BASE:
+            if m.group(0) in PUBLIC_STEAMIDS:
                 continue
             problems.append("%s  含 SteamID64：%s" % (rel, m.group(0)))
         for m in RE_HEXKEY.finditer(text):
@@ -117,6 +132,11 @@ def selftest():
     # (样本文本, 该不该被判为问题)
     vectors = [
         ("SteamID64 公开基准常量 → 放行", "x = " + STEAMID64_BASE, False),
+        # ⚠️ 这两条要成对看：放行是**名单制**，不是把正则放宽。
+        #    只加"放行"那条的话，一个把正则改成 `7656119\d*` 的错改也能骗过自检。
+        ("Valve 官方账号（公开探活用）→ 放行", 'PROBE = "76561197960287930"', False),
+        ("名单外的 17 位 ID → 仍拦截（证明放行是名单，不是放宽）",
+         'sid = "76561198099999999"', True),
         ("真实 SteamID64 → 拦截", "sid = 76561198012345678", True),
         ("本机路径反斜杠 → 拦截", r'BASE = r"E:\WorkBuddy\2026-09-16\p"', True),
         ("本机路径正斜杠 → 拦截", 'p = "E:/WorkBuddy/p"', True),
@@ -132,8 +152,10 @@ def selftest():
 
     fails = 0
     for name, text, should_flag in vectors:
+        # ⚠️ 必须用**同一个** PUBLIC_STEAMIDS 判定，不能在这里另写一份
+        #    （两套规则一分叉，自检就会开始说谎）—— 用的是主扫描那份常量。
         hit = bool(
-            any(m.group(0) != STEAMID64_BASE for m in RE_STEAMID.finditer(text))
+            any(m.group(0) not in PUBLIC_STEAMIDS for m in RE_STEAMID.finditer(text))
             or RE_HEXKEY.search(text)
             or RE_LOCALPATH.search(text)
         )
@@ -177,7 +199,7 @@ def main():
         print("体检查出 %d 处问题 —— 拒绝上传。" % len(problems))
         return 1
 
-    print("  无 SteamID64（基准常量除外）、无 32 位十六进制串、无本机绝对路径")
+    print("  无 SteamID64（公开基准 / 公开账号名单除外）、无 32 位十六进制串、无本机绝对路径")
     print("")
     print("体检通过。")
     return 0
