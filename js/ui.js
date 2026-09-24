@@ -588,7 +588,15 @@
     const img = g.header
       ? '<img src="' + esc(g.header) + '" alt="" loading="lazy" ' +
         'onload="GVCoverFit.apply(this)" ' +
-        'onerror="this.parentNode.innerHTML=\'<div class=&quot;noimg&quot;>◈</div>\'">'
+        // 🔴 加载失败时**只换掉这个 img 自己**（`this.outerHTML=`），**绝不能**写
+        //    `this.parentNode.innerHTML=` —— `parentNode` 是 `.card-media`，那一下会把
+        //    兄弟节点一起清空：`card-badges`（全成就）、`card-quick`（快捷收藏）、
+        //    `card-flags`（自动角标）、以及右下角的拥有状态角标 `ownFlag`
+        //    （已拥有 / 未入库 / 家人的）**全部消失**。
+        //    实测症状：代理一挂、封面全 404 → 400+ 张卡里「已拥有」角标数从 400 多掉到 **0**
+        //    （`_t_wish.html` B2 因此间歇性假红：同一份代码跑出 37/2 与 39/0 两种结果）。
+        //    注意外层属性用的是单引号，所以内层 HTML 的双引号写成 `&quot;`。
+        'onerror="this.outerHTML=\'<div class=&quot;noimg&quot;>◈</div>\'">'
       : '<div class="noimg">◈</div>';
 
     // 快捷收藏按钮（只在「我的游戏单」里出现）
