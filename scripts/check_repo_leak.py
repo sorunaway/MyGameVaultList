@@ -51,6 +51,12 @@ RE_LOCALPATH = re.compile(r"[A-Za-z]:[\\/]+(?:Users|WorkBuddy)\b")
 SKIP_SUFFIX = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2",
                ".zip", ".exe", ".pyc")
 SKIP_PREFIX = ("vendor/",)
+# 🔴 体检**不扫自己**（下面这两个）。代价是一个真实的盲区：
+#    这个文件里写进去的东西，这套检查**永远看不见**。
+#    2026-09-22 就因为这条踩了一次 —— `selftest()` 的样例里把 `.env` 那把真 Key
+#    原样抄了一遍，于是「防泄露的脚本」自己成了仓库里唯一的泄露点，
+#    还随着初始提交进了历史。样例只要形状对就够了，**永远不要填真值**。
+#    （改完这个文件请务必 `--selftest` 复跑，规则的真假只有它验得出来。）
 SKIP_EXACT = {"scripts/check_repo_leak.py", ".gitignore"}
 
 
@@ -116,6 +122,10 @@ def selftest():
         ("本机路径正斜杠 → 拦截", 'p = "E:/WorkBuddy/p"', True),
         ("C 盘用户目录 → 拦截", r"C:\Users\someone\bin\x.exe", True),
         ("普通相对路径 → 放行", 'p = "scripts/sync.py"', False),
+        # 🔴 这里**绝对不能用真 Key 当样例** —— 2026-09-22 审计发现，
+        #    最初的版本把 `.env` 里那把真 Key 原样抄进了这条样例，
+        #    于是"用来防泄露的脚本"自己成了泄露点（在初始提交里就进了仓库历史）。
+        #    样例只要**形状对**（32 位十六进制）就能验到规则，不必是真的。
         ("32 位十六进制 → 拦截", "KEY = 'DEADBEEFCAFEBABE0123456789ABCDEF'", True),
         ("短十六进制 → 放行", "h = 'a1b2c3d4'", False),
     ]
