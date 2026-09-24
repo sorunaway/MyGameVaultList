@@ -11,7 +11,7 @@ GameVault — Windows 桌面版 exe 出包脚本（PyInstaller，白名单制）
 | `pack_win.py`（本文件） | **桌面版** exe | **绝对禁止** —— 那是开发机自己的 key |
 
 桌面版是**发给别人**的：`api_key()` 的优先级是「用户填的 > `.env`」，所以
-exe 里一旦夹带 `.env`，别人机器上就会用开发机的 key 去查 Steam（烧他的配额），
+exe 里一旦夹带 `.env`，别人机器上就会用开发机那把 key 去查 Steam（烧开发者的配额），
 而且那个 key 就明文躺在 `_internal/.env` 里，谁都能翻出来。
 同理必须挡住的还有 `js/seed-data.js`（完整个人游戏库）与 `data/`。
 
