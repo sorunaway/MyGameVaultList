@@ -842,6 +842,74 @@ def account_id_of(steam_id64):
 
 
 # ============================================================
+# 家庭组（Steam Families）—— 成员名单只在本机文件里
+# ============================================================
+def read_family_group(steam_dir=None, account_id=None):
+    """
+    读当前账号的 Steam 家庭组 →
+        `{groupid, name, role, members:[{accountid, steamId, role, isMe}]}`
+    没有家庭组 / 没登录过 / 文件读不动 → **一律 None**（不抛异常）。
+
+    🔑 这是**唯一**能知道"家庭里还有谁"的来源：
+       Web API 侧根本没有家庭接口（`ISteamWebAPIUtil/GetSupportedAPIList` 拉全量清单
+       54 个接口里一个都没有），`ISteamUser/CheckAppOwnership` 对普通 key 一律 403。
+       有了名单才能对每个人调 `IPlayerService/GetOwnedGames` 取并集 —— 那是联网侧
+       唯一能"枚举家庭库"的路（且只对**公开资料**的成员有效）。
+
+    ⚠️ **层级坑**：`localconfig.vdf` 顶层是 `UserLocalConfigStore`，`FamilyGroup` 在它
+       **下面一层**。直接 `root.get("FamilyGroup")` 拿到 None → 会误判成"没加入家庭组"
+       （探针第一版就这么错的，差点得出反向结论）。
+
+    ⚠️ **只有"当前登录的那个账号"的 localconfig 里有这一块**（实测本机 3 个 userdata
+       目录，只有登录中的那个有）。所以它天然是"以本机登录身份为准"，不用另做判断。
+    """
+    steam_dir = steam_dir or find_steam()
+    if not steam_dir:
+        return None
+    if not account_id:
+        accounts = read_accounts(steam_dir)
+        if not accounts:
+            return None
+        account_id = account_id_of(accounts[0]["steamId"])
+    if not account_id:
+        return None
+
+    path = os.path.join(steam_dir, "userdata", str(account_id),
+                        "config", "localconfig.vdf")
+    root = read_vdf(path)
+    if not isinstance(root, dict):
+        return None
+    inner = root.get("UserLocalConfigStore")
+    node = inner if isinstance(inner, dict) else root
+    fg = node.get("FamilyGroup")
+    if not isinstance(fg, dict):
+        return None
+
+    me = str(account_id)
+    members = []
+    for v in (fg.get("members") or {}).values():
+        if not isinstance(v, dict):
+            continue
+        acct = str(v.get("accountid") or "").strip()
+        if not acct.isdigit():
+            continue
+        members.append({
+            "accountid": acct,
+            "steamId": str(int(acct) + STEAMID64_BASE),
+            "role": str(v.get("role") or ""),
+            "isMe": acct == me,
+        })
+    if not members:
+        return None
+    return {
+        "groupid": str(fg.get("groupid") or ""),
+        "name": str(fg.get("name") or ""),
+        "role": str(fg.get("role") or ""),
+        "members": members,
+    }
+
+
+# ============================================================
 # 库 / 游戏
 # ============================================================
 def read_libraries(steam_dir=None):

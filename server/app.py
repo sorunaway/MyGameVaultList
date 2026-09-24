@@ -461,6 +461,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._api_local_status()
             if path == "/api/local/library":
                 return self._api_local_library()
+            # 家庭组成员名单（**只回名单**，成员各自的库仍走 /api/steam/library）。
+            # ⚠️ 这条路由曾经漏注册过：方法 `_api_local_family` 写好了、却没人派发到它，
+            #    表现是前端拿到 404 → getJSON 抛错 → 面板显示"本机服务没有响应"，
+            #    看起来像服务没起。`_t_srv_local.py` 的 B6 段专门盯这一条。
+            if path == "/api/local/family":
+                return self._api_local_family()
             if path == "/api/local/cover":
                 return self._api_local_cover()
             # 用户填的目录先探一下再说（不落盘）；扫盘只在用户点按钮时走
@@ -514,6 +520,32 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_local_library(self):
         return self._json(steam_local.read_library(steam_id=self._q1("steamid") or None))
+
+    def _api_local_family(self):
+        """
+        Steam 家庭组的成员名单。
+
+        返回 `{ok:true, group:{groupid,name,role}, members:[{accountid,steamId,role,isMe}]}`；
+        这个账号没加入家庭组时 `{ok:false, reason:"no_family"}`（**200**，不是错误 ——
+        没有家庭组是完全正常的状态）。
+
+        🔴 **这里只回名单，不回任何人的库**，是刻意的：
+           成员各自的库由前端逐个去 `/api/steam/library?steamid=<成员>` 拿 ——
+           那条接口本来就能查任意 steamid，而且**带着完整的失败归因**
+           （资料不公开 / 链路不通 / 没 key，各带可执行的 `howToFix`）。
+           在这儿再实现一遍取库，等于把归因逻辑复制一份，迟早两边不一致。
+        """
+        g = steam_local.read_family_group()
+        if not g:
+            return self._json({
+                "ok": False, "reason": "no_family",
+                "hint": "这个账号没有加入 Steam 家庭组，或本机文件里没有家庭组记录",
+            })
+        return self._json({
+            "ok": True,
+            "group": {"groupid": g["groupid"], "name": g["name"], "role": g["role"]},
+            "members": g["members"],
+        })
 
     def _api_local_cover(self):
         appid = self._q1("appid")

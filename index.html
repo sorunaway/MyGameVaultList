@@ -224,6 +224,10 @@
              所以用户点同步之前就该知道这次是"联网全量 + 本机补充"还是"只有本机"，
              以及后者缺的是什么。 -->
         <div class="set-status" id="syncSourceNote"></div>
+        <!-- 家庭库那一行。桌面版专有：家庭组的**成员名单**只在本机 Steam 文件里
+             （userdata/<accountid>/config/localconfig.vdf 的 FamilyGroup），
+             Steam 的 Web API 一个家庭接口都没有。所以网页版这行永远是 hidden。 -->
+        <div class="set-status" id="syncFamilyNote" hidden></div>
         <div class="set-actions">
           <button class="btn btn-ghost" id="syncLocalBtn" type="button">重新同步</button>
           <button class="btn btn-ghost" id="syncLocalSetup" type="button">账号设置</button>

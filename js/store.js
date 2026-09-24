@@ -299,9 +299,20 @@
       // 这条记录**是从哪来的**，也是「我的游戏单」里那个角标的唯一依据：
       //   'steam'    它在你的 Steam 库里            -> 角标「已拥有」
       //   'wishlist' 它只在愿望单里，你还没买       -> 角标「未入库」
+      //   'family'   它**不是你的**，是家庭共享里的  -> 角标「家人拥有」
       //   'manual'   你手动加的，Steam 那边不知道   -> 不挂角标（判断不了就别瞎标）
       // ⚠️ 愿望单游戏被买下后，mergeSteam 会把它改成 'steam'，角标随之变「已拥有」。
+      // ⚠️ **家庭款不会**自动转正：它先以 'family' 进来之后，即使你自己买了同一款，
+      //    也仍然停在 'family'（原因见 mergeSteam 里 `staysFamily` 那段注释 ——
+      //    这一层分不清"我买了"和"共享副本装在我盘上"，宁可少标不可错标）。
+      //    修它要先给"这条 payload 确实是我的账号库"加一个显式信号，属独立改动。
       source: 'manual',
+      // ===== 以下两个字段只有「家人拥有」（source='family'）的记录才有意义 =====
+      // ⚠️ 家人的时长**必须**单独放，**绝不能**并进 totalMinutes ——
+      //    totalMinutes 的语义是「**我**玩了多久」，统计条的「总时长」「玩过」
+      //    都直接读它。两者混在一起，库里的数字就再也说不清是谁的。
+      familyOwners: [],      // [{name, steamId}] 家庭里拥有这款的人（从对方的公开库读到）
+      familyMinutes: 0,      // 家人里玩得最久的那个的时长（分钟）
       // ===== 以下三个字段只有愿望单来源的记录才有意义 =====
       wishlisted: false,        // 此刻是否还在 Steam 愿望单里
       wishPriority: 0,          // 你在 Steam 里手动排的位次；0 = 没排过
@@ -395,7 +406,7 @@
   /**
    * 「我的游戏单」卡片右下角那个角标该显示什么。
    *
-   * 返回 'owned'（已拥有）/ 'wish'（未入库）/ ''（不挂角标，因为判断不了）。
+   * 返回 'owned'（已拥有）/ 'wish'（未入库）/ 'family'（家人拥有）/ ''（不挂角标）。
    *
    * ⚠️ 判断依据是 **source 而不是「有没有时长」**：库里从没启动过的游戏
    * 时长同样是 0，用它判断会把一大堆已拥有的游戏标成「未入库」。
@@ -404,11 +415,15 @@
    * 也可能不是，Steam 那边没有依据 —— 标错比不标更糟。
    * 它一旦跟 Steam 库对上号（填了 appid 且那款在库里），mergeSteam 会把
    * source 改成 'steam'，那时自然就显示「已拥有」了。
+   *
+   * 「家人拥有」单独一类（不是「已拥有」的变体）：它是**别人的**游戏，
+   * 混进「已拥有」会让库容量、总时长这些数全部失真。
    */
   function ownershipOf(game) {
     if (!game) return '';
     if (game.source === 'steam') return 'owned';
     if (game.source === 'wishlist') return 'wish';
+    if (game.source === 'family') return 'family';
     return '';
   }
 
@@ -690,7 +705,35 @@
           // 「这条记录原先只是愿望单里的」—— 必须在下面改 source 之前记下来，
           // 状态归类那边要靠它判断「刚刚买下、还没玩过」。
           const wasWishlistOnly = old.source === 'wishlist';
-          old.source = 'steam';
+          // 🔴 **家庭款（source='family'）不许在这里被改成 'steam'**。
+          //    mergeSteam 走的是「**我的**库」这条路，而家庭款是**别人的**游戏 ——
+          //    「已拥有」角标、库容量统计全都靠 source 判，改错就是几百款凭空多出来
+          //    （实测家庭并集数百款）。
+          //    ⚠️ 这条不是理论风险：**备份导入**（`importBackupFile`）就是调这个函数，
+          //    导出过的备份里带着 `source:'family'`，旧写法无条件 `old.source='steam'`
+          //    会让"导出再导入一次"就把家庭款全部变成「已拥有」。
+          //    判据用 `src.source`（备份文件里带着这个字段）；
+          //    本机/联网/愿望单那几条路喂进来的记录**都不带 source**，不受影响。
+          //
+          //    ⚠️⚠️ **已知限制（不是设计）**：`old.source === 'family'` 这一半是**粘性**的
+          //    —— 一款先作为「家人拥有」进来的游戏，在你**真的买下它之后**也不会自动
+          //    转成「已拥有」（虽然愿望单那条路会转）。原因：在 `mergeSteam` 这一层
+          //    分不清"这款出现在库里是因为**我买了**"还是"因为**共享来的副本装在我盘上**"
+          //    —— 后者也会被 `/api/local/library` 读到，一刀切转正会把几百款家人的游戏
+          //    标成你的（比不转正糟得多）。要修得先给"这条payload确实是我的账号库"
+          //    加一个显式信号（联网那条路加得动，本机那条加不动），属独立改动。
+          //    眼下**宁可少标，不可错标**。
+          const staysFamily = old.source === 'family' || src.source === 'family';
+          old.source = staysFamily ? 'family' : 'steam';
+          if (staysFamily) {
+            // 🔴 身份是"家人拥有"时，三个「我的」字段一律归零 —— **不管文件里写了什么**。
+            //    不能只依赖"上游从来没写过脏值"：那是个会被下一次改动打破的假设
+            //    （云端表里连 `familyOwners` 这两列都没有，见 DESIGN.md 的已知限制）。
+            //    放在这里是因为上面 694~696 行已经写过了，这里把它盖回去。
+            old.totalMinutes = 0;
+            old.recentMinutes = 0;
+            old.lastPlayedTs = 0;
+          }
           // 收藏夹：每次同步都覆盖（用户可能在 Steam 里改了分类）
           if (Array.isArray(src.collections)) old.collections = src.collections;
           old.updatedAt = Date.now();
@@ -770,8 +813,17 @@
         } else {
           const g = makeGame(Object.assign({}, src, {
             status: src.suggestedStatus || suggestStatus(src),
-            source: 'steam'
+            // 家庭款从备份导入时**保持自己的身份**（理由见上面那段注释）
+            source: src.source === 'family' ? 'family' : 'steam'
           }));
+          if (g.source === 'family') {
+            // 🔴 家人的时长 / 启动时间**永远不许**落进"我的"字段 ——
+            //    「总时长」「玩过」这些统计直接读 totalMinutes，
+            //    混进别人的游玩记录，库里的数字就再也说不清是谁的。
+            g.totalMinutes = 0;
+            g.recentMinutes = 0;
+            g.lastPlayedTs = 0;
+          }
           delete g.suggestedStatus;   // 内部字段，不入库
           if (!Array.isArray(g.collections)) g.collections = [];
           // 标记这条状态是不是自动规则产生的（供 UI 打「自动」角标）
@@ -784,6 +836,70 @@
 
       await this.saveMany(toSave);
       return { added, updated, recollected, locked, abandoned };
+    },
+
+    /**
+     * 合并一次「家庭库」抓取结果 —— 家庭成员**公开的**库里的那些款。
+     *
+     * 🔴 **为什么不能复用 `mergeSteam`**：那个函数放到这个场景里是**破坏性**的 ——
+     *    · `old.source = 'steam'` → 家人的游戏会挂上「**已拥有**」角标，这是骗人；
+     *    · `old.totalMinutes = src.totalMinutes ?? old.totalMinutes` → 同一个 appid
+     *      我玩了 20 小时、家人玩了 800 小时，**我那份会被静默改成 800**
+     *      （实测家庭并集和我自己的库重合 258 款，走错一步就是几百条真实时长被改）；
+     *    · 还会跑一整套状态归类链（已通关收藏夹 / 全成就 / 90 天启动日期），
+     *      而家庭库**既给不出收藏夹、也给不出我的启动时间** → 状态必算错。
+     *
+     * 所以这条路**独立一整套**，规则只有两条：
+     *
+     *   ① 我库里**没有**的 appid → 新建，`source:'family'`，状态停在「我的游戏单」；
+     *      家人的时长记在**独立字段** `familyMinutes`（`totalMinutes` 保持 0）。
+     *   ② 我库里**已经有的** appid → **原样不动**，连 `familyOwners` 都不写。
+     *      理由：那些款的「我拥有 / 我玩多久 / 什么状态」已经全是对的，
+     *      为了标一句"家人也有这款"去动 258 条真实记录，风险远大于收益。
+     *      ⚠️ 它**不会**因为你后来买了同一款就自动转正 —— 见 mergeSteam 里
+     *      `staysFamily` 那段「已知限制」。
+     *
+     * ⚠️ 去重在这里做**第二遍兜底**：同一款可能被多个成员拥有，调用方应当合成一条
+     *    （带多个 `familyOwners`）；万一没合成，这里也不会写两条同 appid 的记录。
+     */
+    async mergeFamily(incoming) {
+      const existing = await this.all();
+      const seen = new Set();
+      existing.forEach(g => { if (g.appid != null) seen.add(String(g.appid)); });
+
+      const toSave = [];
+      let added = 0, skipped = 0;
+
+      (incoming || []).forEach(src => {
+        if (!src || src.appid == null) return;
+        const key = String(src.appid);
+        // ② 我库里已有 → 不碰（已拥有的、愿望单的、手动加的，全都算"已有"）
+        if (seen.has(key)) { skipped++; return; }
+        const owners = Array.isArray(src.familyOwners) ? src.familyOwners.slice() : [];
+        if (!owners.length) return;
+        const g = makeGame({
+          appid: src.appid,
+          title: src.title || '',
+          icon: src.icon || '',
+          source: 'family',
+          status: STATUS.LIBRARY,
+          familyOwners: owners,
+          familyMinutes: src.familyMinutes || 0,
+          // 🔴 这里**故意不写** totalMinutes / recentMinutes / lastPlayedTs /
+          //    collections / header：前三个是"我的"数据（必须保持 0 / 空），
+          //    收藏夹只有本机那次同步写得了，封面交给 fillMeta 按部就班补。
+        });
+        // 工具 / 原声 / 专用服务器这类照老规矩默认隐藏 ——
+        // 家庭并集里实测有一批（Steam Client、Dedicated Server、各类 Mod Tools），
+        // 不藏起来会把总库冲得没法看。
+        g.hidden = isToolGame(g);
+        toSave.push(g);
+        seen.add(key);          // ⚠️ 必须立刻加，否则同一款会被写两条
+        added++;
+      });
+
+      await this.saveMany(toSave);
+      return { added, skipped };
     },
 
     /**

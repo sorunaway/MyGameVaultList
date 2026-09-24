@@ -408,6 +408,179 @@
     };
   }
 
+  // ============================================================
+  // 家庭库（Steam Families）—— 桌面版专有，必须联网
+  // ============================================================
+  //
+  // 为什么要有这条路：需求问到「能不能拿到家庭库里的游戏」。实测结论是 ——
+  // **Steam 的 Web API 里没有任何家庭接口**（`ISteamWebAPIUtil/GetSupportedAPIList`
+  // 拉全量清单 54 个接口，一个 family 都没有），`ISteamUser/CheckAppOwnership`
+  // 用普通 key 一律 403（它只对发行商 key 开）。
+  // 唯一可行的做法是绕一圈：
+  //
+  //   ① 本机 `localconfig.vdf` 的 `FamilyGroup` 块给**成员名单**
+  //      （→ 服务端 `GET /api/local/family`）；
+  //   ② 对**每个成员**调 `GetOwnedGames`（它对任何 steamid 都有效，
+  //      只要对方把「游戏详情」设为公开）；
+  //   ③ 取并集 = 家庭库的**上界**。
+  //
+  // 🔴 三条必须记住的约束：
+  //
+  //   ① **只在桌面版成立** —— 成员名单要从本机 Steam 文件读，网页版永远拿不到。
+  //      所以这个函数只在桌面态被调用（`ui.js` 的 `syncDesktop`）。
+  //   ② **它只是「上界」** —— Steam Families 有不可共享的项（发行商关闭共享、
+  //      需要第三方 key 的游戏、被 VAC 封禁的账号等）。所以"家人在这个并集里"
+  //      **≠「你一定能玩」** —— 对外文案只能说"家人拥有这些"，不能说"你能玩这些"。
+  //   ③ **成员资料私密 → 那一份拿不到**，必须**逐人报出来**，绝不能静默少算
+  //      （用户看到"近千款"却不知道少了谁，比看到"5 位读到、1 位没读到"更糟）。
+  //
+  // 与「我自己那份」的关系：**家庭并集只做加法**。我库里已有的 appid，
+  // `mergeFamily` 一律不碰（连标记都不写）—— 见 store.js 里那个函数的注释。
+  var FAMILY_MEMBER_TIMEOUT = 60000;   // 单个成员一份库；服务端 LIB_TOTAL_BUDGET 42s + 昵称，给宽一点
+  var FAMILY_LIST_TIMEOUT = 15000;     // 读成员名单（纯本机文件解析，不该慢）
+  // 一次家庭同步最多花多久。5~6 人的家庭、每人跨境拉一份库，最坏情况会叠到几分钟，
+  // 中间还会撞上 Steam 的 1 请求/秒节流 —— 不给上限的话用户会以为卡死。
+  // 超预算就收手，并把"还有几位没读完"如实报出来（下次点同步有服务端缓存，通常很快）。
+  var FAMILY_TOTAL_BUDGET = 240000;
+
+  /** 读本机家庭组成员名单。没家庭组 → `{ok:false, reason:'no_family'}`（正常状态，不是错误） */
+  function loadFamily() {
+    return getJSON('/api/local/family', FAMILY_LIST_TIMEOUT);
+  }
+
+  /**
+   * 拉家庭库并合并。返回：
+   *
+   *     { ok, total, added, skipped, readable, requested, stoppedEarly,
+   *       group:{groupid,name}, members:[{steamId,name,count,reason,message}] }
+   *
+   * `ok:false` 时带 `reason`：no_datastore / fetch_failed / no_family /
+   *                            no_members / all_unreadable。
+   * `onProgress(done, total, name)` 用来在状态行上显示"正在读第几个人"。
+   */
+  async function syncFamily(onProgress) {
+    if (!window.DataStore) return { ok: false, reason: 'no_datastore' };
+
+    var fam;
+    try {
+      fam = await loadFamily();
+    } catch (e) {
+      return { ok: false, reason: 'fetch_failed', error: String((e && e.message) || e) };
+    }
+    if (!fam || !fam.ok) {
+      return { ok: false, reason: (fam && fam.reason) || 'no_family',
+               message: (fam && fam.hint) || '' };
+    }
+
+    // 只读**别人**的库 —— 我自己那份走的是 syncOnline，两边的语义完全不同
+    // （那份是我的、要写 totalMinutes；家庭成员那份只是"谁也有这款"）。
+    var others = (fam.members || []).filter(function (m) {
+      return m && !m.isMe && /^\d{17}$/.test(String(m.steamId || ''));
+    });
+    if (!others.length) return { ok: false, reason: 'no_members' };
+
+    var byAppid = {};       // appid(str) -> 记录（同一款被多人拥有时合并成一条）
+    var order = [];
+    var rows = [];
+    var readable = 0;
+    var stoppedEarly = false;
+    var t0 = Date.now();
+
+    for (var i = 0; i < others.length; i++) {
+      var m = others[i];
+      var sid = String(m.steamId);
+      var row = { steamId: sid, accountid: String(m.accountid || ''),
+                  name: '', count: 0, reason: '', message: '' };
+
+      if (Date.now() - t0 > FAMILY_TOTAL_BUDGET) {
+        // 超预算：**如实记成"没读完"**，不要假装这位兄弟没有游戏
+        stoppedEarly = true;
+        row.reason = 'budget';
+        row.message = '这次同步时间用完了，还没读到这一位';
+        rows.push(row);
+        continue;
+      }
+      if (onProgress) { try { onProgress(i + 1, others.length, row.name); } catch (e) {} }
+
+      var d = null;
+      try {
+        d = await getJSON('/api/steam/library?steamid=' + encodeURIComponent(sid),
+                          FAMILY_MEMBER_TIMEOUT);
+      } catch (e) {
+        row.reason = 'fetch_failed';
+        row.message = '本机服务没有响应（' + ((e && e.message) || e) + '）';
+        rows.push(row);
+        continue;
+      }
+      if (!d) { row.reason = 'bad_response'; row.message = '返回内容看不懂'; rows.push(row); continue; }
+      if (d.error) {
+        // 资料不公开 / 没 key / 链路不通 —— 服务端的 message 更具体，原样透上去
+        row.reason = d.error;
+        row.message = d.message || '';
+        if (d.player && d.player.name) row.name = d.player.name;
+        rows.push(row);
+        continue;
+      }
+
+      var games = d.games || [];
+      if (d.player && d.player.name) row.name = d.player.name;
+      if (!games.length) {
+        // 空库有两种可能：真的没有游戏，或「游戏详情」没公开（Steam 两种情况
+        // 都返回空数组，接口本身分不出来）→ 措辞要覆盖两者，别写死"你没有游戏"。
+        row.reason = 'empty';
+        row.message = '这位的库是空的 —— 可能他真没买过，也可能他的「游戏详情」没设为公开';
+        rows.push(row);
+        continue;
+      }
+
+      readable++;
+      row.count = games.length;
+      var label = row.name || ('账号 …' + sid.slice(-4));
+      games.forEach(function (g) {
+        if (!g || g.appid == null) return;
+        var k = String(g.appid);
+        var rec = byAppid[k];
+        if (!rec) {
+          rec = byAppid[k] = { appid: g.appid, title: '', icon: '',
+                               familyMinutes: 0, familyOwners: [] };
+          order.push(k);
+        }
+        // 名字/图标「有才写」：降级路径下 Steam 不给名称，写空串会盖掉别人已存的真名字
+        if (!rec.title && g.title) rec.title = g.title;
+        if (!rec.icon && g.icon) rec.icon = g.icon;
+        // 家人时长取**最久的那个**（存在独立字段，绝不并进 totalMinutes）
+        if ((g.totalMinutes || 0) > rec.familyMinutes) rec.familyMinutes = g.totalMinutes || 0;
+        if (!rec.familyOwners.some(function (o) { return o.steamId === sid; })) {
+          rec.familyOwners.push({ name: label, steamId: sid });
+        }
+      });
+      rows.push(row);
+    }
+
+    var recs = order.map(function (k) { return byAppid[k]; });
+    var res = { added: 0, skipped: 0 };
+    if (recs.length) {
+      try {
+        res = await window.DataStore.mergeFamily(recs);
+      } catch (e) {
+        console.warn('mergeFamily 失败', e);
+      }
+    }
+
+    return {
+      ok: readable > 0,
+      reason: readable > 0 ? '' : 'all_unreadable',
+      total: recs.length,
+      added: res.added || 0,
+      skipped: res.skipped || 0,
+      readable: readable,
+      requested: others.length,
+      stoppedEarly: stoppedEarly,
+      group: (fam && fam.group) || {},
+      members: rows
+    };
+  }
+
   /**
    * 统一的设置写入。**返回形状统一成 `{ok, reason, data}`** ——
    * 调用方不该去分辨"这是 HTTP 400 还是网络断了"，两种都是"没设成"，
@@ -485,6 +658,12 @@
     },
 
     // ---- 联网同步全量库（需要上面那两个）----
-    syncOnline: syncOnline
+    syncOnline: syncOnline,
+
+    // ---- 家庭库（桌面版专有：成员名单在本机文件里）----
+    loadFamily: loadFamily,
+    syncFamily: syncFamily,
+    /** 家庭同步的单次总预算（毫秒）—— 测试与排查时看这个 */
+    FAMILY_TOTAL_BUDGET: FAMILY_TOTAL_BUDGET
   };
 })();

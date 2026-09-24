@@ -19,6 +19,11 @@
     hideTools: false,       // 总库：是否隐藏工具/软件（默认显示，排底部独立一段）
     hideCompleted: false,   // 总库：是否隐藏已通关的游戏
     hideAbandoned: false,   // 总库：是否隐藏放弃区的游戏
+    // 总库：是否隐藏「家人拥有」的款（source='family'，家庭共享里、**你并不拥有**的）。
+    // 🔴 **默认 true** —— 家庭并集实测一次能进来几百款，
+    //    默认摊开会让"我的库"当场变成一团糊。它是"想看才看"的一份清单，
+    //    在筛选里明示个数（`filterToggles` 那个开关），同步完也会在状态行提一句在哪儿开。
+    hideFamily: true,
     filterOpen: false,      // 总库筛选选项是否展开（纯界面状态，不持久化）
     groupPerfect: false,    // 「已通关」区：是否按全成就/非全成就分两段
     selectMode: false,      // 批量选择模式（暂停区里清理"不想再玩了"用）
@@ -105,6 +110,7 @@
     syncLocalSec:$('#syncLocalSec'),
     syncLocalInfo:$('#syncLocalInfo'),
     syncSourceNote:$('#syncSourceNote'),
+    syncFamilyNote:$('#syncFamilyNote'),
     syncLocalBtn:$('#syncLocalBtn'),
     syncLocalSetup:$('#syncLocalSetup'),
 
@@ -294,20 +300,11 @@
   function gamesInView() {
     let list;
     if (state.view === S.LIBRARY) {
-      list = state.games.slice();
-      if (state.hideTools) {
-        // 「隐藏非游戏」：滤掉真工具 + 被用户藏在「已隐藏」收藏夹里的游戏。
-        // 这两类都不是你想在总库里浏览的内容。
-        list = list.filter(g => !g.hidden);
-      } else {
-        // 默认展示：工具/软件排底部独立一段，
-        // 但被用户主动隐藏的游戏不显示（它们需要靠上面那个开关才出来）。
-        list = list.filter(g => !g.hidden || DS.isToolGame(g));
-      }
-      // 「隐藏已通关」：按状态判定，与是否全成就无关
-      if (state.hideCompleted) list = list.filter(g => g.status !== S.COMPLETED);
-      // 「隐藏已放弃」：把已经出局的清掉，剩下的才是你还在意的
-      if (state.hideAbandoned) list = list.filter(g => g.status !== S.ABANDONED);
+      // 总库的可见性判据**只有一处**（visibleInLibrary），渲染与计数共用它。
+      // 以前这里是几条散落的 filter，和 `countOf` 那份**长得像但不相等**
+      // （hideTools=false 时这里排掉"被收进「已隐藏」收藏夹的游戏"，那边却没排）
+      // → 导航角标比格子里的卡多出 9 张，而两个数看着都合理，极难发现。
+      list = state.games.filter(visibleInLibrary);
     } else {
       // 状态区块里，隐藏的游戏不出现
       list = state.games.filter(g => g.status === state.view && !g.hidden);
@@ -322,22 +319,55 @@
     return sortGames(list);
   }
 
-  /** 计数：状态区块排除隐藏项；总库跟随「隐藏非游戏 / 隐藏已通关 / 隐藏已放弃」三个开关 */
+  /**
+   * 总库视图里该不该排除「家人拥有」（`source='family'`）。
+   *
+   * 「家人拥有」是**别人的**游戏：默认不摊在总库上（实测一次并集进来几百款），
+   * 要用筛选里的开关才显示。所以凡是跟"总库里有什么"有关的判断都得过这一道 ——
+   * 包括渲染、导航角标、以及「非游戏」那个计数。
+   */
+  function familyFilteredOut(g) {
+    return state.hideFamily && g.source === 'family';
+  }
+
+  /**
+   * 「这款现在在总库视图里显示吗」—— **唯一的判据**。
+   *
+   * 🔴 `gamesInView()`（真正渲染什么）与 `countOf()`（导航角标写几）都走它。
+   *    两处口径必须逐字一致：角标数 ≠ 格子里实际张数，就是一种"界面在骗人"，
+   *    而且特别难发现 —— 两个数字各自看着都挺合理（实测差 9 张，谁都看不出来）。
+   *    **以后新增任何总库开关，只改这一个函数。**
+   */
+  function visibleInLibrary(g) {
+    // 「隐藏非游戏」：
+    //   开 = 工具/软件 + 被收进「已隐藏」收藏夹的，全部不显示；
+    //   关 = 工具/软件照常显示（排底部独立一段），但**用户主动隐藏的不显示**
+    //        （它们要靠上面那个开关才出来）。
+    if (state.hideTools) { if (g.hidden) return false; }
+    else if (g.hidden && !DS.isToolGame(g)) return false;
+
+    if (state.hideCompleted && g.status === S.COMPLETED) return false;
+    if (state.hideAbandoned && g.status === S.ABANDONED) return false;
+    if (familyFilteredOut(g)) return false;
+    return true;
+  }
+
+  /** 计数：状态区块排除隐藏项；总库走 visibleInLibrary（与渲染同一个判据） */
   function countOf(st) {
-    if (st === S.LIBRARY) {
-      return state.games.filter(g => {
-        if (state.hideTools && g.hidden) return false;
-        if (state.hideCompleted && g.status === S.COMPLETED) return false;
-        if (state.hideAbandoned && g.status === S.ABANDONED) return false;
-        return true;
-      }).length;
-    }
+    if (st === S.LIBRARY) return state.games.filter(visibleInLibrary).length;
+    // 状态区块（在玩 / 待玩 / 已通关…）**故意不过滤家庭款**：
+    // 用户手动把一张家庭卡拖去「正在游玩」时，那一区的格子里有它，
+    // 计数就得有它。家庭款进来时状态一律停在「我的游戏单」（见 store.mergeFamily），
+    // 所以默认情况下这几区的数本来就不受影响。
     return state.games.filter(g => g.status === st && !g.hidden).length;
   }
 
   /** 非游戏内容数量：真工具/软件 + 用户藏在「已隐藏」收藏夹里的游戏 */
   function hiddenCount() {
-    return state.games.filter(g => g.hidden).length;
+    // 家庭并集里有一批工具件（Steam Client、Dedicated Server、各类 Mod Tools），
+    // 它们默认 hidden=true。总库视图看不到家庭款时，这个数也不该把它们算进去
+    // —— 否则「显示非游戏 47」点下去只出来 30 张，同样是"数对不上"。
+    return state.games.filter(g => g.hidden && !familyFilteredOut(g)).length;
   }
 
   /** 总库里已通关的数量（供开关标注） */
@@ -350,13 +380,26 @@
     return state.games.filter(g => g.status === S.ABANDONED).length;
   }
 
+  /** 「家人拥有」的数量（家庭共享里、你账号并不拥有的那批）—— 供开关标注 */
+  function familyCount() {
+    return state.games.filter(g => g.source === 'family').length;
+  }
+
   // ===== 渲染：统计条 =====
   function renderStats() {
-    // ⚠️ state.games 现在混着两种东西：Steam 库里的（已拥有）和只在愿望单里的
-    // （未入库）。所以「游戏库」这个数**不能**再直接用 state.games.length ——
-    // 那会把 300 款还没买的游戏算进库容量里。按 source 拆成两个数才对得上
-    // 卡片角标，也才对得上用户在 Steam 里看到的情况。
-    const owned = state.games.filter(g => g.source !== 'wishlist').length;
+    // ⚠️ state.games 现在混着**三**种东西：Steam 库里的（已拥有）、只在愿望单里的
+    // （未入库）、以及家庭共享里的（家人拥有，`source='family'`）。
+    // 所以「游戏库」这个数**不能**再直接用 state.games.length ——
+    // 那会把 300 款还没买的 + 几百款家人的一起算进库容量里。
+    // 按 source 拆开才对得上卡片角标，也才对得上用户在 Steam 里看到的情况。
+    //
+    // 🔴 「家人拥有」**必须排除在「已拥有」之外**：它是别人的游戏。
+    //    混进去的话「已拥有」会凭空多出几百款，
+    //    而这个数字是用户判断"我到底有多少游戏"的唯一依据。
+    // ⚠️ 「总时长」不用特意排除：family 记录的 `totalMinutes` 恒为 0
+    //    （家人的时长存在独立的 `familyMinutes` 里），见 store.js 的 mergeFamily。
+    const mine = g => g.source !== 'wishlist' && g.source !== 'family';
+    const owned = state.games.filter(mine).length;
     const wished = state.games.filter(g => g.source === 'wishlist').length;
     const played = state.games.filter(g => (g.totalMinutes || 0) > 0).length;
     const totalMin = state.games.reduce((s, g) => s + (g.totalMinutes || 0), 0);
@@ -430,7 +473,13 @@
         run: () => { state.hideCompleted = !state.hideCompleted; } },
       { id: 'toggleDrop',  n: abandonedCount(),  on: state.hideAbandoned, label: '已放弃',
         tip: '状态为「放弃区」的游戏',
-        run: () => { state.hideAbandoned = !state.hideAbandoned; } }
+        run: () => { state.hideAbandoned = !state.hideAbandoned; } },
+      // 「家人拥有」：家庭共享里、**你账号并不拥有**的款（`source='family'`）。
+      // 措辞必须是"家人拥有"而不是"已拥有" —— 它们来自家庭成员的公开库，
+      // 而且 Steam Families 有不可共享的项，所以严格说只是"家人有这些"。
+      { id: 'toggleFamily', n: familyCount(),    on: state.hideFamily,    label: '家人拥有',
+        tip: '家庭共享里、你账号并不拥有的款（来自家庭成员的公开库）',
+        run: () => { state.hideFamily = !state.hideFamily; } }
     ].filter(t => t.n > 0);
   }
 
@@ -567,16 +616,39 @@
       ? '<div class="card-flags">' + autoFlag + staleFlag + '</div>'
       : '';
 
-    // 右下角：拥有状态（已拥有 / 未入库）。
+    // 右下角：拥有状态（已拥有 / 未入库 / 家人的 · 名字）。
     // 只在「我的游戏单」和「待游玩」两个区块渲染 —— 这两个区块里已拥有和
     // 愿望单来的款会混在一起，角标才有信息量。其余区块清一色都是已拥有的，
     // 每张卡都挂一个「已拥有」只是噪声。
     // DS.ownershipOf 对手动添加的款返回空串（判断不了就不标），见 store.js。
     const own = DS.ownershipOf(g);
+    let ownText = '';
+    let ownTip = '';
+    if (own === 'owned') {
+      ownText = '已拥有';
+    } else if (own === 'wish') {
+      ownText = '未入库';
+    } else if (own === 'family') {
+      // 家庭款要**点名**是谁的：「家人拥有」四个字不够用 —— 一个家庭好几个人，
+      // 用户真正想知道的是"这款能玩是靠谁"。名字太长就截断（角标在卡片右下角，
+      // 撑宽了会压到封面上），完整的名单放 `title` 和详情页里。
+      const names = (g.familyOwners || []).map(o => o && o.name).filter(Boolean);
+      if (names.length) {
+        const first = names[0];
+        ownText = '家人的 · ' + (first.length > 5 ? first.slice(0, 5) + '…' : first) +
+                  (names.length > 1 ? ' 等 ' + names.length + ' 人' : '');
+        ownTip = '家庭共享里这款是' + names.join('、') + '的 —— 你账号并不拥有它';
+      } else {
+        // 名单丢了也别显示「家人的 · 」这种半截话。
+        // 真实会走到这里的场景：桌面版导出备份 → 导进云端版（云端表里没有
+        // `familyOwners` 这两列，见 DESIGN.md 那条已知限制）。
+        ownText = '家人拥有';
+        ownTip = '家庭共享里的款 —— 你账号并不拥有它';
+      }
+    }
     const ownFlag = (own && (state.view === S.LIBRARY || state.view === S.BACKLOG))
-      ? '<div class="card-corner"><span class="cflag cflag-' +
-          (own === 'owned' ? 'owned' : 'wish') + '">' +
-          (own === 'owned' ? '已拥有' : '未入库') + '</span></div>'
+      ? '<div class="card-corner"><span class="cflag cflag-' + own + '"' +
+          (ownTip ? ' title="' + esc(ownTip) + '"' : '') + '>' + esc(ownText) + '</span></div>'
       : '';
 
     // 批量选择模式才渲染勾选圈（避免平时白占几百个 DOM 节点）
@@ -727,11 +799,15 @@
     // 云端层（cloud.js）登录成功后会挂上 window.__gvStorageNote；
     // 没挂就是本机模式 —— 也正是双击 index.html 打开的那种情况。
     const storageNote = window.__gvStorageNote || '数据保存在本机浏览器';
-    // 拆开说：总条数里混着愿望单的，只报一个「共 N 款」会让人以为库变大了。
-    const nOwned = state.games.filter(g => g.source !== 'wishlist').length;
-    const nWish = state.games.length - nOwned;
+    // 拆开说：总条数里混着愿望单的、还有家人拥有的，只报一个「共 N 款」会让人以为库变大了。
+    // ⚠️ 「家人拥有」既不算「已拥有」也不算「愿望单」—— 它是**别人的**游戏，
+    //    必须单独一个数，否则页脚会凭空多出几百款。
+    const nFamily = familyCount();
+    const nOwned = state.games.filter(g => g.source !== 'wishlist' && g.source !== 'family').length;
+    const nWish = state.games.filter(g => g.source === 'wishlist').length;
     el.footInfo.textContent = '已拥有 ' + nOwned + ' 款'
       + (nWish ? ' · 愿望单 ' + nWish + ' 款' : '')
+      + (nFamily ? ' · 家人拥有 ' + nFamily + ' 款' : '')
       + ' · ' + storageNote;
 
     renderSelbar();
@@ -853,11 +929,23 @@
     // ⚠️ 愿望单来的款（还没买）要换一组指标：它的时长和启动时间**天然是空**，
     // 照老样子渲染出来就是「总时长 — / 最后启动 —」两个灰杠，看着像数据坏了。
     // 换成它真正持有的两个信息：什么时候加的、你自己在 Steam 里排的位次。
+    //
+    // ⚠️ 「家人拥有」的款（家庭共享，`source='family'`）同理，而且更会误导：
+    //    它的 `totalMinutes` 恒为 0（那是**我**的时长，我从没玩过）——
+    //    照老样子渲染就是「总时长 — / 最后启动 —」，用户会以为数据丢了。
+    //    改成说清"这是谁的、家人玩了多久"。
+    const familyGame = g.source === 'family';
+    const famHours = fmtHours(g.familyMinutes);
     const wishGame = g.source === 'wishlist';
     const stats = [];
     if (wishGame) {
       stats.push({ k: '加入愿望单', v: fmtDate(g.wishAddedTs) });
       if (g.wishPriority) stats.push({ k: '愿望单排序', v: '第 ' + g.wishPriority + ' 位' });
+      stats.push({ k: '发售年份', v: g.releaseYear || null });
+    } else if (familyGame) {
+      const names = (g.familyOwners || []).map(o => o && o.name).filter(Boolean);
+      stats.push({ k: '拥有者', v: names.length ? names.join('、') : '家庭成员' });
+      stats.push({ k: '家人时长', v: famHours ? famHours + ' h' : null });
       stats.push({ k: '发售年份', v: g.releaseYear || null });
     } else {
       stats.push({ k: '总时长', v: hours ? hours + ' h' : null });
@@ -1282,6 +1370,88 @@
     }
   }
 
+  // ============================================================
+  // 家庭库（Steam Families）—— 桌面版专有
+  // ============================================================
+  //
+  // 🔑 **为什么只有桌面版能做**：家庭组的**成员名单**存在本机 Steam 文件里
+  //    （`userdata/<accountid>/config/localconfig.vdf` 的 `FamilyGroup` 块），
+  //    而 Steam 的 Web API **没有任何家庭接口** ——
+  //    `ISteamWebAPIUtil/GetSupportedAPIList` 拉全量清单 54 个接口，一个都不沾边；
+  //    连"家里有谁"都得靠本机文件。名单到手之后，才对每个成员调 `GetOwnedGames`
+  //    取并集（它对**任何** steamid 都有效，只要对方把「游戏详情」设为公开）。
+  //
+  // ⚠️ 这份并集是**上界**，不是"你能玩的清单"：Steam Families 有不可共享的项
+  //    （发行商关闭共享 / 需要第三方 key / 被 VAC 封禁）。所以文案一律说
+  //    "**家人拥有**这些"，绝不说"你能玩这些"。
+  let familyInfo = null;   // {state:'loading'|'ok'|'none'|'err', group, members, reason}
+
+  /** 读一次家庭组并刷新面板那行。**没有家庭组是完全正常的状态**，不是错误。 */
+  async function refreshFamilyInfo() {
+    if (!state.desktop || !window.GVLocal || !window.GVLocal.loadFamily) return;
+    familyInfo = { state: 'loading' };
+    renderSyncFamilyNote();
+    let f = null;
+    try { f = await window.GVLocal.loadFamily(); } catch (e) { f = null; }
+    if (!f) {
+      familyInfo = { state: 'err', reason: '本机服务没有响应' };
+    } else if (!f.ok) {
+      familyInfo = { state: 'none', reason: f.hint || '' };
+    } else {
+      familyInfo = { state: 'ok', group: f.group || {}, members: f.members || [] };
+    }
+    renderSyncFamilyNote();
+  }
+
+  function renderSyncFamilyNote() {
+    if (!el.syncFamilyNote) return;
+    if (!state.desktop) { el.syncFamilyNote.hidden = true; return; }
+    el.syncFamilyNote.hidden = false;
+    const f = familyInfo;
+    if (!f || f.state === 'loading') {
+      el.syncFamilyNote.className = 'set-status';
+      el.syncFamilyNote.textContent = '家庭库：正在读本机的家庭组…';
+      return;
+    }
+    if (f.state === 'err') {
+      el.syncFamilyNote.className = 'set-status is-warn';
+      el.syncFamilyNote.textContent = '家庭库：' + f.reason;
+      return;
+    }
+    if (f.state === 'none') {
+      el.syncFamilyNote.className = 'set-status';
+      el.syncFamilyNote.textContent = '家庭库：这个账号没有加入 Steam 家庭组';
+      return;
+    }
+    const others = f.members.filter(m => m && !m.isMe);
+    const gn = f.group.name ? '「' + f.group.name + '」' : '';
+    if (!others.length) {
+      el.syncFamilyNote.className = 'set-status';
+      el.syncFamilyNote.textContent = '家庭库：家庭组' + gn + '里只有你自己';
+      return;
+    }
+    el.syncFamilyNote.className = 'set-status is-ok';
+    el.syncFamilyNote.innerHTML =
+      '家庭库：家庭组' + esc(gn) + '共 <b>' + f.members.length + ' 人</b>（含你）—— ' +
+      '同步时会把<b>其他 ' + others.length + ' 人公开的库</b>读进来、标成「家人拥有」。' +
+      '⚠️ 那是<b>他们拥有</b>的款，不等于你都能玩（Steam 有些游戏不允许家庭共享）。';
+  }
+
+  /** 某个家庭成员没读到时，那句解释（服务端给了 message 就用它的） */
+  function familyMissText(reason) {
+    return {
+      profile_private: '他的「游戏详情」没有设为公开，读不到他的库',
+      no_key: '缺 API Key（读别人的库也要 key）',
+      steam_unreachable: '连不上 Steam（跨境链路抖动）',
+      fetch_failed: '本机服务没有响应',
+      bad_response: '返回内容看不懂',
+      budget: '这次同步时间用完了，还没轮到这一位',
+      empty: '他的库是空的 —— 也可能只是「游戏详情」没公开',
+      no_family: '没有加入 Steam 家庭组',
+      no_members: '家庭组里只有你自己'
+    }[reason] || ('没读到（' + (reason || '原因不明') + '）');
+  }
+
   /**
    * 桌面版同步：**先本机、再联网**。
    *
@@ -1305,6 +1475,12 @@
     let onlineBad = '';
     let onlineOk = false;
     let onlineTotal = 0;
+    // 家庭库那半（桌面版专有）—— 与 ①② 完全独立：它读的是**别人**的库
+    let familyOk = false;
+    let familyBad = '';
+    let familyTotal = 0;
+    let familyAdded = 0;
+    let familyMissing = [];
     let plan = null;      // 收尾文案要知道"账号到底绑了没"（p 只在 try 块里活着）
 
     try {
@@ -1373,6 +1549,78 @@
       } else {
         rows.push(['联网补全量', '未绑定账号 —— 设置 →「Steam 账号」']);
       }
+
+      // ---- ③ 家庭库（桌面版专有）----
+      //
+      // 🔑 顺序放在 ② 之后，是**必须**的：①② 先把「我的」那份写完（含收藏夹、
+      //    我的时长、我的状态），③ 才能准确判断"哪些 appid 我库里已经有了" ——
+      //    `mergeFamily` 对已有的款一律不碰（连标记都不写）。
+      //
+      // 🔴 这一步读的是**别人**的库，和 ② 那份语义完全不同：
+      //    ② 写 `totalMinutes`（我的时长），③ 只写 `familyOwners` / `familyMinutes`。
+      //    两者绝不能混 —— store.js 的 mergeFamily 里钉着这一条。
+      if (state.desktop && window.GVLocal && window.GVLocal.syncFamily) {
+        // 顺手把面板那行「家庭库：家庭组…」刷出来（同一份数据，不重复请求）
+        setSyncStatus('正在读本机家庭组…', '');
+        await refreshFamilyInfo();
+        const fi = familyInfo || {};
+        if (fi.state === 'none') {
+          // 没加入家庭组是**正常状态**，不是错误 —— 一行事实就够了，不弹提示
+          rows.push(['家庭库', '这个账号没加入 Steam 家庭组']);
+        } else if (fi.state !== 'ok') {
+          familyBad = fi.reason || '读不到家庭组成员名单';
+          rows.push(['家庭库', familyBad]);
+        } else {
+          const otherN = fi.members.filter(m => m && !m.isMe).length;
+          if (!otherN) {
+            rows.push(['家庭库', '家庭组里只有你自己']);
+          } else if (!plan.hasKey) {
+            // 成员名单是**本机文件**读的（不需要 Key），但读他们的**库**需要 ——
+            // 这里如实说出原因，而不是默默跳过让用户以为"家里就这些"。
+            // 怎么申请：上面「数据来源」那行的链接，和 ② 那条失败的 howToFix 里都有。
+            rows.push(['家庭库（' + otherN + ' 人）',
+                       '要读他们的库得有 API Key —— 见上面「数据来源」那行的申请地址']);
+          } else {
+            setSyncStatus('正在读家庭成员的库…', '');
+            let fr = null;
+            try {
+              fr = await window.GVLocal.syncFamily(function (i, n) {
+                setSyncStatus('正在读家庭成员的库（' + i + '/' + n + '）…', '');
+              });
+            } catch (e) { fr = null; }
+
+            if (!fr) {
+              familyBad = '家庭库同步出错';
+              rows.push(['家庭库', familyBad]);
+            } else {
+              // 逐人归因：**谁读到了、谁没读到、为什么** —— 一条都不能省。
+              // 只报一句"近千款"却不说少了谁，用户会以为那就是全部。
+              (fr.members || []).forEach(function (mm) {
+                if (!mm.reason) return;
+                const who = mm.name || ('账号 …' + String(mm.steamId || '').slice(-4));
+                const why = mm.message || familyMissText(mm.reason);
+                familyMissing.push(who + '：' + why);
+                rows.push(['　· ' + who, why]);
+              });
+              if (fr.readable > 0) {
+                familyOk = true;
+                familyTotal = fr.total || 0;
+                familyAdded = fr.added || 0;
+                rows.push(['家庭库（' + fr.readable + '/' + fr.requested + ' 人读到）',
+                           fr.total + ' 款（新增 ' + fr.added +
+                           '；我已有的 ' + fr.skipped + ' 款原样没动）']);
+                if (fr.stoppedEarly) {
+                  rows.push(['⚠️ 这次时间用完了',
+                             '还有成员没读完 —— 再点一次「重新同步」会接着读（已读到的有服务端缓存）']);
+                }
+              } else {
+                familyBad = '一个成员的库都没读到';
+                rows.push(['家庭库', familyBad]);
+              }
+            }
+          }
+        }
+      }
     } catch (err) {
       setSyncStatus('同步出错：' + ((err && err.message) || err), 'err');
     } finally {
@@ -1385,8 +1633,8 @@
     ).join('');
 
     // 任一半成功都要刷新界面 —— **只成功联网那半时同样得刷**（换台机器、
-    // 本机没装 Steam 就是这种情形：全量库照样拿得到）。
-    if (localOk || onlineOk) {
+    // 本机没装 Steam 就是这种情形：全量库照样拿得到）。③ 同理。
+    if (localOk || onlineOk || familyOk) {
       await reload();
       if (el.setMask.hidden) render();
 
@@ -1401,12 +1649,29 @@
         msg += '（仅本机：' + onlineBad + '）';
       }
       if (newIds.length) msg += '，联网新补 ' + newIds.length + ' 款';
+      if (familyOk) {
+        msg += '，家庭库 ' + familyTotal + ' 款（新进来 ' + familyAdded + ' 款）';
+        // 有家人没读到就必须在**状态行**上也点到 —— 状态行才是用户真正会读的那一行，
+        // 明细里的原因他未必看得见。少了谁 = 这份并集不全。
+        if (familyMissing.length) {
+          msg += '，其中 ' + familyMissing.length + ' 位家人没读到（见明细）';
+        }
+      } else if (familyBad) {
+        msg += '。家庭库没读成：' + familyBad;
+      }
       if (!localOk && localBad) msg += '。本机没读成：' + localBad;
-      // 本机那半失败也要算"需要看一眼" —— 否则状态行一句干净的「同步完成」
-      // 会把上面那行本机错误盖掉。
-      const bad = !!onlineBad || !localOk;
+      // 本机那半失败、家庭库有家人没读到，都要算"需要看一眼" ——
+      // 否则状态行一句干净的「同步完成」会把它们盖掉。
+      const bad = !!onlineBad || !localOk || !!familyBad || familyMissing.length > 0;
       setSyncStatus(msg + '。', bad ? 'warn' : 'ok');
       note(msg, bad ? 'warn' : 'ok');
+
+      // 家人的库读进来后，那份清单**默认是收起来的**（一次几百款，摊在总库里没法看）。
+      // 所以必须告诉用户"东西在哪儿、怎么打开" —— 否则他会以为同步什么都没发生。
+      if (familyAdded > 0) {
+        note('家庭库进来了 ' + familyAdded + ' 款，默认**不显示在总库里**。' +
+             '想看就点「筛选」→ 打开「家人拥有」。', 'ok');
+      }
 
       // 联网新进来的款本机没有封面，优先去补它们（不 await，后台跑）
       fillMetaInBackground(newIds);
@@ -1425,6 +1690,7 @@
       } else if (onlineBad) {
         msg += '。联网：' + onlineBad;
       }
+      if (familyBad) msg += '。家庭库：' + familyBad;
       setSyncStatus(msg + '。', 'err');
       note(msg + '。', 'err');
     }
