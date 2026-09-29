@@ -913,7 +913,7 @@ python -m venv .venv-desktop
 .venv-desktop/Scripts/python scripts/pack_win.py
 ```
 
-产物在 **项目外面**：`../_build_desktop/dist/mygamevaultlist-desktop/`（约 38 MB）。
+产物在 **项目外面**：`../_build_desktop/dist/mygamevaultlist-desktop/`（约 32 MB）。
 里面的 `mygamevaultlist-desktop.exe` 双击就跑 —— ⚠️ **整个目录一起拷走**（`_internal/` 不能丢）。
 
 打包脚本走**白名单**：只把前端静态资源 + `server/` 的代码装进去，
