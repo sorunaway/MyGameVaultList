@@ -1,5 +1,5 @@
 /*
- * GameVault — 内置初始数据引导
+ * MyGameVaultList — 内置初始数据引导
  * 首次打开时，如果 IndexedDB 是空的，自动把 data/steam_sync.json 灌进去。
  * 之后所有改动都存本地，不会被这个文件覆盖。
  *

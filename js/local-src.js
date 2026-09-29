@@ -1,9 +1,13 @@
 /*
  * 本机数据源（Windows 桌面版）—— 把 `/api/local/*` 接进 DataStore。
  *
- * 为什么单独一个文件：`cloud.js` 那套是「登录 + 云端数据库」，桌面版要的是
+ * 为什么单独一个文件：线上版（`cloud.js`，登录 + 云端数据库）还在时，桌面版要的是
  * 「本机 Steam 文件 + 本机浏览器存储」。两条路的数据来源、身份确认、失败处理全不一样，
- * 塞进同一个文件迟早互相绊（cloud.js 已经 1600 行量级了）。
+ * 塞进同一个文件迟早互相绊（那边已经 1600 行量级了）。
+ *
+ * ⚠️ 线上版 2026-09-28 整体下线、`cloud.js` 已删 —— 本文件里凡是提到 `cloud.js`
+ *    的地方都是**历史对照**（写这些守卫/字段时对标的是那份实现），不是在引用一个
+ *    还在的文件。那些"为什么这么写"的理由**依然成立**，别当成过时注释删掉。
  *
  * ============================================================
  * 🔴 怎么判断「我正跑在桌面版里」——**问服务端**，不看 URL、不看 hostname
@@ -298,7 +302,18 @@
       if (fetched[k]) return;                  // 问过了
       var g = byId[k];
       if (!g) return;                          // 不在库里的不问
-      if (g.title && g.header) return;         // 名字和封面都有，没什么可补
+      // 🔴 「名字和封面都有就跳过」这条守卫**不能拿掉** —— 它是给全库几百款省请求的
+      //    （每次启动补一批，没有它每轮都会为整个库重发请求）。
+      //
+      //    但**手动加的条目要开一个口子**：它的名称来自商店候选、封面是按 appid 拼的
+      //    URL，于是"名字和封面都有"这句对它成立 —— 可它**类型 / 开发商 / 发售年
+      //    从来没问过**。不开口子，这几项就永远是空的（2026-09-28 实测确认）。
+      //    这类条目是用户一款一款手填的，量很小，多问几次不心疼。
+      //
+      //    补到之后 `mergeSteam` 会写进 `genres`（下面那段就是），所以
+      //    「已经有类型」的第二个条件保证它**不会每轮都重问**。
+      var manualGap = g.source === 'manual' && !(g.genres || []).length;
+      if (!manualGap && g.title && g.header) return;
       want.push(k);
     });
     if (!want.length) return { filled: 0, left: 0 };
@@ -548,6 +563,192 @@
   }
 
   // ============================================================
+  // Steam 成就进度（「全成就 -> 已通关」）—— 桌面版
+  // ============================================================
+  //
+  // 🔴 为什么必须有这段（2026-09-29 排查时发现）：
+  //    `/api/steam/achievements`（并发分波 + 9 类失败判据 + `no_stats` 确定性答案）
+  //    在服务端**一直是活的**，但桌面版这条路**从来没调过它** —— 唯一的调用点是
+  //    （2026-09-28 随线上版一起删掉的）云端路径里的 `scanAchievements`。
+  //    于是 `game.achievements` 恒为 `null`，四个后果全是**静默**的、一个报错都没有：
+  //      · 顶栏统计格「全成就」恒 0        （`ui.js` 的 renderStats）
+  //      · 卡片永不挂全成就勋章            （`store.js` 的 isPerfect）
+  //      · `suggestStatus()` 第 3 条「全成就 -> 已通关」永不命中
+  //      · 排序「成就进度」永远全垫底
+  //    ⚠️ 与 2026-09-24 愿望单那次是**同一类缺陷**（能力写好了、桌面版的入口没接）——
+  //       愿望单补了，成就漏了。诊断口径也一样：先数"谁调用了这个接口"。
+  //
+  // 🔴 每轮只核一批（`ACH_BATCH` 款），从没核过的优先 —— 这就是「每轮同步真的
+  //    往前推进」：全库几百款要分几次核完，而不是一次把同步卡死几分钟。
+  //    候选池 = 我的 Steam 记录里 `totalMinutes > 0` 且**还没有 `achievements`** 的款。
+  //    核过就落库（包括 `{0,0}` —— 那是"这款没有成就系统"的**确定性答案**），
+  //    于是候选池自然枯竭，不会每轮重复轰炸 Steam。
+  //
+  // ⚠️ **已知限制（不是设计）**：核过的款不再刷新 —— 只有"从没核过"才进候选池。
+  //    所以「本来没全成就、后来打全了」不会被自动发现（要重核得先清掉那条的
+  //    `achievements`）。做成"按时间戳定期重扫"要新加一个字段，属独立改动。
+  var ACH_BATCH = 120;        // = 服务端 `ACH_MAX_IDS`（一次最多问这么多）
+  var ACH_TIMEOUT = 40000;    // 服务端 ACH_DEADLINE 34s + 回环余量
+
+  /**
+   * 取一批成就进度并合并进本地库。
+   *
+   * 返回 `{ok:true, asked, got, left, recollected, link, fatal}`，
+   * 或 `{ok:true, nothingToDo:true, left:0}`（候选池空了，这一步本轮跳过），
+   * 或 `{ok:false, reason, message, howToFix, link, reasons, left}`。
+   *
+   * `left > 0` = 还有没核的，下次同步接着来。
+   *
+   * `reason` 取值：no_datastore / no_steamid / fetch_failed / bad_response /
+   *                链路类（steam_unreachable / steam_key_rejected / no_key…）。
+   * ⚠️ 调用方**不需要**在失败时做任何补偿 —— 这个函数自己保证失败即无副作用。
+   */
+  async function syncAchievements(steamid) {
+    if (!window.DataStore) return { ok: false, reason: 'no_datastore' };
+    var sid = String(steamid == null ? '' : steamid).trim();
+    if (!/^\d{17}$/.test(sid)) return { ok: false, reason: 'no_steamid' };
+
+    // ---- 候选池 ----
+    // 🔴 三条筛选缺一不可：
+    //   ① **只在我自己的 Steam 库里**。排掉 `wishlist` / `family` 与别的平台：
+    //      `mergeSteam` 对喂进去的记录会写 `old.source = 'steam'` —— 愿望单里的款
+    //      被顺手"转正"就等于凭空多出一堆「已拥有」（`store.js` 那段注释钉着这条）。
+    //   ② `totalMinutes > 0`。一次都没启动过的款没有成就可言（`scripts/sync.py`
+    //      同口径："只查玩过的"）。
+    //   ③ 还没有 `achievements`。核过的不重复核（见上面「每轮推进」）。
+    var all = [];
+    try {
+      all = await window.DataStore.all();
+    } catch (e) {
+      return { ok: false, reason: 'no_datastore' };
+    }
+    var P = window.GVPlatforms;
+    var cand = (all || []).filter(function (g) {
+      if (!g || g.appid == null) return false;
+      if (P && P.of(g) !== P.DEFAULT_ID) return false;
+      if (g.source === 'wishlist' || g.source === 'family') return false;
+      if (!(g.totalMinutes > 0)) return false;
+      return !g.achievements;
+    });
+
+    if (!cand.length) {
+      // 候选池空了 —— 这一步本轮**跳过**，不是失败。返回 `nothingToDo` 让调用方
+      // 能把"成就是最新的"如实写进明细，而不是留一行空白让人以为漏了。
+      return { ok: true, nothingToDo: true, asked: 0, got: 0, left: 0 };
+    }
+
+    // 从没核过的优先（上面的筛选已保证），组内按**游玩时长降序** ——
+    // 玩得多的更可能是用户真正在意的那几款，先让它们在界面上出结果
+    // （勋章 / 自动进「已通关」），比按 appid 顺序扫更早看到东西。
+    cand.sort(function (a, b) { return (b.totalMinutes || 0) - (a.totalMinutes || 0); });
+    var ids = cand.slice(0, ACH_BATCH).map(function (g) { return g.appid; });
+
+    var d = null;
+    try {
+      // ⚠️ 用 getJSONLoose：链路类失败（502）的 message 在 body 里，
+      //    用 getJSON 会被 throw 吞掉、只剩一句"本机服务没有响应"（指错方向）。
+      d = await getJSONLoose('/api/steam/achievements?steamid=' + encodeURIComponent(sid) +
+                             '&appids=' + ids.join(','), ACH_TIMEOUT);
+    } catch (e) {
+      return { ok: false, reason: 'fetch_failed',
+               message: '成就这次没拉到（本机服务没有响应），下次同步会接着核。',
+               left: cand.length };
+    }
+    if (!d) return { ok: false, reason: 'bad_response', left: cand.length };
+    if (d.error) {
+      // 服务端把「为什么读不到 + 怎么修」都给了 —— 原样透上去，别在这儿改写文案。
+      return { ok: false, reason: d.error, message: d.message || '',
+               howToFix: d.howToFix || [], left: cand.length };
+    }
+
+    // ---- 落库 ----
+    // 🔴 契约：`items[appid] === null` = **不知道**（这次没轮到 / 查询失败）——
+    //    这种情况**一个字都不许写**。写了就等于把"不确定"记成"已核过"，
+    //    而那款**永远不会再被核**（候选池只挑没有 `achievements` 的）。
+    //    这是本段最容易写错的一行，服务端 `_api_achievements` 的注释也钉着它。
+    var res = d.items || {};
+    var recs = [];
+    ids.forEach(function (id) {
+      var a = res[String(id)];
+      if (!a) return;
+      var earned = Number(a.earned), total = Number(a.total);
+      if (!isFinite(earned) || !isFinite(total)) return;
+      recs.push({ appid: id, achievements: { earned: earned, total: total } });
+    });
+
+    if (!recs.length) {
+      // 一款都没拿到答案。**不报成"已核 0 款"** —— 那读起来像"这些游戏都没成就"，
+      // 而真相是"这次一个都没问到"。原因分类服务端已经给了（`link` / `fatal`）。
+      return { ok: false, reason: d.fatal || 'steam_unreachable',
+               link: d.link || '', reasons: d.reasons || {}, left: cand.length };
+    }
+
+    var stat = await window.DataStore.mergeSteam(recs);
+    return {
+      ok: true,
+      asked: ids.length,
+      got: recs.length,
+      // 没拿到答案的那几款仍在候选池里，所以"还剩"按**候选总数 - 拿到的**算，
+      // 而不是 asked - got 之后再减 —— 写错会让进度条永远差一截。
+      left: Math.max(0, cand.length - recs.length),
+      recollected: stat.recollected || 0,   // 被「全成就」拉进「已通关」的款数
+      link: d.link || 'ok',
+      fatal: d.fatal || ''
+    };
+  }
+
+  // ============================================================
+  // 商店搜索（按名字找 AppID）—— 给「手动添加游戏」当联想
+  // ============================================================
+  //
+  // ⚠️ 与 cloud.js 那边同样是**两份实现、一套语义**（理由同 syncWishlist）：
+  //    这条走本机服务的 `/api/steam/search`（无登录态），那条走同一个路径
+  //    但带云端登录态。**返回形状逐字一致**，所以 ui.js 只按「有没有后端」
+  //    分派，不用关心是哪一边在答。
+
+  var SEARCH_TIMEOUT = 12000;   // 服务端出网超时 8s × 重试 + 回环余量
+
+  /**
+   * 按名字搜 Steam 商店，拿候选（最多 10 条 —— 上限在 Steam 那边，不是我们截的）。
+   *
+   * 返回 `{ok:true, items:[{appid, name, tiny}]}`
+   * 或 `{ok:false, reason, message, items:[]}`。
+   * `reason` 取值：empty / fetch_failed / bad_response / term_empty /
+   *                term_too_long / steam_unreachable
+   *
+   * 🔴 **它是只读的，绝不改变「拥有」语义。**
+   *    不写存储、不碰任何游戏记录 —— 返回的 appid 只是交给表单填一下，
+   *    好让用户点「添加」之后能顺手抓到封面。搜到 ≠ 你有这款。
+   *
+   * 🔴 「搜到 0 条」和「没搜成」在返回值里必须分得开
+   *    （`ok:true, items:[]` 对 `ok:false`）：前者该说「没找到」，
+   *    后者该说「这次没连上，再试试」。混成一句，用户会以为是自己名字打错了，
+   *    然后一直改字 —— 和愿望单那条是同一类错误（见 syncWishlist 的说明）。
+   */
+  async function searchApps(term) {
+    var t = String(term == null ? '' : term).trim();
+    if (!t) return { ok: false, reason: 'empty', items: [] };
+
+    var d = null;
+    try {
+      // ⚠️ 用 getJSONLoose：502（steam_unreachable）的 message 就在 body 里，
+      //    用 getJSON 会被 throw 吞掉，只剩一句"本机服务没有响应"（指错方向）。
+      d = await getJSONLoose('/api/steam/search?term=' + encodeURIComponent(t),
+                             SEARCH_TIMEOUT);
+    } catch (e) {
+      return { ok: false, reason: 'fetch_failed', items: [],
+               message: '本机服务没有响应' };
+    }
+    if (!d) return { ok: false, reason: 'bad_response', items: [] };
+    if (d.error) {
+      // 服务端已经把「为什么没搜成」写好了（含 502 那句链路说明）—— 原样透上去，
+      // 别在这儿改写文案：改写了就和服务端说的不是一回事。
+      return { ok: false, reason: d.error, message: d.message || '', items: [] };
+    }
+    return { ok: true, items: d.items || [] };
+  }
+
+  // ============================================================
   // 家庭库（Steam Families）—— 桌面版专有，必须联网
   // ============================================================
   //
@@ -757,6 +958,12 @@
       }).length;
     },
 
+    /**
+     * 按名字搜商店，拿候选（最多 10 条）。
+     * 给「手动添加游戏」当联想用 —— **只读公共数据，不碰「拥有」语义**。
+     */
+    searchApps: searchApps,
+
     // ---- Steam 目录（哪台机器上 Steam 装在哪都可能不一样）----
     status: function () { return getJSON('/api/local/status', STATUS_TIMEOUT); },
     probePath: function (p) {
@@ -825,6 +1032,21 @@
      * （2026-09-24 之前正是这样，「待游玩」永远是 0）。
      */
     syncWishlist: syncWishlist,
+
+    /**
+     * 核一批成就进度（全成就 -> 已通关）。
+     *
+     * ⚠️ 它同样是**桌面版这条路唯一的入口**：`syncDesktop` 不调它、这个功能就不存在
+     * （2026-09-28 之前正是这样 —— 唯一调用点随云端路径一起被删掉了，
+     * 「全成就」恒 0、卡片永不挂勋章、自动进「已通关」永不触发，且**没有任何报错**）。
+     *
+     * 每轮只核 `ACH_BATCH` 款、从没核过的优先 —— 全库几百款要分几次核完。
+     * 返回里的 `left > 0` 就是"还剩多少款没核"，调用方要把它说到用户看得见的地方。
+     */
+    syncAchievements: syncAchievements,
+
+    /** 成就每轮最多核多少款（= 服务端上限）—— 测试与排查时看这个 */
+    ACH_BATCH: ACH_BATCH,
 
     // ---- 家庭库（桌面版专有：成员名单在本机文件里）----
     loadFamily: loadFamily,

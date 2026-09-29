@@ -1,6 +1,6 @@
 {
-  "name": "我的游戏生涯",
-  "short_name": "游戏生涯",
+  "name": "MyGameVaultList · 我的游戏生涯",
+  "short_name": "MyGameVaultList",
   "description": "Steam 游戏历程管理：玩过什么、进度如何、接下来玩什么",
   "start_url": "/",
   "scope": "/",

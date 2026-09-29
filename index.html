@@ -7,9 +7,9 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="游戏生涯">
+<meta name="apple-mobile-web-app-title" content="MyGameVaultList">
 <meta name="format-detection" content="telephone=no">
-<title>我的游戏生涯</title>
+<title>MyGameVaultList · 我的游戏生涯</title>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="assets/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="assets/icon.svg">
@@ -22,8 +22,13 @@
   <div class="brand">
     <span class="brand-mark">◈</span>
     <div class="brand-text">
-      <h1>我的游戏生涯</h1>
-      <p id="brandSub">游戏历程 · 进度 · 待玩计划</p>
+      <!-- 🔴 品牌名 2026-09-29 从「我的游戏生涯」改为 MyGameVaultList；
+           中文名降为副标题 —— 它仍是这个应用的自我介绍，删掉会让人不知道这是干嘛的。
+           ⚠️ 改这里**不要**碰 index.html 之外的任何"身份"：存储库名（store.js 的
+           DB_NAME / LS_KEY）与数据目录（%LOCALAPPDATA%\MyGameVault）都**不能跟着改** ——
+           那等于把用户已有的库和凭证一起丢掉（理由写在 DESIGN.md 的「改名的边界」一节）。 -->
+      <h1>MyGameVaultList</h1>
+      <p id="brandSub">我的游戏生涯 · 进度 · 待玩计划</p>
     </div>
   </div>
 
@@ -47,22 +52,27 @@
       消息
     </button>
     <!-- 设置：收藏夹 -> 状态的映射。
-         为什么不塞进右上角那个「⋮」——云端模式下 #btnMenu 已被账号菜单接管
-         （见 js/cloud.js takeoverUI），借用它会和账号菜单打架。 -->
+         ⚠️ 顶栏这个「设置」是**唯一**的设置入口。这里原来还有个「⋮」按钮：云端模式
+         下它被账号菜单接管，其余模式里早就空着（2026-09-22 把「清空数据」搬进设置后
+         它就没内容了）。线上版 2026-09-28 下线时一并删掉 —— 别再加只有云端才用得上的
+         按钮，也别把危险操作搬回顶栏。 -->
     <button class="btn btn-ghost" id="btnSettings" title="设置：哪个收藏夹算「已通关」">
       <svg viewBox="0 0 24 24" class="ico"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>
       设置
     </button>
-    <!-- 「⋮」：**只有云端模式用它**（js/cloud.js takeoverUI 把它换成账号菜单）。
-         它原来在本地/桌面模式下装着「清空所有本地数据」—— 一个一键删库的高危动作，
-         却和「同步」「设置」并排放在最外层，误触一下就没了。2026-09-22 移除：
-         危险动作搬进「设置 → 危险操作」，本地/桌面模式下这个按钮由 ui.js 直接隐藏
-         （留着也是空的）。⚠️ 别在本地模式下往里塞新功能 —— 会和云账号菜单打架。 -->
-    <button class="btn btn-ghost" id="btnMenu" title="更多">
-      <svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
-    </button>
   </div>
 </header>
+
+<!-- ===== 平台切换（一级导航）=====
+     一行标签页：库里的数据来自哪个游戏平台。**由 js/platforms.js 的注册表渲染**
+     （ui.js:renderPlatformTabs），HTML 里刻意不留死标签 —— 加一个平台只改注册表，
+     这个文件一行都不用动。
+     ⚠️ 位置刻意放在 <header> **外面**，两个理由：
+       · 顶栏按钮的清单是钉死的（_t_wipe.html 的 F1b 断言 `header .btn` 恰好是
+         添加/同步/消息/设置）。平台切换是**导航**，不是动作按钮；混进顶栏会让那条
+         护栏失去意义（它防的正是"又冒出来一个没用处的按钮"）。
+       · 它比侧栏的「区块导航」**高一层**：先选平台，再选区块。 -->
+<nav class="platformtabs" id="platTabs"></nav>
 
 <!-- ===== 统计条 ===== -->
 <section class="statsbar" id="statsBar"></section>
@@ -128,7 +138,9 @@
 
     <div id="emptyState" class="empty" hidden>
       <div class="empty-mark">◈</div>
-      <h3>这里还空着</h3>
+      <!-- 标题要能被 ui.js 改写：「这个区块空着」和「这个平台还没接入」是两回事，
+           后者得说清缺什么，不能让用户以为自己库丢了。 -->
+      <h3 id="emptyTitle">这里还空着</h3>
       <p id="emptyHint"></p>
     </div>
   </section>
@@ -155,7 +167,13 @@
     <div class="modal-body">
       <label class="field">
         <span>游戏名称 <b>*</b></span>
-        <input id="mTitle" type="text" placeholder="例如：只狼：影逝二度">
+        <input id="mTitle" type="text" placeholder="例如：只狼：影逝二度"
+               autocomplete="off" spellcheck="false">
+        <!-- 商店搜索候选。贴在输入框下面像个下拉，列表项是 div 不是 button ——
+             它们在一个 <label> 里面，button 会打断 label → input 的聚焦行为。
+             ⚠️ 只在**有后端**时才会出现（桌面版 / 线上版）；双击 index.html
+             那个纯本地版拿不到（浏览器不允许网页直接问 Steam），那时它一直是空的。 -->
+        <div class="sg-list" id="mSuggest" hidden></div>
       </label>
       <label class="field">
         <span>Steam AppID <em>（可选，填了能自动抓图标）</em></span>
@@ -354,9 +372,10 @@
              · 「换电脑搬数据」这种事，用户不会想到去页脚找
            位置**刻意贴着下面那节「危险操作」**：滚下去准备删东西的时候，
            正上方就是「先备份一份」。
-           只在本地/桌面模式显示 —— 云端模式的备份在右上角「⋮」账号菜单里
-           已经有一对（导出我的数据 / 导入），不重复摆。 -->
-      <div class="set-sec" id="setBackupSec" hidden>
+           2026-09-28 起这一节**常显**：线上版下线后，这里就是唯一的备份入口了。
+           ⚠️ 别再挂 `hidden` 做条件显示 —— 唯一的开关（ui.js 里按云端模式藏）已随云
+           分支删掉，挂了就永远不显示。 -->
+      <div class="set-sec" id="setBackupSec">
         <h4 class="set-sec-title">数据备份</h4>
         <p class="set-hint">
           把<b>这台设备上</b>的全部记录存成一个文件 —— 库、状态归类、手写感想、
@@ -382,9 +401,9 @@
              · 颜色：整节走红色，和上面几节明显不是一类
              · 二次确认：#wipeMask 是一层**独立**的确认窗（不是 native confirm），
                必须勾掉「我知道找不回来」那个框，「确认清空」才会亮
-           只在本地/桌面模式显示（云端模式的本地库里没有这些记录，
-           它的「⋮」是账号菜单，本来也没这个入口）。 -->
-      <div class="set-sec set-sec-danger" id="setDangerSec" hidden>
+           2026-09-28 起这一节**常显**（线上版下线，不再有"云端模式的记录在云上"那种歧义）。
+           ⚠️ 同样别再挂 `hidden`，见上面「数据备份」那段的说明。 -->
+      <div class="set-sec set-sec-danger" id="setDangerSec">
         <h4 class="set-sec-title">
           <svg viewBox="0 0 24 24" class="ico"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01"/></svg>
           危险操作
@@ -451,6 +470,10 @@
 </footer>
 
 <script src="js/msglog.js"></script>
+<!-- 平台注册表：只声明「有哪些平台、各自能给什么」，零依赖、零副作用。
+     刻意排在 store.js / ui.js **之前** —— 那两个都要读它（记录归属哪个平台、
+     标签页怎么渲染、排序按钮显示哪几个）。加平台只改这一个文件。 -->
+<script src="js/platforms.js"></script>
 <script src="js/store.js"></script>
 <!-- js/seed-data.js 有意不在这里静态引入 —— 它由 scripts/build-embed.py 从
      「你自己的游戏库」内联生成，属于个人数据，不随仓库分发。js/seed.js 会按需
@@ -459,14 +482,11 @@
 <!-- 本机数据源（Windows 桌面版）：把 /api/local/* 接进 DataStore。
      在线上/双击打开时它探测不到本机服务，会静默回落，不影响别的模式。 -->
 <script src="js/local-src.js"></script>
+<!-- 平台数据源：EPIC 那条路（挂进 platforms.js 的数据源位，见 js/epic-src.js）。
+     刻意排在 ui.js **之前** —— ui.js 渲染平台标签页时要问「这个平台有没有数据源」。
+     顺序上它是 self-contained 的：只往注册表挂一个对象，不碰 DOM、不发请求。 -->
+<script src="js/epic-src.js"></script>
 <script src="js/coverfit.js"></script>
 <script src="js/ui.js"></script>
-<!-- 云服务 SDK：自托管在 vendor/ 下（原因与升级步骤见 vendor/README.md）
-     ⚠️ 不要改回 CDN 链接。cdn.jsdelivr.net 在国内链路实测时通时不通，
-        而它挂掉的后果是「整个云端功能不可用」（登录都进不去），不是少个功能；
-        另外 @dev 是滚动标签，等于让平台方直接往生产环境推代码。 -->
-<script src="vendor/index.global.js"></script>
-<script src="js/cloud-config.js"></script>
-<script src="js/cloud.js"></script>
 </body>
 </html>

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GameVault — Steam 同步脚本
+MyGameVaultList — Steam 同步脚本
 
 拉取你 Steam 库的全部游戏，输出成应用能吃的 JSON。
 
@@ -529,7 +529,7 @@ def step_compose(games, ach, store, collections=None):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="GameVault Steam 同步")
+    ap = argparse.ArgumentParser(description="MyGameVaultList Steam 同步")
     ap.add_argument("--key", default=DEFAULT_KEY)
     ap.add_argument("--sid", default=DEFAULT_SID)
     ap.add_argument("--refresh-store", action="store_true",
@@ -559,7 +559,7 @@ def main():
         sys.exit(1)
 
     log("=" * 56)
-    log("GameVault Steam 同步")
+    log("MyGameVaultList Steam 同步")
     log("=" * 56)
     log("SteamID: %s" % args.sid)
     log("")

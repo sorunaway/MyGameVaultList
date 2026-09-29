@@ -1,5 +1,5 @@
 /*
- * GameVault — 界面逻辑
+ * MyGameVaultList — 界面逻辑
  * 依赖 store.js 暴露的 DataStore
  */
 
@@ -9,10 +9,24 @@
   const DS = window.DataStore;
   const S = DS.STATUS;
   const META = DS.STATUS_META;
+  // 平台注册表（js/platforms.js）。**平台之间的差异全在它的声明里** ——
+  // 这个文件里不该出现平台名，见那个文件顶部的说明。
+  const PF = window.GVPlatforms;
 
   // ===== 应用状态 =====
   const state = {
     games: [],
+
+    // 🔴 当前平台（'steam' / 'epic'…）—— 它是**比 view 更高一层**的轴：
+    //    先选平台，再看那个平台的区块。统计、侧栏角标、格子、页脚**全部按它过滤**
+    //    （唯一入口是下面的 platformGames()）。
+    // ⚠️ 刻意**不持久化**（和 state.view 一个口径）：它属于"导航"。
+    //    启动一律落在默认平台 —— 存下来的话，用户上次停在 EPIC，这次一打开就是
+    //    一个空平台，还得自己找回来。
+    // ⚠️ 与 state.desktop **正交**：那个说的是"跑在哪种形态里"，这个说的是
+    //    "数据来自哪个平台"。两种形态下都看得到同一排平台标签页。
+    platform: PF.DEFAULT_ID,
+
     view: S.PLAYING,        // 当前视图（默认正在游玩）
     sort: 'lastPlayed',
     search: '',
@@ -29,13 +43,24 @@
     selectMode: false,      // 批量选择模式（暂停区里清理"不想再玩了"用）
     selected: {},           // 已选中的游戏 id（当 Set 用：{ id: true }）
     noteTargetId: null,
+    // 当前详情抽屉里是哪一款（没开就是 null）。**唯一用途**：后台补资料跑完时
+    // 知道该重绘哪一张 —— 不然用户正看着这款的详情，资料补上了却停在旧内容上，
+    // 他会以为没补到。openDrawer 是幂等的（重调=重绘），所以直接重调它即可。
+    drawerId: null,
     syncPayload: null,
     desktop: false,         // 是否跑在桌面版里（boot 里探测出来后置真）
-    // 是否云端模式（boot 里算出来的）。用途：
-    //  · 决定右上角「⋮」按钮留不留（云端那边它被账号菜单接管，本地这边已清空）
-    //  · 决定设置里「危险操作」那一节显不显示（云端模式的记录在云上，
-    //    这套清除只清本机库，给它看只会误导）
-    cloud: false
+
+    // 每个平台的「本机数据源读得怎么样」：平台 id → { state, text }。
+    //   'loading' 正在读 / 'fail' 读不到（text 是原因）/ 'ready' 读到了、等用户点同步 /
+    //   'ok' 已经同步过了。**没有这个键 = 还没探过。**
+    // 🔴 只活在内存里，**刻意不持久化** —— 它是一次探测的结果、不是偏好。
+    //    存下来的话，"上次没装 EPIC"会被记一辈子，装好之后界面还在说没有。
+    platNote: {}
+    // ⚠️ 这里原来还有个 `cloud`（是否云端模式），随线上版 2026-09-28 下线一起删了 ——
+    //    连带 forceLocal / cloudMode / `#btnMenu` 的隐藏 / `window.__gvRefresh`
+    //    全都只服务于那一种模式。
+    //    留下的教训：每引入一种运行模式，每个 if 都要多问一次，而它只在一种部署里成立。
+    //    现在只承认两种形态：「双击 index.html 的本地版」和「桌面版」，别再添第三种。
   };
 
   /**
@@ -43,6 +68,14 @@
    * 打开设置面板时读它填输入框；用户在面板里改了目录、保存成功后再刷新它。
    */
   let desktopStatus = null;
+
+  // ===== 手动添加 · 商店联想的临时状态 =====
+  // 全部不持久化：属于"这一次弹窗里正在发生的事"，关掉弹窗就该没了。
+  let sgTimer = null;      // 防抖定时器
+  let sgSeq = 0;           // 请求序号 —— 只认最新那一次响应（理由见 doSuggest）
+  let sgItems = [];        // 当前候选（渲染用）
+  let sgIndex = -1;        // 键盘高亮的下标（-1 = 没高亮）
+  let sgTerm = '';         // 当前候选是对哪个词搜出来的
 
   /** 退出批量选择模式，并清空选中 */
   function exitSelectMode() {
@@ -55,6 +88,7 @@
   const el = {
     brandSub:    $('#brandSub'),
     statsBar:    $('#statsBar'),
+    platTabs:    $('#platTabs'),
     viewNav:     $('#viewNav'),
     legend:      $('#legend'),
     viewTitle:   $('#viewTitle'),
@@ -72,6 +106,7 @@
     selExitBtn:  $('#selExitBtn'),
     grid:        $('#grid'),
     emptyState:  $('#emptyState'),
+    emptyTitle:  $('#emptyTitle'),
     emptyHint:   $('#emptyHint'),
     searchInput: $('#searchInput'),
     footInfo:    $('#footInfo'),
@@ -86,6 +121,7 @@
     modalCancel: $('#modalCancel'),
     modalSave:   $('#modalSave'),
     mTitle:      $('#mTitle'),
+    mSuggest:    $('#mSuggest'),
     mAppid:      $('#mAppid'),
     mStatus:     $('#mStatus'),
     mNote:       $('#mNote'),
@@ -143,7 +179,6 @@
     btnAdd:      $('#btnAdd'),
     btnSync:     $('#btnSync'),
     btnSettings: $('#btnSettings'),
-    btnMenu:     $('#btnMenu'),
 
     // 设置里的「数据备份」（仅本地/桌面版可见）
     setBackupSec:   $('#setBackupSec'),
@@ -178,6 +213,20 @@
     return h >= 100 ? String(Math.round(h)) : String(h);
   }
 
+  /**
+   * 装机体积（字节）→ 人能读的一行。没有值就返回 null（界面按「—」渲染）。
+   *
+   * ⚠️ 用 1024 进制、单位写 GB/MB —— 和 Steam / EPIC 自己的写法一致。
+   *    写成 GiB 反而会让人对不上号（用户会拿它去和自己的盘比对）。
+   */
+  function fmtSize(bytes) {
+    const b = Number(bytes) || 0;
+    if (b <= 0) return null;
+    if (b >= 1024 * 1024 * 1024) return (b / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+    if (b >= 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + ' MB';
+    return Math.round(b / 1024) + ' KB';
+  }
+
   function fmtDate(ts) {
     const d = DS.tsToDate(ts);
     if (!d) return null;
@@ -204,6 +253,35 @@
   // ===== 排序 =====
   const SORTS = ['lastPlayed', 'playtime', 'achievement', 'title', 'release'];
 
+  /**
+   * 每个排序各自依赖哪一项**平台能力**（能力名见 js/platforms.js 的 CAPS）。
+   *
+   * 🔴 缺能力 = 这一项对这个平台没意义，按钮直接不显示。
+   *    例：EPIC 那个接口给不出可靠的"最后游玩时间"（注册表里写在 missing 里），
+   *    而「最近游玩」排序全靠它 —— 留着这个按钮，用户点下去只会得到一个
+   *    看着有顺序、其实全是 0 的列表，比没有这个按钮更坏。
+   * `null` = 不依赖任何平台数据（按名称排，谁都能做）。
+   */
+  const SORT_CAP = {
+    lastPlayed:  'lastPlayed',
+    playtime:    'playtime',
+    achievement: 'achievements',
+    title:       null,
+    release:     'release'
+  };
+
+  /**
+   * 实际生效的排序。与 `state.sort` 分开是**故意的**：
+   * 切到 EPIC 时「最近游玩」不成立，但**不许**把 state.sort 改掉 ——
+   * 那等于用户只是去别的平台看了一眼，回来就发现自己的排序被换了。
+   * 所以这里只降级**这一次渲染用哪个**，偏好本身留着（切回去自动恢复）。
+   */
+  function effectiveSort() {
+    if (PF.supports(state.platform, SORT_CAP[state.sort])) return state.sort;
+    const ok = SORTS.find(s => PF.supports(state.platform, SORT_CAP[s]));
+    return ok || 'title';
+  }
+
   /** 成就完成率 0~1；无成就数据返回 -1（排最后） */
   function achRatio(g) {
     const a = g.achievements;
@@ -213,7 +291,7 @@
 
   function sortGames(list) {
     const arr = list.slice();
-    switch (state.sort) {
+    switch (effectiveSort()) {
       case 'playtime':
         arr.sort((a, b) => (b.totalMinutes || 0) - (a.totalMinutes || 0));
         break;
@@ -304,10 +382,10 @@
       // 以前这里是几条散落的 filter，和 `countOf` 那份**长得像但不相等**
       // （hideTools=false 时这里排掉"被收进「已隐藏」收藏夹的游戏"，那边却没排）
       // → 导航角标比格子里的卡多出 9 张，而两个数看着都合理，极难发现。
-      list = state.games.filter(visibleInLibrary);
+      list = platformGames().filter(visibleInLibrary);
     } else {
       // 状态区块里，隐藏的游戏不出现
-      list = state.games.filter(g => g.status === state.view && !g.hidden);
+      list = platformGames().filter(g => g.status === state.view && !g.hidden);
     }
     if (state.search) {
       const q = state.search.toLowerCase();
@@ -317,6 +395,20 @@
       );
     }
     return sortGames(list);
+  }
+
+  /**
+   * 当前平台下的全部记录 —— **平台维度的唯一入口**。
+   *
+   * 🔴 统计条、侧栏角标、格子里的卡片、页脚那一行，全部必须过它。
+   *    漏了一处的症状和下面 `visibleInLibrary` 那条教训一模一样：切到 Steam 标签页，
+   *    数字里却混着别的平台 —— 两个数各自看着都挺合理，极难发现。
+   * ⚠️ 只有"按 id / appid 找某一条记录"（state.games.find）**不**走它：
+   *    那是全局查找，按平台过滤会让从消息记录/详情跳过来的入口找不到目标。
+   */
+  function platformGames() {
+    const p = state.platform;
+    return state.games.filter(g => PF.of(g) === p);
   }
 
   /**
@@ -354,12 +446,12 @@
 
   /** 计数：状态区块排除隐藏项；总库走 visibleInLibrary（与渲染同一个判据） */
   function countOf(st) {
-    if (st === S.LIBRARY) return state.games.filter(visibleInLibrary).length;
+    if (st === S.LIBRARY) return platformGames().filter(visibleInLibrary).length;
     // 状态区块（在玩 / 待玩 / 已通关…）**故意不过滤家庭款**：
     // 用户手动把一张家庭卡拖去「正在游玩」时，那一区的格子里有它，
     // 计数就得有它。家庭款进来时状态一律停在「我的游戏单」（见 store.mergeFamily），
     // 所以默认情况下这几区的数本来就不受影响。
-    return state.games.filter(g => g.status === st && !g.hidden).length;
+    return platformGames().filter(g => g.status === st && !g.hidden).length;
   }
 
   /** 非游戏内容数量：真工具/软件 + 用户藏在「已隐藏」收藏夹里的游戏 */
@@ -367,31 +459,34 @@
     // 家庭并集里有一批工具件（Steam Client、Dedicated Server、各类 Mod Tools），
     // 它们默认 hidden=true。总库视图看不到家庭款时，这个数也不该把它们算进去
     // —— 否则「显示非游戏 47」点下去只出来 30 张，同样是"数对不上"。
-    return state.games.filter(g => g.hidden && !familyFilteredOut(g)).length;
+    return platformGames().filter(g => g.hidden && !familyFilteredOut(g)).length;
   }
 
   /** 总库里已通关的数量（供开关标注） */
   function completedCount() {
-    return state.games.filter(g => g.status === S.COMPLETED).length;
+    return platformGames().filter(g => g.status === S.COMPLETED).length;
   }
 
   /** 总库里已放弃的数量（供开关标注） */
   function abandonedCount() {
-    return state.games.filter(g => g.status === S.ABANDONED).length;
+    return platformGames().filter(g => g.status === S.ABANDONED).length;
   }
 
   /** 「家人拥有」的数量（家庭共享里、你账号并不拥有的那批）—— 供开关标注 */
   function familyCount() {
-    return state.games.filter(g => g.source === 'family').length;
+    return platformGames().filter(g => g.source === 'family').length;
   }
 
   // ===== 渲染：统计条 =====
   function renderStats() {
-    // ⚠️ state.games 现在混着**三**种东西：Steam 库里的（已拥有）、只在愿望单里的
+    // ⚠️ 这一整条统计**只算当前平台**（platformGames）——直读 state.games 的话，
+    //    切到 EPIC 标签页会看到 Steam 的库容量，「已拥有」当场变成别人的数字。
+    //
+    // ⚠️ 平台下的记录现在混着**三**种东西：平台库里的（已拥有）、只在愿望单里的
     // （未入库）、以及家庭共享里的（家人拥有，`source='family'`）。
-    // 所以「游戏库」这个数**不能**再直接用 state.games.length ——
+    // 所以「游戏库」这个数**不能**再直接用列表长度 ——
     // 那会把 300 款还没买的 + 几百款家人的一起算进库容量里。
-    // 按 source 拆开才对得上卡片角标，也才对得上用户在 Steam 里看到的情况。
+    // 按 source 拆开才对得上卡片角标，也才对得上用户在平台里看到的情况。
     //
     // 🔴 「家人拥有」**必须排除在「已拥有」之外**：它是别人的游戏。
     //    混进去的话「已拥有」会凭空多出几百款，
@@ -399,30 +494,205 @@
     // ⚠️ 「总时长」不用特意排除：family 记录的 `totalMinutes` 恒为 0
     //    （家人的时长存在独立的 `familyMinutes` 里），见 store.js 的 mergeFamily。
     const mine = g => g.source !== 'wishlist' && g.source !== 'family';
-    const owned = state.games.filter(mine).length;
-    const wished = state.games.filter(g => g.source === 'wishlist').length;
-    const played = state.games.filter(g => (g.totalMinutes || 0) > 0).length;
-    const totalMin = state.games.reduce((s, g) => s + (g.totalMinutes || 0), 0);
-    const perfect = state.games.filter(g => DS.isPerfect(g)).length;
+    const owned = platformGames().filter(mine).length;
+    const wished = platformGames().filter(g => g.source === 'wishlist').length;
+    const played = platformGames().filter(g => (g.totalMinutes || 0) > 0).length;
+    const totalMin = platformGames().reduce((s, g) => s + (g.totalMinutes || 0), 0);
+    const perfect = platformGames().filter(g => DS.isPerfect(g)).length;
     const playing = countOf(S.PLAYING);
     const backlog = countOf(S.BACKLOG);
+    // 「装了几款 / 一共多大」—— 只在平台**没有时长能力**时用来顶替时长那两格。
+    // ⚠️ 和卡片上的安装状态、详情页的统计格是同一份数据，别再各算一遍。
+    const installedN = platformGames().filter(g => g.installed).length;
+    const installedBytes = platformGames().reduce((s, g) => s + (g.installSize || 0), 0);
 
-    const cards = [
-      { label: '已拥有', value: owned, unit: '款' },
-      { label: '未入库', value: wished, unit: '款' },
-      { label: '总时长', value: Math.round(totalMin / 60), unit: '小时' },
-      { label: '玩过', value: played, unit: '款' },
-      { label: '正在玩', value: playing, unit: '款' },
-      { label: '待玩', value: backlog, unit: '款' },
-      { label: '全成就', value: perfect, unit: '款' }
-    ];
+    // 🔴 格子**按能力拼**，不是写死七格。
+    //
+    // 为什么必须这样：EPIC 拿不到「游玩时长 / 最后游玩时间 / 成就 / 愿望单」，
+    // 而它**每一条记录都算已拥有**（那是它的权益目录）。写死七格的话，
+    // EPIC 标签页上会长期挂着「总时长 0 小时 / 玩过 0 款 / 全成就 0 款」——
+    // 用户读到的是"你玩了 0 小时"，而真相是"这个平台给不出这个数"。
+    // 这和卡片上那个永远空的时长格是同一个错，只是换了位置。
+    //
+    // 规则：
+    //   · 有 `playtime`  → 时长那两格（原样，Steam 走这条，**格子与顺序一位不差**）
+    //   · 没有 `playtime` 但有 `installed` → 换成「已安装 / 占用空间」（换成读得出来的事实）
+    //   · 没有 `wishlist` / `achievements` → 那两格**不出现**（它们对这个平台恒为 0）
+    // ⚠️ 「正在玩 / 待玩」不按能力裁：它们看的是**状态**，用户手动把一款挪进去就算数，
+    //    所以对任何平台都可能非零（自动归类进不去 ≠ 用户进不去）。
+    const caps = c => PF.supports(state.platform, c);
+    const cards = [{ label: '已拥有', value: owned, unit: '款' }];
+    if (caps('wishlist')) cards.push({ label: '未入库', value: wished, unit: '款' });
+    if (caps('playtime')) {
+      cards.push({ label: '总时长', value: Math.round(totalMin / 60), unit: '小时' });
+      cards.push({ label: '玩过', value: played, unit: '款' });
+    } else if (caps('installed')) {
+      cards.push({ label: '已安装', value: installedN, unit: '款' });
+      cards.push({ label: '占用空间',
+                   value: Math.round(installedBytes / 1073741824 * 10) / 10, unit: 'GB' });
+    }
+    cards.push({ label: '正在玩', value: playing, unit: '款' });
+    cards.push({ label: '待玩', value: backlog, unit: '款' });
+    if (caps('achievements')) cards.push({ label: '全成就', value: perfect, unit: '款' });
 
     el.statsBar.innerHTML = cards.map(c =>
+
       '<div class="stat">' +
         '<div class="stat-label">' + esc(c.label) + '</div>' +
         '<div class="stat-value">' + c.value + '<small>' + esc(c.unit) + '</small></div>' +
       '</div>'
     ).join('');
+  }
+
+  /**
+   * 顶栏那行小字（`.brand` 里的区块副标题）。
+   *
+   * 🔴 **不能直接用 `META[st].desc`** —— `store.js` 那张表里「我的游戏单」写死了
+   *    `'Steam 库 + 愿望单，全在这里'`，而切到 EPIC 时这两样**一个都没有**：
+   *    标题栏会挂着"Steam 库 + 愿望单"，下面的统计和卡片却全是 EPIC 的。
+   *    这就是"标题和内容各说各的平台"，出图时实测看到了（`_shot_platform_epic.png` 那一栏）。
+   *
+   * ⚠️ 只改「我的游戏单」这一条：其余五条说的是**分桶规则本身**
+   *    （"90 天内启动过" / "超过 90 天没启动"…），规则在任何平台上都成立，
+   *    只是没有 `lastPlayed` 的平台**永远不会有记录自动落进去** —— 那不是假话。
+   */
+  function viewDesc(st) {
+    const m = META[st] || META[S.LIBRARY];
+    if (st === S.LIBRARY && !PF.supports(state.platform, 'wishlist')) {
+      return '这个平台的全部游戏，都在这里';
+    }
+    return m.desc;
+  }
+
+  // ===== 渲染：平台切换（一级导航）=====
+  /**
+   * 平台标签页。**完全由注册表渲染**（js/platforms.js）——
+   * 加一个平台只改那个文件，这个函数和 index.html 一行都不用动。
+   */
+  function renderPlatformTabs() {
+    if (!el.platTabs) return;
+    el.platTabs.innerHTML = PF.all().map(p => {
+      const on = p.id === state.platform;
+      // 还没接数据源的平台在标签上就说清（点开还有一段更详细的"缺什么"）
+      const soon = p.available ? '' : '<span class="ptab-soon">未接入</span>';
+      const tip = p.available ? p.label : (p.label + '：' + (p.unavailableWhy || '尚未接入'));
+      return '<button class="ptab' + (on ? ' on' : '') + (p.available ? '' : ' off') + '"' +
+             ' type="button" role="tab" aria-selected="' + (on ? 'true' : 'false') + '"' +
+             ' data-plat="' + esc(p.id) + '"' +
+             ' style="--ptab-c:' + esc(p.color) + '"' +
+             ' title="' + esc(tip) + '">' +
+               '<span class="ptab-mark">' + esc(p.mark) + '</span>' +
+               esc(p.short) + soon +
+             '</button>';
+    }).join('');
+
+    el.platTabs.querySelectorAll('.ptab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (btn.dataset.plat === state.platform) return;
+        // 换平台 = 换了一整份数据：跨平台的"已选中"没有任何意义，清掉
+        // （和 renderNav 里换区块时同一个理由）。
+        exitSelectMode();
+        state.platform = btn.dataset.plat;
+        render();
+        // 这个平台有数据源、而且这一趟会话里还没探过 → 顺手**只读**探一次，
+        // 好让占位区能立刻说出"本机有什么 / 为什么读不到"，而不是先空着等用户去点同步。
+        // ⚠️ 只是探测，**不写库**（见 runPlatformProbe 上面那段）。
+        const src = PF.sourceOf(state.platform);
+        if (src && !state.platNote[state.platform]) runPlatformProbe(src, state.platform);
+      });
+    });
+  }
+
+  /**
+   * 排序按钮：按当前平台**能给的能力**决定显示哪几个（能力表见 js/platforms.js）。
+   *
+   * ⚠️ 用 `hidden` 而不是重建 DOM：这些按钮的点击监听是 bindEvents 里一次性挂上的，
+   *    重建会把它们一起扔掉 —— 和筛选面板那组选项踩过的是同一个坑。
+   */
+  function renderSortSeg() {
+    if (!el.sortSeg) return;
+    const cur = effectiveSort();
+    el.sortSeg.querySelectorAll('button').forEach(b => {
+      b.hidden = !PF.supports(state.platform, SORT_CAP[b.dataset.sort]);
+      b.classList.toggle('on', b.dataset.sort === cur);
+    });
+  }
+
+  /**
+   * 「这个平台还没接入」时，占位区里那几句话。
+   * 内容**全部来自注册表声明** —— 不在这里写死任何平台名或字段清单，
+   * 否则真接进来那天，这段文案就会留下来继续骗人。
+   */
+  function platformSoonText(p) {
+    const got = (p.capabilities || []).map(PF.capLabel);
+    const miss = (p.missing || []).map(PF.capLabel);
+    // ⚠️ 第一句必须自带句末标点：这三句是拼成**一整段**给用户看的，
+    //    `unavailableWhy` 是注册表里手写的、结尾有没有句号全看当时心情 ——
+    //    缺一个句号就会出现「…再谈登录后取全量库接入后能拿到：…」这种粘在一块的句子
+    //    （出图时就是这个样子）。这里补一刀，别去要求每条声明都自己写标点。
+    let why = p.unavailableWhy || (p.label + ' 还没接入数据源');
+    if (!/[。！？]$/.test(why)) why += '。';
+    const s = [why];
+    if (got.length) s.push('接入后能拿到：' + got.join('、') + '。');
+    if (miss.length) s.push('拿不到：' + miss.join('、') + '（这些地方会留空、或退回手动填写）。');
+    return s.join('');
+  }
+
+  // ===== 平台数据源：探一次 / 同步一次 =====
+  //
+  // 🔴 「探一次」和「同步一次」是**两个**动作，不许合并成一个。
+  //    切标签页是**导航**，不是操作 —— 做成"切过去就自动导入"，就是在用户没下过
+  //    任何指令的情况下替他写数据；出问题的时候没人知道是谁写的、什么时候写的。
+  //    所以：切过去只**读**（`probe`，一个字节都不落盘），导进来要用户点「同步」。
+  //
+  // ⚠️ 这两个函数**完全不认识任何平台名** —— 它们只面对"一个数据源"，
+  //    具体是哪个平台由注册表回答（`PF.sourceOf`）。加第三个平台时这里一行不用改。
+  let platBusy = false;
+
+  /** 只读探一次当前平台的本机数据源，结果记进 `state.platNote`。**不写任何数据。** */
+  async function runPlatformProbe(src, pid) {
+    const cur = state.platNote[pid];
+    if (cur && cur.state === 'loading') return;   // 已经在读了，别叠
+    if (!src.probe) return;                        // 数据源没实现探测：什么都不说
+    state.platNote[pid] = { state: 'loading', text: src.loadingText || '正在读取…' };
+    if (state.platform === pid) render();
+    let r = null;
+    try {
+      r = await src.probe();
+    } catch (e) {
+      r = { ok: false, text: '读取失败：' + ((e && e.message) || e) };
+    }
+    state.platNote[pid] = { state: r && r.ok ? 'ready' : 'fail',
+                            text: (r && r.text) || '' };
+    // 读的过程中用户可能已经切走了 —— 那时只记结果，别去动别人的界面
+    if (state.platform === pid) render();
+  }
+
+  /** 真同步一次（**会写库**）。给用户看的话一律用数据源给的那句，界面不自己编。 */
+  async function runPlatformSync(src) {
+    if (platBusy) return;                          // 按钮能连点，别叠起来跑
+    platBusy = true;
+    const pid = state.platform;
+    state.platNote[pid] = { state: 'loading', text: src.loadingText || '正在读取…' };
+    render();
+    let r = null;
+    try {
+      r = await src.sync();
+    } catch (e) {
+      r = { ok: false, text: '同步失败：' + ((e && e.message) || e) };
+    }
+    platBusy = false;
+    state.platNote[pid] = { state: r && r.ok ? 'ok' : 'fail', text: (r && r.text) || '' };
+    // ⚠️ 同上：切走了就只记结果。拿旧平台的结论去改新平台的界面，
+    //    症状是"切过去看到的是另一个平台的状态"——看着像数据串了，最难查。
+    if (state.platform !== pid) return;
+    if (r && r.ok) {
+      await reload();                              // reload 只刷 state.games，不重绘
+      note(r.text || (PF.labelOf(pid) + ' 同步完成'), 'ok');
+    } else {
+      note(r.text || (PF.labelOf(pid) + ' 没读出来'), 'err');
+    }
+    render();
   }
 
   // ===== 渲染：侧栏导航 =====
@@ -746,6 +1016,23 @@
         '</button>'
       : '';
 
+    // 卡面那一格数字：能按时长的平台给时长，**给不出的平台换一件它确实有的事**。
+    //
+    // 🔴 为什么不能继续画「—」：注册表里没声明 `playtime` 能力的平台（EPIC 就是），
+    //    `totalMinutes` 恒为 0 → 每张卡都是「—」。用户看到的是"你玩了 0 小时"，
+    //    而事实是"这个平台没有时长数据"—— 两件事在界面上长得一模一样、含义正好相反。
+    //    和详情页里"愿望单的款换一组指标"是同一类问题、同一种解法。
+    // `installed` 也没有的平台（将来的）→ 这一格留空，比一个假的 0 好。
+    const hoursCell = PF.supports(state.platform, 'playtime')
+      ? '<span class="card-hours">' +
+          (hours ? '<b>' + hours + '</b> h' : '&mdash;') +
+        '</span>'
+      : (PF.supports(state.platform, 'installed')
+          ? '<span class="card-inst' + (g.installed ? ' on' : '') + '">' +
+              (g.installed ? '已安装' : '未安装') +
+            '</span>'
+          : '');
+
     return '<article class="card' + (isSel ? ' sel' : '') + '" data-id="' + esc(g.id) +
              '" style="--stc:' + m.color + '">' +
       '<div class="card-media">' + img +
@@ -760,9 +1047,7 @@
         '<div class="card-title' + (titleInfo.pending ? ' pending' : '') +
           '" title="' + esc(titleInfo.tip) + '">' + esc(titleInfo.text) + '</div>' +
         '<div class="card-meta">' +
-          '<span class="card-hours">' +
-            (hours ? '<b>' + hours + '</b> h' : '&mdash;') +
-          '</span>' +
+          hoursCell +
           (showStatus
             // 状态文字包一层 .pill-label：手机端（≤620px）一行放 3 张卡时宽度不够，
             // 只留图标。区块内每张卡的状态必然相同，文字本来就是重复信息。
@@ -776,13 +1061,20 @@
 
   // ===== 渲染：主视图 =====
   function render() {
+    // 平台是最外面那一层：它决定下面所有数字算谁的数据，所以先渲染它
+    renderPlatformTabs();
     renderStats();
     renderNav();
     renderFilters();
+    renderSortSeg();
 
+    const pNow = PF.get(state.platform);
     const m = META[state.view] || META[S.LIBRARY];
-    el.viewTitle.textContent = m.label;
-    el.brandSub.textContent = m.desc;
+    // 非默认平台时把平台名缀在区块名前面。不缀的话，切到 EPIC 还写着「正在游玩」，
+    // 而下面的统计和卡片**已经是 EPIC 的**了 —— 标题和内容各说各的平台。
+    el.viewTitle.textContent =
+      (state.platform === PF.DEFAULT_ID ? '' : PF.labelOf(state.platform) + ' · ') + m.label;
+    el.brandSub.textContent = viewDesc(state.view);
 
     const list = gamesInView();
     el.viewCount.textContent = list.length ? list.length + ' 款' : '';
@@ -803,9 +1095,62 @@
     } else {
       el.grid.hidden = true;
       el.emptyState.hidden = false;
-      el.emptyHint.textContent = state.search
-        ? '没有匹配「' + state.search + '」的游戏。'
-        : emptyHintFor(state.view);
+      // 空态分**三**种，不许混成一句：
+      //   ① 这个平台还没接数据源（注册表里 available:false）→ 说清它缺什么；
+      //   ② 接了数据源，但这台机器上读不到（没装 / 不是桌面版）→ 说清为什么；
+      //   ③ 数据读得到，只是这个区块暂时没东西 → 原来那句"这里还空着"。
+      // ③ 写成 ② 会让用户以为自己的库丢了；② 写成 ③ 会让他对着空页面反复点同步。
+      const note = pNow ? state.platNote[pNow.id] : null;
+      if (pNow && !pNow.available) {
+        el.emptyTitle.textContent = pNow.label + ' 尚未接入';
+        el.emptyHint.textContent = platformSoonText(pNow);
+      } else if (note && (note.state === 'loading' || note.state === 'fail'
+                          || note.state === 'ready')) {
+        el.emptyTitle.textContent =
+          note.state === 'loading' ? ('正在读 ' + pNow.label + ' 的本机库…')
+          : note.state === 'fail' ? (pNow.label + ' 的本机数据没读出来')
+          : ('本机 ' + pNow.label + ' 的数据还没导进来');
+        el.emptyHint.textContent = note.text || '';
+      } else {
+        el.emptyTitle.textContent = '这里还空着';
+        el.emptyHint.textContent = state.search
+          ? '没有匹配「' + state.search + '」的游戏。'
+          : emptyHintFor(state.view);
+      }
+    }
+
+    // 当前平台还没接数据源（注册表里 available:false）→ 写操作一律置灰。
+    //
+    // 理由：这两个动作现在**只有 Steam 语义**（「添加」问的是 Steam AppID、
+    // 「同步」读的是本机 Steam 文件）。在一个还没有数据源的平台上放开它们，
+    // 产出的是一条"归属说不清"的记录 —— 用户明明站在 EPIC 标签页里点添加，
+    // 建出来的条目却落在 Steam 那边，他只会觉得"加了看不到"。
+    // 阶段 2 把 EPIC 的 available 置真后，这里**自动一起放开**，不用改这个函数。
+    // 两个写操作按**各自的条件**开放，不是一个 `writable` 管两个：
+    //
+    //   · 「添加」看平台声明里的 `manualAdd` —— 那个表单是**某一个平台的语义**
+    //     （问的是它的商品号、搜的是它的商店、封面按它的 URL 拼）。在没有声明它的
+    //     平台上放开，建出来的记录 `platform` 是缺省的、于是落进默认平台，
+    //     用户明明站在别的标签页里点添加，却"加了看不到"。
+    //   · 「同步」看**有没有数据源**（`PF.sourceOf`）。有数据源就一定能读，
+    //     剩下的交给数据源自己回答"读不读得到、为什么"。
+    //
+    // ⚠️ 平台名一个都不在这段里 —— 条件全来自注册表。
+    const src = pNow ? PF.sourceOf(pNow.id) : null;
+    const canAdd = !!(pNow && pNow.manualAdd);
+    const canSync = !!(pNow && (pNow.available || src));
+    if (el.btnAdd) {
+      el.btnAdd.disabled = !canAdd;
+      el.btnAdd.title = canAdd ? '手动添加游戏'
+        : ((pNow ? pNow.label : '') + ' 目前只能从它的本机库同步，不提供手动添加');
+    }
+    if (el.btnSync) {
+      el.btnSync.disabled = !canSync;
+      // ⚠️ 文案由**平台名**拼出来（不是写死的"从 Steam 同步"）——
+      //    写死的话，切到别的平台按钮上还写着 Steam，用户会以为按错了按钮。
+      el.btnSync.title = canSync
+        ? ('从 ' + PF.labelOf(pNow.id) + ' 同步')
+        : ((pNow ? pNow.label : '') + ' 还没有数据源，暂时不能同步');
     }
 
     // 分组开关：只在「已通关」区出现（其他地方分组没意义）
@@ -856,21 +1201,19 @@
       });
     });
 
-    // 排序按钮态
-    el.sortSeg.querySelectorAll('button').forEach(b => {
-      b.classList.toggle('on', b.dataset.sort === state.sort);
-    });
+    // 排序按钮态：挪到 renderSortSeg()（它还要按平台能力决定显示哪几个按钮），
+    // 在 render() 开头和平台标签一起渲染。
 
-    // 这句话必须说实话：云端模式下数据在服务器上，不是「本机浏览器」。
-    // 云端层（cloud.js）登录成功后会挂上 window.__gvStorageNote；
-    // 没挂就是本机模式 —— 也正是双击 index.html 打开的那种情况。
+    // 这句话必须说实话：桌面版的数据在本机 Steam 文件里，不是「本机浏览器」。
+    // 桌面版的数据源（local-src.js）会挂上 window.__gvStorageNote 说明它从哪来；
+    // 没挂就是双击 index.html 打开的那种本地版 —— 那时数据确实在浏览器存储里。
     const storageNote = window.__gvStorageNote || '数据保存在本机浏览器';
     // 拆开说：总条数里混着愿望单的、还有家人拥有的，只报一个「共 N 款」会让人以为库变大了。
     // ⚠️ 「家人拥有」既不算「已拥有」也不算「愿望单」—— 它是**别人的**游戏，
     //    必须单独一个数，否则页脚会凭空多出几百款。
     const nFamily = familyCount();
-    const nOwned = state.games.filter(g => g.source !== 'wishlist' && g.source !== 'family').length;
-    const nWish = state.games.filter(g => g.source === 'wishlist').length;
+    const nOwned = platformGames().filter(g => g.source !== 'wishlist' && g.source !== 'family').length;
+    const nWish = platformGames().filter(g => g.source === 'wishlist').length;
     el.footInfo.textContent = '已拥有 ' + nOwned + ' 款'
       + (nWish ? ' · 愿望单 ' + nWish + ' 款' : '')
       + (nFamily ? ' · 家人拥有 ' + nFamily + ' 款' : '')
@@ -946,14 +1289,52 @@
     render();
   }
 
+  /**
+   * 「这个区块空着」时那句提示。
+   *
+   * 🔴 文案**按能力拼**，不写死。这里原来是"点「同步」载入 Steam 库，或点「添加」手动录入"，
+   *    那句话在 EPIC 标签页上同时错了三处：这个平台读的不是 Steam、没有愿望单、
+   *    而且「添加」是**灰的**（`manualAdd:false`）。出图时实测看到的就是这一屏
+   *    （`_shot_platform_epic.png`）—— 用户会照着一条走不通的指引去折腾。
+   *    它同时还是 `ui.js` 里最后一处**平台名字面量**（"平台差异只写在 js/platforms.js"
+   *    这条规则的漏网之处，正则断言拦不住字符串里的名字，只能靠这个函数自己守）。
+   *
+   * ⚠️ 「正在游玩 / 暂停区」的自动归类**依赖 `lastPlayed`**：没有它的平台上
+   *    "会自动出现在这里"不是"暂时没有"，是**永远不会**。所以换一句真话。
+   * ⚠️ 「放弃区」那句不用换 —— 它走的是**状态**（手动挪进去），任何平台都成立。
+   */
   function emptyHintFor(st) {
+    const p = PF.get(state.platform) || {};
+    const caps = c => PF.supports(state.platform, c);
+    const hasSrc = !!PF.sourceOf(state.platform);
+    // "怎么把数据弄进来"：两句各自独立，缺哪个就少哪句
+    const syncClause = hasSrc ? '点「同步」把库导进来' : '点「同步」载入游戏库';
+    const addClause = p.manualAdd ? '，或点「添加」手动录入' : '';
+    // 既没有数据源、又不让手动加 —— 那就别指一条走不通的路
+    const nothingToDo = !hasSrc && !p.manualAdd;
     switch (st) {
-      case S.PLAYING:   return DS.RECENT_DAYS + ' 天内启动过的游戏会自动出现在这里，也可以手动把游戏移进来。';
-      case S.BACKLOG:   return '你想玩、还没开始的游戏放这里。点「同步」会把你 Steam 愿望单里的游戏自动导进来。';
-      case S.PAUSED:    return '超过 ' + DS.RECENT_DAYS + ' 天没启动的游戏会自动落到这里；也可以手动把游戏移进来。';
-      case S.COMPLETED: return '全成就、或收藏夹（默认「已完结」，可在「设置」里改）里的游戏会自动进来，也可以手动标记「已通关」。';
-      case S.ABANDONED: return '这里是主动否掉的游戏。在「暂停区」点「批量选择」，或点开卡片改状态，都能把它挪进来。';
-      default:          return '还没有游戏数据。点「同步」载入 Steam 库，或点「添加」手动录入。';
+      case S.PLAYING:
+        return caps('lastPlayed')
+          ? DS.RECENT_DAYS + ' 天内启动过的游戏会自动出现在这里，也可以手动把游戏移进来。'
+          : '这个平台的资料里没有「最后启动时间」，不会有游戏自动落到这里 —— 点开卡片手动移进来。';
+      case S.BACKLOG:
+        return '你想玩、还没开始的游戏放这里。' + (caps('wishlist')
+          ? '点「同步」会把愿望单里的游戏自动导进来。'
+          : '点开卡片把状态改成「待游玩」，它就会出现在这里。');
+      case S.PAUSED:
+        return caps('lastPlayed')
+          ? '超过 ' + DS.RECENT_DAYS + ' 天没启动的游戏会自动落到这里；也可以手动把游戏移进来。'
+          : '这个平台的资料里没有「最后启动时间」，不会自动分流到这里 —— 点开卡片手动移进来。';
+      case S.COMPLETED:
+        return caps('achievements')
+          ? '全成就、或收藏夹（默认「已完结」，可在「设置」里改）里的游戏会自动进来，也可以手动标记「已通关」。'
+          : '这个平台既拿不到成就、也没有收藏夹 —— 点开卡片手动标记「已通关」。';
+      case S.ABANDONED:
+        return '这里是主动否掉的游戏。在「暂停区」点「批量选择」，或点开卡片改状态，都能把它挪进来。';
+      default:
+        return nothingToDo
+          ? '这个平台暂时还没有可用的数据来源。'
+          : '还没有游戏数据。' + syncClause + addClause + '。';
     }
   }
 
@@ -964,6 +1345,7 @@
     el.drawerBody.innerHTML = drawerHtml(g);
     el.drawer.hidden = false;
     el.drawerMask.hidden = false;
+    state.drawerId = id;                       // 见 state 里那条说明（后台补完要重绘）
     bindDrawer(g);
   }
 
@@ -971,6 +1353,7 @@
     el.drawer.hidden = true;
     el.drawerMask.hidden = true;
     el.drawerBody.innerHTML = '';
+    state.drawerId = null;
   }
 
   function drawerHtml(g) {
@@ -1012,6 +1395,20 @@
       const names = (g.familyOwners || []).map(o => o && o.name).filter(Boolean);
       stats.push({ k: '拥有者', v: names.length ? names.join('、') : '家庭成员' });
       stats.push({ k: '家人时长', v: famHours ? famHours + ' h' : null });
+      stats.push({ k: '发售年份', v: g.releaseYear || null });
+    } else if (!PF.supports(state.platform, 'playtime')) {
+      // 🔴 平台**给不出时长**（注册表里没声明 playtime 能力）—— 照老样子渲染出来是
+      //    「总时长 — / 最后启动 —」，用户会以为数据丢了。
+      //    这和上面「愿望单的款」「家人拥有的款」是同一类问题：
+      //    **值天然为空，而"空"在两个不同的原因下长得一模一样。**
+      //    所以换一组这个平台确实持有的指标（装没装、占多大、谁做的、哪年出的）。
+      if (PF.supports(state.platform, 'installed')) {
+        stats.push({ k: '安装状态', v: g.installed ? '已安装' : '未安装' });
+        if (g.installSize) stats.push({ k: '占用空间', v: fmtSize(g.installSize) });
+      }
+      if (PF.supports(state.platform, 'developer')) {
+        stats.push({ k: '开发商', v: (g.developers || [])[0] || null });
+      }
       stats.push({ k: '发售年份', v: g.releaseYear || null });
     } else {
       stats.push({ k: '总时长', v: hours ? hours + ' h' : null });
@@ -1060,14 +1457,17 @@
         '</div></div>'
       : '';
 
-    // Steam 玩家评价（自动抓的）
-    const steamReviewHtml =
-      '<div class="d-sec">' +
-        '<h4>Steam 评价</h4>' +
-        (g.steamReview
-          ? '<div class="d-note">' + esc(g.steamReview) + '</div>'
-          : '<div class="d-note placeholder">暂未抓取到 Steam 评价，可在下方写自己的感想。</div>') +
-      '</div>';
+    // 玩家评价（自动抓的）—— **只有声明了 `review` 能力的平台才有这一节**。
+    // 没有这一节不是"缺数据"，是那个平台本来就没有这个数据源；
+    // 硬画出来会写一句"暂未抓取到 Steam 评价"，站在别的平台上等于在说别人的事。
+    const reviewHtml = PF.supports(state.platform, 'review')
+      ? ('<div class="d-sec">' +
+          '<h4>' + esc(PF.labelOf(state.platform)) + ' 评价</h4>' +
+          (g.steamReview
+            ? '<div class="d-note">' + esc(g.steamReview) + '</div>'
+            : '<div class="d-note placeholder">暂未抓取到评价，可在下方写自己的感想。</div>') +
+        '</div>')
+      : '';
 
     // 我的记录
     const myNoteHtml =
@@ -1078,9 +1478,14 @@
           : '<div class="d-note placeholder">还没写。点「编辑」记下打到哪了、喜欢什么、哪里劝退。</div>') +
       '</div>';
 
-    const steamLink = g.appid
-      ? '<a class="d-link" href="https://store.steampowered.com/app/' + g.appid +
-        '" target="_blank" rel="noopener">🔗 在 Steam 商店查看</a>'
+    // 去商店看看：地址**按这条记录的归属平台**从注册表取（`storeUrl` 声明）。
+    // 拼不出来就不画 —— 以前这里写死的是某一个平台的 URL，拿别的平台的记录去点它，
+    // 打开的是一个真实存在、但**不是这一款**的页面（比 404 更难发现）。
+    const gPlat = PF.of(g);
+    const storeUrl = PF.storeUrlOf(gPlat, g);
+    const storeLink = storeUrl
+      ? '<a class="d-link" href="' + esc(storeUrl) + '" target="_blank" rel="noopener">' +
+        '🔗 在 ' + esc(PF.labelOf(gPlat)) + ' 商店查看</a>'
       : '';
 
     const autoTag = g.statusLocked
@@ -1140,11 +1545,11 @@
                    esc(lastRel) + '</div>' : '') +
         achHtml +
         myNoteHtml +
-        steamReviewHtml +
+        reviewHtml +
         devHtml +
         tagsHtml +
         '<div class="d-actions">' +
-          steamLink +
+          storeLink +
           '<button class="btn btn-danger" id="deleteBtn">删除</button>' +
         '</div>' +
       '</div>';
@@ -1239,11 +1644,15 @@
       '<option value="' + st + '">' + META[st].icon + ' ' + META[st].label + '</option>'
     ).join('');
     el.mStatus.value = S.BACKLOG;
+    closeSuggest();          // 清掉上一次留下的候选，别让第二次打开看到旧列表
     el.modalMask.hidden = false;
     setTimeout(() => el.mTitle.focus(), 50);
   }
 
-  function closeAddModal() { el.modalMask.hidden = true; }
+  function closeAddModal() {
+    closeSuggest();
+    el.modalMask.hidden = true;
+  }
 
   async function saveNewGame() {
     const title = el.mTitle.value.trim();
@@ -1268,8 +1677,8 @@
       icon: icon,
       header: header,
       // 发售年份不再让用户手填（2026-09-18 反馈：这项没用）。
-      // 手工游戏先留空；填了 AppID 的话，同步时会被商店信息补上
-      // （cloud.js 的补全逻辑按 release_year 写回来）。
+      // 手工游戏先留空；填了 AppID 的话，保存后由商店信息补上
+      // （`fillMetaInBackground` 那一步，按 release_year 写回来）。
       status: status,
       manualStatus: status,
       myNote: el.mNote.value.trim(),
@@ -1284,6 +1693,215 @@
     state.view = status;
     render();
     openDrawer(g.id);
+
+    // 🔴 填了 AppID 就**立刻问一次商店**，把类型 / 开发商 / 发售年补上。
+    //
+    //    「名字和封面」在保存那一刻就已经有了（名字是候选给的、封面是按 appid
+    //    拼的 URL），可**这三项只有真问过商店才有** —— 而补资料那条守卫是
+    //    「名字和封面都有就跳过」，对手动条目恰好成立，于是它会被一路跳过、
+    //    这几项永远空着。所以这里既开守卫的口子（local-src.js 的 `manualGap`），
+    //    也在保存后主动推一把，让它**不用等到下次同步**。
+    //
+    //    ⚠️ 只补这一款（`[appid], 1`），不碰整个库。
+    //    ⚠️ **故意不 await**：外网快慢不该让「添加」这个动作卡住。
+    //       补完由 `fillMetaInBackground` 自己重绘，连开着的这张详情一起。
+    //    ⚠️ 条件用 `state.desktop` **不是** `desktopMode` —— 后者是 boot() 里的
+    //       局部变量，这里取不到（写成它会直接 ReferenceError）。
+    //       `state.desktop` 为假时（双击 index.html 那个纯本地版）没有后端可问，
+    //       直接不发，省掉一次注定失败、还会被当成"没答上来"的请求。
+    if (state.desktop && appid != null) fillMetaInBackground([appid], 1);
+  }
+
+  // ===== 手动添加 · 按名字搜 Steam 商店 =====
+  //
+  // 用户要的：输了名字，先知道 Steam 上有没有这款、是哪一个，选中就把
+  // AppID 填上。拿到 appid 之后，**封面 / 类型 / 开发商 / 发售年**这些交给
+  // 既有的补全链路去问（见 saveNewGame 末尾那次触发）—— 所以候选只要有
+  // 名字和 appid 就够，不用在这里再查一遍。
+  // ⚠️ 别把这句话读成「保存后什么都不用做」：补资料那条守卫只放行
+  //    「名字或封面有缺」的款，手动条目两样都有 → 得靠 `manualGap` 那个
+  //    例外 + saveNewGame 末尾的主动触发，两者缺一，这几项就永远是空的。
+  //    （2026-09-28：早先这里的注释写成「保存后自动补」，是错的 —— 当时
+  //    saveNewGame 根本没调补全。留个记号，免得再想当然。）
+  //
+  // 🔴 三条不能破的约定：
+  //   ① **只补公共元数据，绝不改变「拥有」语义。**
+  //      搜到 ≠ 你有这款。这段代码不写任何存储，只把 appid 填进表单；
+  //      真正落库还是走 saveNewGame，那边一律 source='manual'。
+  //   ② **不搜也能正常添加。** 联想是加速，不是必经步骤 —— 断网、搜不到、
+  //      或者用户就是想自己打名字，都必须照旧能加。
+  //   ③ **手填 AppID 那条路保留**（用户可能本来就知道自己要哪款）。
+  //
+  // ⚠️ 它只在**有后端**时出现（桌面版 / 线上版）。双击 index.html 那个纯本地版
+  //    拿不到 —— 浏览器不允许网页直接问 Steam（CORS），这条是硬约束不是省事。
+  //    所以没后端时整段安静地不工作，也不弹任何「搜不了」的提示：
+  //    用户只是想记一款游戏，不该被技术原因打扰。
+
+  const SG_DEBOUNCE = 400;   // 停手多久才去搜。太短会在打字过程中打出一串请求
+  const SG_MIN_LEN = 2;      // 少于这么多字不搜：一个字的结果太泛，纯属浪费请求
+
+  /** 现在有没有「能搜商店」的后端？没有就整段联想安静地不工作。 */
+  function suggestBackend() {
+    // 🔓 自动化验收留的注入位（**产品代码从不设它**）。
+    //    不这么做的话，「有后端」这条路径在 file:// 测试页里**永远走不到** ——
+    //    那里 probe 一定失败 → state.desktop 恒为 false → 防抖 / 渲染 / 回填
+    //    整条链零覆盖。而这条链正是这次功能的核心，零覆盖比多这两行危险得多。
+    //    （XSS 意义上也是安全的：这是页面自己的全局，能被设就说明页面早已被接管。）
+    if (window.__gvSuggestBackend) return window.__gvSuggestBackend;
+    if (state.desktop && window.GVLocal && window.GVLocal.searchApps) return window.GVLocal;
+    return null;
+  }
+
+  function suggestOpen() {
+    return !!(el.mSuggest && !el.mSuggest.hidden);
+  }
+
+  function closeSuggest() {
+    sgSeq++;                 // 让还在飞的那次响应作废（回来了也别再画）
+    sgItems = [];
+    sgIndex = -1;
+    sgTerm = '';
+    if (el.mSuggest) {
+      el.mSuggest.hidden = true;
+      el.mSuggest.innerHTML = '';
+    }
+  }
+
+  /**
+   * 只放一句提示（「没找到」/「这次没连上」），不渲染成列表。
+   * `isErr` 区分两者 —— 前者是正常结果，后者是故障，颜色上要分得开。
+   */
+  function suggestHint(text, isErr) {
+    if (!el.mSuggest) return;
+    sgItems = [];
+    sgIndex = -1;
+    el.mSuggest.innerHTML =
+      '<div class="sg-hint' + (isErr ? ' err' : '') + '">' + esc(text) + '</div>';
+    el.mSuggest.hidden = false;
+  }
+
+  function renderSuggest(list, term) {
+    // 「已在游戏单」标注 —— 光看名字用户不一定想得起来自己记过没有，
+    // 重复添加一款会让库里出现两张一模一样的卡。这里只**标注**，不做任何拦截：
+    // 用户要是真想再记一条（比如换个状态分类），那是他的自由。
+    const inLib = {};
+    state.games.forEach(g => { if (g.appid != null) inLib[String(g.appid)] = 1; });
+
+    sgItems = list;
+    sgIndex = -1;
+    sgTerm = term;
+    el.mSuggest.innerHTML = list.map((it, i) =>
+      '<div class="sg-item" data-i="' + i + '" role="option">' +
+        (it.tiny
+          ? '<img class="sg-thumb" src="' + esc(it.tiny) + '" alt="" loading="lazy">'
+          : '<span class="sg-thumb"></span>') +
+        '<span class="sg-name" title="' + esc(it.name) + '">' + esc(it.name) + '</span>' +
+        (inLib[String(it.appid)] ? '<span class="sg-own">已在游戏单</span>' : '') +
+      '</div>').join('');
+    el.mSuggest.hidden = false;
+  }
+
+  function suggestHighlight(i) {
+    if (!el.mSuggest || !sgItems.length) return;
+    // 环形选择：末项再往下回到首项（只有几条候选时这点很顺手）
+    sgIndex = ((i % sgItems.length) + sgItems.length) % sgItems.length;
+    const nodes = el.mSuggest.querySelectorAll('.sg-item');
+    nodes.forEach((n, k) => n.classList.toggle('on', k === sgIndex));
+    if (nodes[sgIndex] && nodes[sgIndex].scrollIntoView) {
+      nodes[sgIndex].scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  /**
+   * 选中第 i 个候选 → 回填「名称 + AppID」。
+   *
+   * ⚠️ **只动这两个字段**，不碰用户已经写好的备注和状态 ——
+   *    用户很可能先写了感想、才回头把名字改准，覆盖掉会很恼人。
+   */
+  function pickSuggest(i) {
+    const it = sgItems[i];
+    if (!it) return;
+    el.mTitle.value = it.name;
+    el.mAppid.value = String(it.appid);
+    closeSuggest();
+    el.mTitle.focus();
+  }
+
+  async function doSuggest(term) {
+    const be = suggestBackend();
+    if (!be) return;
+    const my = ++sgSeq;                   // 认领这次请求
+    let r = null;
+    try { r = await be.searchApps(term); } catch (e) { r = null; }
+
+    // 🔴 只认最新一次：用户手快时会有多个请求同时在飞，先发的后到就会把
+    //    「只狼」的候选画到「只狼 2」的输入框下面。序号是唯一的防线。
+    if (my !== sgSeq) return;
+    // 输入框已经不在这句话上了（用户删了字 / 又改了）→ 别画
+    if (el.mTitle.value.trim() !== term) return;
+
+    if (!r || !r.ok) {
+      // 「输入被清空」是正常的收摊，不是错误
+      if (r && r.reason === 'empty') { closeSuggest(); return; }
+      // 🔴 「没搜成」和「没搜到」必须说成两件事（理由见 local-src.js 的同名函数）。
+      //    说成「没找到」，用户会以为是自己名字打错了，然后一直改字。
+      const why = (r && r.message) ? r.message : '';
+      if (r && r.reason === 'steam_unreachable') {
+        suggestHint('这次没连上 Steam 商店（跨境链路波动），稍等几秒再输一次就行。', true);
+      } else if (r && r.reason === 'fetch_failed') {
+        suggestHint('连不上本机服务，搜索暂时用不了（不影响手动填写）。', true);
+      } else {
+        suggestHint(why || '搜索暂时用不了（不影响手动填写）。', true);
+      }
+      return;
+    }
+
+    if (!r.items || !r.items.length) {
+      // 这是**正常结果**：确实没这款。用中性色，并可执行地指回手动填写。
+      suggestHint('Steam 商店里没找到这个名字的正式游戏 —— 可以直接手动填写。', false);
+      return;
+    }
+    renderSuggest(r.items, term);
+  }
+
+  /** 名字输入框变了 → 防抖后去搜 */
+  function onTitleInput() {
+    const term = el.mTitle.value.trim();
+    clearTimeout(sgTimer);
+    if (!suggestBackend()) return;                  // 没有后端就完全不打扰
+    if (term.length < SG_MIN_LEN) { closeSuggest(); return; }
+    if (term === sgTerm && sgItems.length) return;  // 同一个词、候选还在 → 不重复问
+    sgTimer = setTimeout(() => doSuggest(term), SG_DEBOUNCE);
+  }
+
+  function onTitleKeydown(e) {
+    if (e.key === 'Escape') {
+      if (suggestOpen()) { e.preventDefault(); closeSuggest(); }
+      else closeAddModal();
+      return;
+    }
+    // 没候选时，回车保持原语义（= 保存）
+    if (!sgItems.length || !suggestOpen()) {
+      if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); saveNewGame(); }
+      return;
+    }
+    if (e.key === 'ArrowDown') { e.preventDefault(); suggestHighlight(sgIndex + 1); return; }
+    if (e.key === 'ArrowUp')   { e.preventDefault(); suggestHighlight(sgIndex - 1); return; }
+    if (e.key === 'Enter') {
+      // ⚠️ 输入法组字期间的回车是「上屏」，不是「确认」。少了这一句，
+      //    中文用户打完字按回车选词，会当场把表单保存掉。
+      if (e.isComposing) return;
+      e.preventDefault();
+      // 有高亮 → 选它；没高亮 → 还是保存（用户可能就是想直接加）
+      if (sgIndex >= 0) pickSuggest(sgIndex); else saveNewGame();
+    }
+  }
+
+  function onSuggestClick(e) {
+    const node = e.target && e.target.closest ? e.target.closest('.sg-item') : null;
+    if (!node) return;
+    const i = Number(node.getAttribute('data-i'));
+    if (!isNaN(i)) pickSuggest(i);
   }
 
   // ===== Steam 同步 =====
@@ -1385,6 +2003,29 @@
       no_steamid: '还没有绑定 SteamID',
       bad_response: '服务端回了个看不懂的响应'
     }[reason] || ('愿望单没读到（' + (reason || '原因不明') + '）');
+  }
+
+  /**
+   * 成就那一行的失败文案。
+   *
+   * ⚠️ 同 `wishFailText`：只兜「服务端没说清」的情况 —— 服务端给了 `message`
+   *    就**优先用它**。下面的 key 与 `local-src.js` 里 `syncAchievements` 的
+   *    `reason` 一一对应，别改成另一套词。
+   *
+   * 🔴 「这次一款都没问到」与「这些游戏都没成就」是**两件事** ——
+   *    前者是链路问题（下次接着来），后者是确定性答案（已落库 `{0,0}`）。
+   *    文案必须分开，否则用户会把"没连上"读成"我的游戏都没成就"。
+   */
+  function achFailText(reason) {
+    return {
+      steam_unreachable: '这次没连上 Steam（跨境链路抖动），过几秒再点一次「同步」就会接着核',
+      steam_key_rejected: 'Steam 拒绝了这个 API Key —— 去「设置」里换一把，重试没有用',
+      no_key: '还没有填 Steam Web API Key',
+      no_steamid: '还没有绑定 SteamID',
+      profile_private: 'Steam 的「游戏详情」没有设为公开',
+      fetch_failed: '本机服务没有响应',
+      bad_response: '服务端回了个看不懂的响应'
+    }[reason] || ('成就这次没核成（' + (reason || '原因不明') + '）');
   }
 
   // 「去申请 API Key」的官方地址。写成常量：同步面板和账号设置两处都要用，
@@ -1577,6 +2218,19 @@
     let familyAdded = 0;
     let familyMissing = [];
     let plan = null;      // 收尾文案要知道"账号到底绑了没"（p 只在 try 块里活着）
+    // 🔴 ②.5 愿望单 / ②.75 成就 的这几个变量**必须声明在这里**（不能在 try 块里）。
+    //    它们要在 `try/finally` **之后**的收尾文案里读 —— 而 `let` 是块作用域的，
+    //    写在 try 体内，跳出那个块之后就是 `ReferenceError`。
+    //    ⚠️ 实测过这条：原先只有 `wish*` 这一组漏在了 try 里，于是只要
+    //    「进了收尾分支」（本机那半读成功就会进，本机装了 Steam 的机器基本必然），
+    //    函数就停在 `if (wishOk)` 那一行抛异常 —— 而它是 async 且没有调用方 catch，
+    //    异常被静默吞掉。表现是**明细行全对、状态行永远停在最后一个中间态、
+    //    界面不刷新**（愿望单其实已经写进库了，只是没重绘）。
+    //    `family*` 当初就声明在外面（见上面那行注释），`wish*` 漏了 —— 这次一并补齐。
+    let wishOk = false, wishReason = '', wishBad = '', wishCount = 0, wishAdded = 0;
+    let wishIds = [];
+    let achOk = false, achBad = '', achReason = '';
+    let achAsked = 0, achGot = 0, achLeft = 0, achRecollected = 0, achSkipped = false;
 
     try {
       // ---- ① 本机（永远做）----
@@ -1655,8 +2309,8 @@
       // 🔴 为什么这一步以前不存在、现在必须有（2026-09-24 用户实测：
       //    绑好 STEAMID + 新 Key、同步跑完，「待游玩」还是 0）：
       //    愿望单那条链（`/api/steam/wishlist` + `DS.mergeWishlist` + 卡片上的
-      //    「未入库」角标）**早就全写好了**，但唯一的调用点在 `cloud.js` 的
-      //    `syncNow` —— 那是浏览器 / 云端路径。桌面版的同步入口是这个函数，
+      //    「未入库」角标）**早就全写好了**，但那时唯一的调用点在（2026-09-28 已
+      //    下线的）云端路径里。桌面版的同步入口是这个函数，
       //    它原来只有 ①本机 ②联网 ③家庭库三步，**从来没有拉过愿望单**，
       //    于是 `status='backlog'` 的记录一条都建不出来，那个数字永远是 0，
       //    而且**没有任何报错**（静默缺失，比报错难查得多）。
@@ -1672,8 +2326,7 @@
       //    不同的原因（一个要申请、一个要更换），只有服务端分得清 —— 前端一旦
       //    自己短路，那段「为什么不行 + 怎么修」的文案就永远到不了用户眼前。
       //    所以只要有账号就**一律发出去**，由服务端归因。
-      let wishOk = false, wishReason = '', wishBad = '', wishCount = 0, wishAdded = 0;
-      let wishIds = [];
+      //    （`wish*` 那几个变量的声明在函数顶部 —— 理由见那里的注释。）
       if (p.sid) {
         setSyncStatus('正在读 Steam 愿望单…', '');
         let w = null;
@@ -1696,6 +2349,71 @@
             note('读不到你的 Steam 愿望单。' + (w.message || '') + '\n' +
                  w.howToFix.map((s, i) => (i + 1) + '. ' + s).join('\n'),
                  wishReason === 'steam_key_rejected' ? 'err' : 'warn');
+          }
+        }
+      }
+
+      // ---- ②.75 Steam 成就进度（「全成就 -> 已通关」）----
+      //
+      // 🔴 为什么这一步以前不存在、现在必须有（2026-09-29 排查发现）：
+      //    `/api/steam/achievements` 在服务端**一直是活的**（并发分波 + 9 类失败
+      //    判据 + `no_stats` 确定性答案），但唯一的调用点是随线上版一起删掉的云端
+      //    路径。桌面版的同步入口是这个函数，它原来只有 ①本机 ②联网 ②.5愿望单
+      //    ③家庭库 —— **从来没有核过成就**。于是 `game.achievements` 恒为 null：
+      //    顶栏「全成就」恒 0、卡片永不挂勋章、`suggestStatus()` 的
+      //    「全成就 -> 已通关」永不命中、排序「成就进度」全垫底，
+      //    而**四个后果全是静默的**（没有报错，只能靠出图或逐项对数据看出来）。
+      //    与 ②.5 愿望单那次是同一类缺陷（能力写好了、桌面版没接），差一天漏掉。
+      //
+      // 顺序：紧跟 ②.5、排在 ③ 之前。它和 ①②.5 一样是"我的库"这一组
+      // （都要账号 + 出网），而 ③ 读的是**别人**的库，永远压轴。
+      //
+      // ⚠️ 同一条纪律：**不自己判「有没有 Key」** —— 缺 Key / Key 被拒 / 链路不通
+      //    是三种不同的原因，只有服务端分得清。有账号就一律发出去，由它归因。
+      //
+      // ⚠️ 每轮只核一批（`ACH_BATCH` 款），从没核过的优先 —— 全库几百款分几次核完。
+      //    所以这里必须把「还剩多少款没核」说到用户看得见的地方（明细 + 状态行），
+      //    否则他会以为"点了同步什么都没发生"。
+      //    （`ach*` 那几个变量的声明在函数顶部 —— 理由见那里的注释。）
+      if (p.sid) {
+        setSyncStatus('正在核对成就进度…', '');
+        let a = null;
+        try { a = await window.GVLocal.syncAchievements(p.sid); } catch (e) { a = null; }
+        if (a && a.ok) {
+          achOk = true;
+          achAsked = a.asked || 0;
+          achGot = a.got || 0;
+          achLeft = a.left || 0;
+          achRecollected = a.recollected || 0;
+          if (a.nothingToDo) {
+            achSkipped = true;
+            rows.push(['成就进度', '已是最新（候选池里没有没核过的款）']);
+          } else {
+            rows.push(['成就进度',
+              '本轮核了 ' + achGot + ' 款' +
+              // 问了的比拿到的多 = 有几款这次没问到（仍在候选池里，下次重试）。
+              // 不写这一句的话，"核了 118 款"会让人以为全部都核过了。
+              (achAsked > achGot ? '（问了 ' + achAsked + ' 款，' +
+                                   (achAsked - achGot) + ' 款这次没拿到，下次重试）' : '') +
+              (achLeft > 0 ? '，还剩 ' + achLeft + ' 款没核 —— 再点一次「同步」接着来'
+                           : '，已全部核完')]);
+            if (achRecollected) {
+              rows.push(['由「全成就」进「已通关」', achRecollected + ' 款']);
+            }
+            if (a.link && a.link !== 'ok') {
+              rows.push(['⚠️ 成就链路', a.link === 'down' ? '整条不通' : '时好时坏']);
+            }
+          }
+        } else {
+          achReason = (a && a.reason) || 'unknown';
+          achLeft = (a && a.left) || 0;
+          achBad = (a && a.message) || achFailText(achReason);
+          rows.push(['成就进度',
+            achBad + (achLeft > 0 ? '（还有 ' + achLeft + ' 款没核）' : '')]);
+          if (a && a.howToFix && a.howToFix.length) {
+            note('读不到成就进度。' + (a.message || '') + '\n' +
+                 a.howToFix.map((s, i) => (i + 1) + '. ' + s).join('\n'),
+                 achReason === 'steam_key_rejected' ? 'err' : 'warn');
           }
         }
       }
@@ -1784,7 +2502,12 @@
 
     // 任一半成功都要刷新界面 —— **只成功联网那半时同样得刷**（换台机器、
     // 本机没装 Steam 就是这种情形：全量库照样拿得到）。③ 同理。
-    if (localOk || onlineOk || familyOk) {
+    //
+    // ⚠️ ③ 与 ②.5 / ②.75 **不能只判 `onlineOk`**：愿望单、成就、全量库是**三个
+    //    各自出网的接口**，"全量库那次失败、成就那次成功"完全可能发生。
+    //    只判 `onlineOk` 会让已经写进库的成就**不刷新** —— 用户看到的是
+    //    "同步完成"，界面上的「全成就」却还是 0（另一处静默不一致）。
+    if (localOk || onlineOk || familyOk || wishOk || achOk) {
       await reload();
       if (el.setMask.hidden) render();
 
@@ -1807,6 +2530,15 @@
       } else if (wishBad) {
         msg += '。愿望单没读成：' + wishBad;
       }
+      // 成就那一步同理：核了就说清"还剩多少"（那是用户唯一会读的一行，
+      // 而「每轮只核一批」正是要他知道再点一次能继续），没核成就说原因。
+      if (achOk && !achSkipped) {
+        msg += '，成就核了 ' + achGot + ' 款' +
+               (achLeft > 0 ? '（还剩 ' + achLeft + ' 款，再点一次接着核）'
+                            : '（已全部核完）');
+      } else if (achBad) {
+        msg += '。成就没核成：' + achBad;
+      }
       if (familyOk) {
         msg += '，家庭库 ' + familyTotal + ' 款（新进来 ' + familyAdded + ' 款）';
         // 有家人没读到就必须在**状态行**上也点到 —— 状态行才是用户真正会读的那一行，
@@ -1828,7 +2560,7 @@
       //    其余原因（没 Key / Key 被拒 / 链路不通）是**真的没读到**，算 bad。
       const wishHard = !!wishBad && wishReason !== 'unavailable' && wishReason !== 'empty';
       const bad = !!onlineBad || !localOk || !!familyBad || wishHard ||
-                  familyMissing.length > 0;
+                  !!achBad || familyMissing.length > 0;
       setSyncStatus(msg + '。', bad ? 'warn' : 'ok');
       note(msg, bad ? 'warn' : 'ok');
 
@@ -1846,6 +2578,12 @@
         note('愿望单进来了 ' + wishAdded + ' 款，都在「待游玩」区块。' +
              '名字和封面正在后台补（补之前卡面显示「App <appid>」占位，下次同步还会接着补）。',
              'ok');
+      }
+
+      // 「全成就 -> 已通关」是自动归类里**唯一一条用户看不见就会困惑**的规则：
+      // 几款游戏突然从「正在游玩」跳到「已通关」，不说一声他会以为归类坏了。
+      if (achRecollected > 0) {
+        note(achRecollected + ' 款拿了全成就，已自动归档到「已通关」。', 'ok');
       }
 
       // 联网新进来的款本机没有封面，愿望单刚进来的**连名字都没有** ——
@@ -1869,6 +2607,7 @@
         msg += '。联网：' + onlineBad;
       }
       if (familyBad) msg += '。家庭库：' + familyBad;
+      if (achBad) msg += '。成就：' + achBad;
       setSyncStatus(msg + '。', 'err');
       note(msg + '。', 'err');
     }
@@ -1959,7 +2698,7 @@
    */
   function backupPayload(all) {
     return {
-      app: '我的游戏生涯', version: 1,
+      app: 'MyGameVaultList', version: 1,
       exportedAt: new Date().toISOString(),
       prefs: DS.getPrefs(),
       games: all
@@ -1981,7 +2720,7 @@
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'gamevault-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+      a.download = 'mygamevaultlist-backup-' + new Date().toISOString().slice(0, 10) + '.json';
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -2093,13 +2832,11 @@
     //    反过来（await 完再显示）在网络慢时会表现为"点了设置没反应"。
     el.setSteamSec.hidden = !state.desktop;
     el.setAcctSec.hidden = !state.desktop;
-    // 「数据备份」：跟下面「危险操作」同一套判断 —— 云端模式的备份在右上角「⋮」
-    // 账号菜单里已经有一对（导出我的数据 / 导入），不在这儿再摆一份。
-    el.setBackupSec.hidden = !!state.cloud;
+    // 「数据备份」与下面「危险操作」两节**常显**。它们原来是按云端模式藏起来的
+    // （云端模式下备份在账号菜单里、清空也只清本机库，藏起来免得误导）。
+    // 线上版 2026-09-28 下线后没有"另一种模式"了 —— 这里的判断与 HTML 上的
+    // `hidden` 属性是**一对**，删就一起删：只删 JS 的话 `hidden` 会永远留着，两节再也出不来。
     setBackupState('', '');
-    // 「危险操作」：云端模式的记录挂在云上，这套只清本机库 —— 不给它看，
-    // 免得用户按了之后以为云上的也没了（反过来也一样）。
-    el.setDangerSec.hidden = !!state.cloud;
     // 每次重开设置都把确认窗的闸门复位：上次勾过/点开过，不该带进这一次。
     // （不然「关闭设置 → 再打开 → 点清空」会直接出现一个已经勾好的确认框）
     el.wipeMask.hidden = true;
@@ -2516,8 +3253,7 @@
    * 为什么比默认的 45 大出一截：45 是给**启动**那种"后台慢慢补、别拖慢开屏"
    * 的场景定的；而手动同步是用户**主动点、人就在屏幕前等**的场景，
    * 愿望单一次能进来几百款，45 一款一款地补意味着他接下来好几次启动都要
-   * 面对一片「App 12345」。取 240 与 `cloud.js` 的 `ACH_PER_RUN` 同量级
-   * （那条注释写的是「一次同步就能覆盖整个库」），也是同一套取舍。
+   * 面对一片「App 12345」。取 240 是照着"一次同步就该覆盖整个库"定的，同一套取舍。
    */
   const META_BULK_LIMIT = 240;
 
@@ -2563,15 +3299,25 @@
     (priorityIds || []).forEach(push);
     // ① 没名字的（愿望单导入的款就在这一档）—— 卡面退化成「App <appid>」，最该先补
     state.games.forEach(g => { if (!g.title) push(g.appid); });
-    // ② 其余（有名字缺封面 / 都已经有了的，后者会被 fillMeta 自己滤掉）
+    // ② 其余（有名字缺封面 / 都已经有了的，后者会被 fillMeta 自己滤掉 ——
+    //    **唯一的例外是手动加的条目**：它的名封是我们自己拼的，所以"两样都有"这句
+    //    对它成立，可类型/开发商/发售年还空着，守卫专门给它开了口子，
+    //    理由见 local-src.js 里 `manualGap` 那段）
     state.games.forEach(g => push(g.appid));
     if (!ids.length) return;
 
     window.GVLocal.fillMeta(ids, limit).then(async (r) => {
       if (!r || !r.filled) return;
       await reload();
+      // 用户正开着某一款的详情时，那一张也要重绘 —— `render()` 只管列表，不碰抽屉。
+      // 🔴 少了这一步就是「手动添加完就没动静」：他刚点完候选、抽屉里打开那一款，
+      //    类型/年份随后补上来了，可眼前那张还是旧的（连个变化都看不到）。
+      //    `openDrawer` 是幂等的（重调=重绘并重新绑定），直接重调就行。
+      if (state.drawerId) openDrawer(state.drawerId);
       if (el.setMask.hidden) render();      // 面板开着就别动它（见上面的说明）
-      note('已补全 ' + r.filled + ' 款的名字/封面' +
+      // ⚠️ 文案别退回「名字/封面」—— 手动条目这一路补的是类型/开发商/发售年，
+      //    那款的名字和封面本来就有，照旧文案会说出一句用户看得见的假话。
+      note('已补全 ' + r.filled + ' 款的资料' +
            (r.left ? '，还有 ' + r.left + ' 款下次启动继续' : '，已全部补齐'), 'ok');
     }).catch(e => console.warn('后台补全商店信息失败（不影响使用）', e));
   }
@@ -2772,8 +3518,14 @@
     el.modalMask.addEventListener('click', (e) => {
       if (e.target === el.modalMask) closeAddModal();
     });
-    el.mTitle.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') saveNewGame();
+    el.mTitle.addEventListener('input', onTitleInput);
+    el.mTitle.addEventListener('keydown', onTitleKeydown);
+    if (el.mSuggest) el.mSuggest.addEventListener('click', onSuggestClick);
+    // 焦点离开「名字」这一格去填别的字段 → 收起候选。
+    // 之所以挂在**别的字段**上而不是给 mTitle 挂 blur：点候选时 blur 会先触发，
+    // 把列表关掉就点不中了（这也是列表项用 div 而不是 button 的同一个理由）。
+    [el.mAppid, el.mNote, el.mStatus].forEach(node => {
+      if (node) node.addEventListener('focus', closeSuggest);
     });
 
     // 抽屉
@@ -2789,7 +3541,15 @@
     });
 
     // 同步
-    el.btnSync.addEventListener('click', openSyncModal);
+    // 「同步」按当前平台分派。**默认平台那条路一字不改** —— 还是原来那个面板
+    //（它里面装着账号 / API Key / 家庭库 / 愿望单那一整套，只对默认平台成立）。
+    // 别的平台走它注册表里挂的数据源；没有数据源 = 还没接入，按钮本来就置灰了。
+    el.btnSync.addEventListener('click', () => {
+      if (state.platform === PF.DEFAULT_ID) { openSyncModal(); return; }
+      const src = PF.sourceOf(state.platform);
+      if (src) { runPlatformSync(src); return; }
+      note(PF.labelOf(state.platform) + ' 还没有数据源，暂时不能同步。', 'warn');
+    });
     el.syncClose.addEventListener('click', closeSyncModal);
     el.syncCancel.addEventListener('click', closeSyncModal);
     el.syncFile.addEventListener('change', onSyncFile);
@@ -2860,11 +3620,10 @@
       }
     });
 
-    // 🔴 右上角「⋮」**不再**挂「清空数据」（2026-09-22 移除）。
-    //    它原来和「同步」「设置」并排，点一下就走 native confirm 删库 ——
-    //    位置太外露、确认太轻。现在这条路只剩「设置 → 危险操作」一个入口。
-    //    本地/桌面模式下这个按钮已无内容（由 boot 里的 state.cloud 决定是否隐藏），
-    //    云端模式下它被 js/cloud.js 接管成账号菜单 —— 两边都别在这里抢着绑事件。
+    // 🔴 「清空数据」只剩「设置 → 危险操作」一个入口。
+    //    它原来挂在右上角「⋮」上，和「同步」「设置」并排，点一下就走 native confirm
+    //    删库 —— 位置太外露、确认太轻，2026-09-22 搬进设置。那个按钮本身就是给云端
+    //    账号菜单准备的挂载点，2026-09-28 随线上版下线一并删了。
 
     // ===== 危险操作：清空本机记录（设置里的入口 + 独立的确认窗）=====
     el.setWipe.addEventListener('click', openWipeConfirm);
@@ -2902,16 +3661,14 @@
     // 加了就不会连云端，数据只存在这台设备上。
     //
     // 🔴 file:// 也一律走本地模式（2026-09-20 修）。
-    // 「零依赖本地版：双击 index.html」是本项目承诺的用法，但云 auth 只在**已注册的
-    // HTTPS 发布域**可用 —— file:// 下 getSession() 永远拿不到会话，于是每次双击都会
-    // 停在登录门上，boot() 在 `if (!ok) return;` 处直接返回，**一张卡都渲染不出来**
-    // （实测 --dump-dom：有 cvGate、class="card" 计数 0）。本地既然不可能登录成功，
-    // 就不该给登录门。
-    let forceLocal = false;
-    try {
-      forceLocal = /[?&]local=1\b/.test(location.search) ||
-                   location.protocol === 'file:';
-    } catch (e) { /* ignore */ }
+    // ⚠️ 这里原来有一段 `forceLocal`（`?local=1` 或 file:// 时跳过云端登录门）。
+    //    线上版 2026-09-28 下线，「云端模式」这个概念没有了 —— 那段连同 cloudMode /
+    //    state.cloud / `#btnMenu` 的隐藏 / `window.__gvRefresh` 一起删掉。
+    //    留下来的教训：它存在的唯一原因是**多了一种运行模式**。「零依赖本地版：双击
+    //    index.html」是本项目承诺的用法，可云 auth 只在已注册的 HTTPS 域可用 ——
+    //    file:// 下永远拿不到会话 → boot() 停在登录门、**一张卡都渲染不出来**
+    //    （实测 --dump-dom：有登录门、`class="card"` 计数 0）。别再引入第三种运行模式。
+    //    `?local=1` 参数本身保留（测试页与截图脚本靠它钉本地模式，现在只是被忽略）。
 
     // ---- 桌面版探测（问卷，别猜）----
     // 只有桌面版启动器设了 GV_DESKTOP=1，也只有那时 /api/local/status 才存在。
@@ -2926,20 +3683,6 @@
     // 探测结果本身就是一份 `/api/local/status`，直接留给设置面板用（省一次请求）
     desktopStatus = desktopMode ? desktop : null;
 
-    // 桌面版**也**不走云模式：它要的是「离线 + 本机数据」，
-    // 云登录在桌面版里既没必要（数据就在本机），也走不通（OpenID 回调要注册过的 HTTPS 域）。
-    const cloudMode = !!(window.Cloud && window.Cloud.enabled && !forceLocal && !desktopMode);
-    state.cloud = cloudMode;
-
-    // 右上角「⋮」的处理（与 js/cloud.js takeoverUI 分工，别互相抢）：
-    //   · 云端模式 -> 留给 cloud.js，它会把按钮换成账号菜单
-    //   · 其余模式 -> 这个按钮已经没有任何内容了（原来的「清空数据」搬进了设置），
-    //     直接隐藏，别留一个点了没反应的死按钮
-    // ⚠️ 必须在这里按 cloudMode 隐藏，而不是在 index.html 上写 `hidden`：
-    //    cloud.js 是 cloneNode(true) 接管按钮的，属性会被一起复制过去 ——
-    //    写在 HTML 上会把云端模式的账号菜单一起藏掉。
-    if (!cloudMode && el.btnMenu) el.btnMenu.hidden = true;
-
     // ---- 先恢复上次存下的界面选项，再让 URL 参数覆盖 ----
     // 🔴 顺序不能反：URL 参数是"这一次打开就要这样"的明确指令
     //    （也是自动化验收的唯一入口），必须优先于存档值。
@@ -2948,12 +3691,20 @@
     loadUiPrefs();
 
     // ---- URL 参数先解析进 state ----
-    // 必须放在「云端登录」之前：登录界面期间 state 已经就位，
-    // 登录完成后由 __gvRefresh 重绘时这些偏好才生效（如 ?sort=achievement）。
+    // 放在 reload() / render() 之前：首屏就该是 URL 指定的样子，不要先闪一下默认值。
     // ?view=playing|backlog|paused|completed|library —— 方便直接分享/书签某个区块
     let initialView = null;
     try {
       const sp = new URLSearchParams(location.search);
+
+      // ?plat=steam|epic —— 直接落在某个平台标签页上。
+      // 和 ?view= / ?select= 一个路子：点标签页这个动作在无头验收（--dump-dom）
+      // 里拿不到，必须给它留个入口；平时也能当书签用。
+      // ⚠️ 只认注册表里登记过的 id（见 js/platforms.js）—— 拼错的参数静默忽略，
+      //    不然会落在一个没有标签页的平台 id 上，界面看起来"什么都没有"。
+      const qp = sp.get('plat');
+      if (qp && PF.get(qp)) state.platform = qp;
+
       const q = sp.get('view');
       if (q && META[q]) initialView = q;
 
@@ -2990,20 +3741,12 @@
       const qo = sp.get('open');
       if (qo && /^\d+$/.test(qo)) state._openGame = qo;
     } catch (e) { /* ignore */ }
-    state._initialView = initialView;
 
-    // ---- 事件绑定与重绘钩子：必须早于云端登录流程 ----
-    // 未登录时 boot() 会中途 return 去等用户登录，而登录成功后并不会整页刷新
-    // （只有 Steam 绑定那一步会跳转回来）。所以这里先绑好：
-    //   · bindEvents() 让排序 / 搜索 / 抽屉 / 快捷键在登录后立即可用
-    //   · __gvRefresh 让云端层登录完成时能直接重绘，而不是停在空白页
+    // ---- 事件绑定：早于数据加载 ----
+    // 绑在 reload() 之前，用户点得快时不至于"点了没反应"。
+    // （这里原来还有个 `window.__gvRefresh` —— 云端层登录完成后重绘用的钩子，
+    //   唯一调用方是已下线的 cloud.js，2026-09-28 一并删了。）
     bindEvents();
-    window.__gvRefresh = async function () {
-      await reload();
-      // 首次登录完成后，把 URL 里指定的区块补上（登录前 reload 还没跑过）
-      if (state._initialView) { state.view = state._initialView; state._initialView = null; }
-      render();
-    };
 
     if (desktopMode) {
       // 桌面版：数据来自本机 Steam 文件（/api/local/library）。
@@ -3029,24 +3772,9 @@
                (r.added ? '（新增 ' + r.added + ' 款）' : ''), 'ok');
         }
       }
-    } else if (!cloudMode && window.__seedIfEmpty) {
+    } else if (window.__seedIfEmpty) {
       // 本地模式（直接双击 index.html）：空库时用内置数据灌一次
       try { await window.__seedIfEmpty(); } catch (e) { console.warn('seed failed', e); }
-    }
-
-    // 云端模式：先把登录 / Steam 绑定走完，数据接到云上再继续。
-    // 未登录时 ready() 返回 false —— 登录界面已经显示，
-    // 这里直接返回等用户操作，登录成功后由 __gvRefresh 接管重绘。
-    if (cloudMode) {
-      let ok = false;
-      try {
-        ok = await window.Cloud.ready();
-      } catch (e) {
-        console.error('云端初始化失败', e);
-        note('云端初始化失败：' + ((e && e.message) || e), 'err');
-        return;
-      }
-      if (!ok) return;
     }
 
     await reload();
@@ -3060,9 +3788,21 @@
       // 有数据时，默认停在有内容的区块
       if (!countOf(S.PLAYING) && countOf(S.BACKLOG)) state.view = S.BACKLOG;
     }
-    state._initialView = null;   // 已生效，避免之后每次刷新又跳回 URL 指定的区块
 
     render();
+
+    // 首屏停在某个**有数据源**的平台上时，顺手只读探一次（和点标签页那条路完全一致）。
+    //
+    // 🔴 为什么这一句必须有：`?plat=<id>` 是**直接落进**某个平台的入口（书签 / 无头验收），
+    //    它不经过"点标签页"那个 handler。少了这一句，从链接进来的人看到的是第③种空态
+    //    （"这里还空着"），而真相是第②种（"本机读不到、为什么、怎么修"）——
+    //    出图时实测就是这样（`_shot_platform_epic.png` 早先那版写着"点「同步」载入 Steam 库"）。
+    // ⚠️ 仍然只是**探测**：一个字节都不写库（见 runPlatformProbe 上面那段）。
+    //    默认平台（steam）没挂通用数据源 → 这里什么都不会发生。
+    {
+      const src = PF.sourceOf(state.platform);
+      if (src && !state.platNote[state.platform]) runPlatformProbe(src, state.platform);
+    }
 
     // 桌面版：界面已经交给用户了，名字/封面在后台分批补（不阻塞启动，见函数说明）
     if (desktopMode) fillMetaInBackground();

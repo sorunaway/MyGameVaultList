@@ -1,5 +1,5 @@
 /*
- * GameVault — Steam 游戏历程管理器
+ * MyGameVaultList — Steam 游戏历程管理器
  * 数据层：统一的 Game 模型 + IndexedDB 持久化
  * 设计原则：手动标记优先于 Steam 自动同步，绝不被覆盖
  */
@@ -317,6 +317,22 @@
       wishlisted: false,        // 此刻是否还在 Steam 愿望单里
       wishPriority: 0,          // 你在 Steam 里手动排的位次；0 = 没排过
       wishAddedTs: 0,           // 加入愿望单的时间戳（秒）
+      // ===== 平台轴（见 js/platforms.js）=====
+      // 🔴 `platform` 在这里**刻意不给默认值**，别顺手补一行 `platform: 'steam'`。
+      //    "没写 platform 就是默认平台"（见 GVPlatforms.of）正是**老数据与旧备份
+      //    一条都不用迁移**的来源；补上默认值会让这条性质看不出来，
+      //    下一个人要加平台时就会以为非写迁移脚本不可。
+      //
+      // ===== 以下字段只有非默认平台（EPIC）的记录才有意义 =====
+      // （命名规则和上面的 familyMinutes / wishPriority 一致：**按来源命名**，
+      //   不硬造成通用字段 —— 通用名字会让"谁的语义"变得要猜）
+      installed: false,       // 本机装了没有。EPIC 从安装清单读得到；Steam 侧不写它
+      installSize: 0,         // 装机体积（字节）
+      epicAppName: '',        // EPIC 的**发版代号**（`Bluebird` = Fez）——
+                              // 只作跨商店对号入座的钥匙，**绝不当标题或 id**
+      epicId: '',             // EPIC 自己的身份 `namespace:catalogItemId`，排查时对得上号
+      coverKind: '',          // 封面是横版还是竖版。服务端两平台都回报它，
+                              // 以后要按形状换画法（竖图塞横框会裁掉一大半）时靠它
       addedAt: Date.now(),
       updatedAt: Date.now()
     }, partial || {});
@@ -418,6 +434,13 @@
    *
    * 「家人拥有」单独一类（不是「已拥有」的变体）：它是**别人的**游戏，
    * 混进「已拥有」会让库容量、总时长这些数全部失真。
+   *
+   * ⚠️ **非默认平台（EPIC）刻意不挂角标**（走到最后的空返回）。理由：
+   *    那个平台的整份库**每一款都是已拥有**（拿到的是它的权益目录），
+   *    「已拥有」四个字在该标签页里等于每张卡都一样 —— 挂上去只是噪音。
+   *    真正有信息量的是"装没装"，那个走卡面上的**已安装**标记
+   *    （见 ui.js 里按 `installed` 能力决定的那一格），不是这里的角标。
+   *    ⇒ 别为了让这里"看起来完整"给它补一个分支，那会把噪音加回来。
    */
   function ownershipOf(game) {
     if (!game) return '';
@@ -665,6 +688,99 @@
     },
 
     /**
+     * 合并一捆**非默认平台**的同步结果（EPIC 走这条；以后接第三个平台也是这条）。
+     *
+     * 🔴 为什么不写进 `mergeSteam` 里加几个 if：
+     *    那条链上一多半规则是 **Steam 独有**的 —— 按收藏夹名判「已通关」、按全成就归档、
+     *    按 `lastPlayedTs` 的 90 天分流、愿望单转正、家庭款的粘性……
+     *    而这些字段别的平台**根本没有**（EPIC 连"最后游玩时间"都不存在）。
+     *    在那条链上加分支，代价不是"多打几个 if"，而是**每个 if 都要多问一次
+     *    "这对别的平台成立吗"** —— 而其中大半只在 Steam 上成立。
+     *
+     * 规则（刻意比 mergeSteam 少得多）：
+     *   · 归属看 `platform`，判据走 `GVPlatforms.of`（唯一判据，别在这儿再写一份）
+     *   · 键 = **平台 + appid**，不是裸 appid —— 两个平台的 id 空间毫无关系，
+     *     只按 appid 认会被"恰好同名"的键串起来，而且这种错**不会报错**
+     *   · 已存在 → 只更新**平台侧**字段（标题 / 封面 / 安装状态 / 开发商 / 发售日）；
+     *     用户侧字段（状态 / 感想 / 锁定 / 收藏 / 隐藏）一律不动
+     *   · 新建 → 状态交给 `suggestStatus`。对没有"最后游玩时间"的平台，它天然只
+     *     返回「我的游戏单」—— **那不是退化，那就是事实**
+     *   · 🔴 **已存在的记录不改状态**。这些平台给不出任何日期，应用对"它现在该算
+     *     哪个区块"**没有新信息**；此时重算的唯一效果是把用户自己摆好的位置推回默认。
+     *     Steam 那边敢每次重算，是因为它每次都带着新的 `lastPlayedTs` / 收藏夹。
+     */
+    async mergePlatform(incoming) {
+      const existing = await this.all();
+      const byKey = new Map();
+      existing.forEach(g => {
+        if (g.appid == null) return;
+        byKey.set(GVPlatforms.of(g) + '|' + String(g.appid), g);
+      });
+
+      const toSave = [];
+      let added = 0, updated = 0, skipped = 0;
+
+      (incoming || []).forEach(src => {
+        if (!src || src.appid == null) return;
+        const plat = GVPlatforms.of(src);
+        // 默认平台的记录有它自己那条更细的路径，这里不抢（抢了会绕过收藏夹 / 全成就归类）
+        if (plat === GVPlatforms.DEFAULT_ID) { skipped++; return; }
+        const key = plat + '|' + String(src.appid);
+        const old = byKey.get(key);
+
+        if (old) {
+          // ⚠️ 一律"**有才写**"，不是 `src.title || old.title`。后者看着等价，
+          //    实际会把"这次没拿到标题"当成"标题是空的"写进去 —— 一次性清掉一片名字。
+          if (src.title) old.title = src.title;
+          if (src.header) old.header = src.header;
+          if (src.icon) old.icon = src.icon;
+          if (src.developers && src.developers.length) old.developers = src.developers;
+          if (src.releaseDate) {
+            old.releaseDate = src.releaseDate;
+            if (!old.releaseYear) old.releaseYear = parseReleaseYear(src.releaseDate);
+          }
+          if (src.coverKind) old.coverKind = src.coverKind;
+          if (src.epicAppName) old.epicAppName = src.epicAppName;
+          if (src.epicId) old.epicId = src.epicId;
+          if (typeof src.installed === 'boolean') old.installed = src.installed;
+          if (src.installSize) old.installSize = src.installSize;
+          // 身份原样保留（平台 + 它自己那个 source），只防"被别的路径洗过"
+          old.platform = plat;
+          if (src.source) old.source = src.source;
+          old.updatedAt = Date.now();
+          toSave.push(old);
+          updated++;
+          return;
+        }
+
+        const g = makeGame({
+          appid: src.appid,
+          platform: plat,
+          source: src.source || 'manual',
+          title: src.title || '',
+          developers: Array.isArray(src.developers) ? src.developers.slice() : [],
+          releaseDate: src.releaseDate || '',
+          releaseYear: parseReleaseYear(src.releaseDate),
+          installed: !!src.installed,
+          installSize: src.installSize || 0,
+          epicAppName: src.epicAppName || '',
+          epicId: src.epicId || '',
+          coverKind: src.coverKind || ''
+        });
+        // 封面「有才写」：写成空串会把 `src.header || old.header` 那条路堵死
+        if (src.header) g.header = src.header;
+        if (src.icon) g.icon = src.icon;
+        g.status = suggestStatus(g);
+        g.autoStatus = g.status !== STATUS.LIBRARY;
+        toSave.push(g);
+        added++;
+      });
+
+      await this.saveMany(toSave);
+      return { added, updated, skipped };
+    },
+
+    /**
      * 合并一捆 Steam 同步结果。
      * 规则：
      *  - appid 已存在 -> 更新 Steam 侧字段（时长/成就/最后游玩），保留用户侧字段（状态/备注/评价）
@@ -675,19 +791,43 @@
      *  - 升级上来的老数据：见到旧版写死的分类名就沿用（见 adoptLegacyCollection）
      */
     async mergeSteam(incoming) {
+      // 🔴 先把**别的平台**的记录摘出去，交给 mergePlatform。
+      //
+      //    为什么这里非有这一步不可：**备份导入走的就是这个函数**
+      //    （`ui.js` 的 `importBackupFile`），而导出的文件里逐条带着 `platform` 字段。
+      //    不摘的话，下面那句 `old.source = 'steam'` 会把 EPIC 的记录一起改成
+      //    "已拥有"，而**再也没有任何东西能把它们改回去** —— EPIC 每次同步只认
+      //    自己那几条（`source='epic'`），被改错的它一个都不认得。
+      //    "导出再导入一次，别的平台的记录全变了样"是最难查的一类回归。
+      const all = Array.isArray(incoming) ? incoming : [];
+      const mine = [], others = [];
+      all.forEach(r => {
+        if (r && GVPlatforms.of(r) !== GVPlatforms.DEFAULT_ID) others.push(r);
+        else mine.push(r);
+      });
+      const other = others.length
+        ? await this.mergePlatform(others)
+        : { added: 0, updated: 0, skipped: 0 };
+
       const existing = await this.all();
       const byAppid = new Map();
-      existing.forEach(g => { if (g.appid != null) byAppid.set(String(g.appid), g); });
+      // ⚠️ 索引里**只放默认平台**的记录。按裸 appid 认本来就不该跨平台，
+      //    这一步把"两个平台的 id 恰好同名"这种将来可能出现的坑提前堵掉。
+      existing.forEach(g => {
+        if (g.appid == null) return;
+        if (GVPlatforms.of(g) !== GVPlatforms.DEFAULT_ID) return;
+        byAppid.set(String(g.appid), g);
+      });
 
       // 老用户升级上来的第一趟：数据里（不管是库里已有的还是这次喂进来的）
       // 带着旧版写死的分类名就一并认下来，否则「已通关」会整体回退。
       // 只认一次，且用户改过设置就不动。
-      adoptLegacyCollection(existing.concat(incoming));
+      adoptLegacyCollection(existing.concat(mine));
 
       const toSave = [];
       let added = 0, updated = 0, recollected = 0, locked = 0, abandoned = 0;
 
-      incoming.forEach(src => {
+      mine.forEach(src => {
         const key = String(src.appid);
         const old = byAppid.get(key);
         if (old) {
@@ -835,7 +975,13 @@
       });
 
       await this.saveMany(toSave);
-      return { added, updated, recollected, locked, abandoned };
+      // 别的平台那半的计数**并入同一个返回**：导入是一条动作、一份回执，
+      // 分开报的话用户看到的是"新增 120 款"，而他一共导进来 180 款。
+      return {
+        added: added + other.added,
+        updated: updated + other.updated,
+        recollected, locked, abandoned
+      };
     },
 
     /**
@@ -933,7 +1079,7 @@
      *
      * status = backlog（→ 出现在「待游玩」），source = 'wishlist'
      * （→ 「我的游戏单」里挂「未入库」角标）。appid 已经有，但 title/封面是空的
-     * —— 愿望单接口不给名字，得靠 store 补全那条路填（见 cloud.js syncWishlist）。
+     * —— 愿望单接口不给名字，得靠 store 补全那条路填（见 local-src.js syncWishlist）。
      *
      * ## 已经在库里 / 已手动添加过的怎么办
      *
@@ -948,7 +1094,7 @@
      *   · 接口失败（None）      → 前端根本不该走到这里
      *   · 空列表（未公开/为空）  → 前端也不该走到这里
      * 否则一次链路抖动、或者用户把愿望单隐私改成「仅好友」，
-     * 就会把几百款记录一次清空。守卫写在 cloud.js syncWishlist 里。
+     * 就会把几百款记录一次清空。守卫写在 local-src.js syncWishlist 里。
      *
      * ## 删除的条件（很严格，故意的）
      *

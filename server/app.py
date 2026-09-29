@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-我的游戏生涯 — 服务端
+MyGameVaultList — 服务端
 
 一个单端口 HTTP 服务，同时承担两件事：
   1) 托管前端静态文件（手机浏览器直接访问）
@@ -32,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config                      # noqa: E402
+import epic_local                  # noqa: E402
 import steam_client                # noqa: E402
 import steam_local                 # noqa: E402
 import steam_openid                # noqa: E402
@@ -86,7 +87,7 @@ def api_key():
     生效的 Steam Web API Key。优先级：**用户自己填的 > .env**。
 
     为什么是这个顺序（2026-09-22 加）：
-      · `.env` 那份是**开发机 / 自用**留下的（开发机那把 key，随 `pack_deploy.py` 一起走线上）。
+      · `.env` 那份是**开发机 / 自用**留下的（开发机那把 key，只存在本机、不进任何出包）。
         对外发的桌面版**故意不带 `.env`** —— 所以别人的机器上只有"用户自己填的"这一份，
         这里是空的，联网同步会给出「还没填 Key」+ 申请指引，而不是一个 500。
       · 反过来，用户在自己机器上填了 key 却还在用 `.env` 那份，就会莫名其妙地
@@ -133,6 +134,18 @@ MIME_FIX = {
 # 云数据库里还有一份持久化的全站共享缓存，这里只是第一层挡板。
 _store_cache = {}
 _store_lock = threading.Lock()
+
+# 商店**搜索**结果的内存缓存：关键词 -> (写入时间, items)。
+#
+# ⚠️ 这个必须有 TTL，不能学 _store_cache 永久缓存 —— 两者的失效方式不同：
+#    「某款游戏的详情」不会变（所以永久缓存安全）；
+#    「某关键词能搜到什么」会变（新游戏上架、Steam 那边相关度排序也会调整）。
+#    10 分钟是折中：足够挡住用户打字时来回删改造成的重复请求，
+#    又不会让「刚上架的游戏搜不到」这个状态被钉太久。
+SEARCH_CACHE_TTL = 600
+SEARCH_CACHE_MAX = 400        # 条目上限（兜底用，正常使用到不了）
+_search_cache = {}
+_search_lock = threading.Lock()
 
 # 游戏库的内存缓存：steamid -> (写入时间, 响应 payload)。
 #
@@ -219,6 +232,11 @@ MIN_ITEM_SLACK = 5
 ACH_ITEM_BUDGET = 10     # 成就健康时云端约 1.9 秒/款（并发后单款仍是这个量级）
 STORE_ITEM_BUDGET = 8    # 商店健康时约 0.6 秒/款
 
+# 商店搜索的关键词长度上限（字符数）。
+# 正常游戏名不会超过这个数；设它是为了别让一个超长 term 被原样拼进 URL
+# 打到 Steam 上去（那属于拿用户的输入去替我们试探对方接口）。
+SEARCH_MAX_LEN = 60
+
 # 成就接口对外一次最多受理多少个 appid。
 # ⚠️ 这**不是**向 Steam 限流 —— Steam 那边不限制款数（一款一次而已）。
 # 它只是「一次 HTTP 往返愿意背多少活」：60 款并发 12 健康时约 10 秒，
@@ -268,7 +286,7 @@ def _safe_join(root, rel_path):
 # 请求处理
 # ============================================================
 class Handler(BaseHTTPRequestHandler):
-    server_version = "GameVault/" + VERSION
+    server_version = "MyGameVaultList/" + VERSION
     protocol_version = "HTTP/1.1"
 
     # ---------- 基础工具 ----------
@@ -499,6 +517,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/steam/store":
             return self._api_store()
 
+        if path == "/api/steam/search":
+            return self._api_steam_search()
+
         if config.DESKTOP_MODE:
             # 本机模式（Windows 桌面版）。线上 GV_DESKTOP 未设 → 这里永不进入，
             # 下面这些路径落到 _static 得到 404。
@@ -519,6 +540,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._api_local_probe()
             if path == "/api/local/scan":
                 return self._api_local_scan()
+            # EPIC 本机库（**纯读盘，零联网、零登录**）。与 Steam 那组完全独立：
+            # EPIC 没有账号 / 没有 API Key / 没有"目录设置"这一节。
+            if path == "/api/local/epic":
+                return self._api_local_epic()
 
         return self._static(path)
 
@@ -591,6 +616,25 @@ class Handler(BaseHTTPRequestHandler):
             "group": {"groupid": g["groupid"], "name": g["name"], "role": g["role"]},
             "members": g["members"],
         })
+
+    def _api_local_epic(self):
+        """
+        EPIC 本机库：**已拥有全库（含没装的）∪ 已安装清单**。
+
+        返回 `{ok, manifestsDir, catalogPath, catalogOk, games:[…], stats:{…}}`；
+        这台机器上没有 EPIC 的任何痕迹时 `{ok:false, reason:"epic_not_found"}`
+        （**200**，不是错误 —— 没装 EPIC 是完全正常的状态，和"没家庭组"同一口径）。
+
+        🔴 与 Steam 那组的三点不同，都能在返回里看出来：
+           · **没有账号、没有 Key、没有目录设置** —— 数据全在本机文件里，
+             `%PROGRAMDATA%` 下是机器级共享的一份；
+           · **不需要联网** —— 不像 `/api/steam/library` 那样会出网，
+             所以它不会出现 `steam_unreachable` 那类失败；
+           · **没有"最后游玩时间"** —— EPIC 的数据模型里就没有这个字段
+             （不是本机没有），所以前端拿到的记录 `lastPlayedTs` 恒为 0。
+             详见 `server/epic_local.py` 的文件头。
+        """
+        return self._json(epic_local.read_library())
 
     def _api_local_cover(self):
         appid = self._q1("appid")
@@ -773,7 +817,7 @@ class Handler(BaseHTTPRequestHandler):
         if not store_ok and "store" not in bad:
             bad.append("store")
         return self._json({
-            "service": "gamevault",
+            "service": "mygamevaultlist",
             "version": VERSION,
             "allReachable": not bad,
             "unreachable": bad,
@@ -1280,6 +1324,79 @@ class Handler(BaseHTTPRequestHandler):
                 unknown.append(appid)
         return self._json({"items": out, "unknown": unknown})
 
+    def _api_steam_search(self):
+        """按名字搜 Steam 商店 —— 给「手动添加游戏」当联想用。
+
+        和上面 `_api_store` 是**方向相反**的两件事，别混：
+          · /api/steam/store   「我知道 appid」→ 问详情（抓封面 / 发售年 / 类型）
+          · /api/steam/search  「我只有名字」  → 找 appid（**最多 10 条**，上限在 Steam 那边）
+
+        🔴 **它只读公共数据，绝不碰「拥有」语义。**
+           搜到不等于你有这款。这个方法不写任何存储、不改任何游戏记录 ——
+           返回的 appid 只是给前端填进表单，好让后面「添加」能顺手抓到封面。
+           用户点了添加之后，那款仍然是 `source='manual'`（`store.js` 里
+           明确写着 manual 款不挂任何拥有角标）。
+
+        🔴 **不做「必须有 Key」的检查。** 商店搜索是免 Key 的公开接口，
+           而「我还没填 Key，先手动记几款想玩的」正是这个功能的典型场景 ——
+           在这里设 Key 门槛会把最需要它的人挡在外面。
+
+        两种结果，前端必须分开处理：
+
+          {"items":[…]}
+              搜完了。**items 为空是合法结果**（确实没这款），显示「没找到」。
+          502 {"error":"steam_unreachable", …}
+              这次没搜成（链路波动）。**前端不能说成「没找到那款游戏」** ——
+              用户会以为自己名字打错了，然后一直改字
+              （和愿望单那边是同一类错误，见 `_api_wishlist` 的说明）。
+
+        ⚠️ 缓存按关键词（TTL，见 SEARCH_CACHE_TTL）。**失败不写缓存** ——
+           否则一次链路抖动会把「搜不到」钉住 10 分钟。
+        """
+        term = (self._q1("term") or "").strip()
+        if not term:
+            return self._json({"error": "term_empty", "items": [],
+                               "message": "搜索关键词是空的。"}, 400)
+        if len(term) > SEARCH_MAX_LEN:
+            return self._json({
+                "error": "term_too_long", "items": [],
+                "message": "关键词太长了（最多 %d 个字）。" % SEARCH_MAX_LEN}, 400)
+
+        key = term.lower()
+        with _search_lock:
+            hit = _search_cache.get(key)
+            if hit and (time.time() - hit[0]) < SEARCH_CACHE_TTL:
+                return self._json({"items": hit[1], "total": len(hit[1]),
+                                   "cached": True})
+
+        items, err = steam_client.search_apps(term)
+        if items is None:
+            # 🔴 绝不能在这里回一个空列表 —— 那等于对用户说「没这款游戏」。
+            log("商店搜索失败 %r：%s" % (term, err))
+            return self._json({
+                "error": "steam_unreachable",
+                "message": "没连上 Steam 商店（跨境链路波动），稍等几秒再输一次就行。",
+                "detail": err,
+                "items": [],
+            }, 502)
+
+        with _search_lock:
+            now = time.time()
+            # 顺手清掉过期的：比单独设一个容量上限更贴合 TTL 缓存的语义，
+            # 正常使用下缓存大小自然就收敛了。
+            for k in [k for k, v in _search_cache.items()
+                      if now - v[0] >= SEARCH_CACHE_TTL]:
+                _search_cache.pop(k, None)
+            # 兜底：万一短时间内被塞进大量不同关键词（被脚本刷），砍掉一半最旧的。
+            if len(_search_cache) >= SEARCH_CACHE_MAX:
+                for k, _v in sorted(_search_cache.items(),
+                                    key=lambda kv: kv[1][0])[:SEARCH_CACHE_MAX // 2]:
+                    _search_cache.pop(k, None)
+            _search_cache[key] = (now, items)
+
+        log("商店搜索 %r -> %d 条" % (term, len(items)))
+        return self._json({"items": items, "total": len(items)})
+
     # ---------- 静态 ----------
     def _static(self, path):
         if path == "/":
@@ -1318,7 +1435,7 @@ def build_server(host="0.0.0.0", port=None):
 def main():
     server = build_server("0.0.0.0")
     log("=" * 52)
-    log("我的游戏生涯 服务端 v%s" % VERSION)
+    log("MyGameVaultList 服务端 v%s" % VERSION)
     log("监听 %s:%d" % server.server_address[:2])
     log("Steam API Key：%s" % ({"user": "用户自己填的", "env": ".env 里的", "none": "【缺失】"}
                                [api_key_source()]))

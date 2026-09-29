@@ -1,5 +1,5 @@
 /* ==========================================================================
-   GameVault — 样式表（深色主题，卡片式布局）
+   MyGameVaultList — 样式表（深色主题，卡片式布局）
    ========================================================================== */
 
 :root {
@@ -129,6 +129,12 @@ input, textarea, select { font-family: inherit; }
 .btn-ghost { background: var(--bg); border-color: var(--border); color: var(--text-dim); }
 .btn-ghost:hover { background: var(--bg-hover); color: var(--text); }
 
+/* 置灰态（当前平台还没接数据源时的「添加」「同步」，见 ui.js:render）。
+   ⚠️ 必须把 :hover 也按住 —— 只写 `:disabled{opacity}` 的话鼠标移上去照样变亮，
+      看着像能点（比不置灰更让人困惑）。 */
+.btn-ghost:disabled { opacity: .45; cursor: not-allowed; }
+.btn-ghost:disabled:hover { background: var(--bg); color: var(--text-dim); }
+
 .btn-primary { background: var(--accent); color: #1a1206; font-weight: 600; }
 .btn-primary:hover { background: #ffb52e; }
 .btn-primary:disabled { opacity: .4; cursor: not-allowed; }
@@ -141,6 +147,72 @@ input, textarea, select { font-family: inherit; }
   color: var(--text-dim);
 }
 .iconbtn:hover { background: var(--bg-hover); color: var(--text); }
+
+/* ===================== 平台切换（一级导航） =====================
+   顶栏下面单独一条：先选平台，再在侧栏选区块。
+   ⚠️ 用 `flex: none` 钉住高度：它和 .topbar / .statsbar 一样是**固定高度的一层**，
+      写成可伸缩会把 body 那条 flex 列的高度分走，内容区自己就滚不动了。
+   ⚠️ 选中态用 `border-bottom` 而不是加粗字重：字重变化会让文字宽度跳，
+      整条标签页在点击时会左右抖（和 .navitem 那条"别用 hover 改字号"同理）。 */
+
+.platformtabs {
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 0 20px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;              /* 平台多了要能横滑，不许换行把布局顶变形 */
+  scrollbar-width: none;
+}
+.platformtabs::-webkit-scrollbar { display: none; }
+
+.ptab {
+  position: relative;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 13px 7px;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  /* 选中那条线：**未选中也占位**（透明），否则选中/取消时整条会跳 2px。
+     颜色走 --ptab-c（由 ui.js 从平台声明里塞进来），兜底才是主题强调色 ——
+     这样"每个平台一个品牌色"只改注册表，不用回这里加规则。 */
+  border-bottom: 2px solid transparent;
+  transition: color .13s, border-color .13s;
+}
+.ptab:hover { color: var(--text-dim); }
+.ptab.on {
+  color: var(--text);
+  font-weight: 600;
+  border-bottom-color: var(--ptab-c, var(--accent));
+}
+
+.ptab .ptab-mark { font-size: 13px; line-height: 1; color: var(--ptab-c, var(--text-faint)); }
+.ptab.on .ptab-mark { color: var(--ptab-c, var(--accent)); }
+
+/* 还没接数据源的平台（注册表里 available:false）：
+   标签照样点得开（点开能看到"缺什么"），但要一眼看出它现在没内容 ——
+   不这样，用户切过去看到空列表会以为自己的库丢了。 */
+.ptab.off { opacity: .6; }
+.ptab.off:hover { opacity: .85; }
+.ptab.off.on { opacity: 1; }
+
+.ptab .ptab-soon {
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 0 5px;
+  border-radius: 20px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text-faint);
+}
 
 /* ===================== 统计条 ===================== */
 
@@ -693,6 +765,25 @@ input, textarea, select { font-family: inherit; }
 .card-hours { font-variant-numeric: tabular-nums; color: var(--text-dim); }
 .card-hours b { color: var(--text); font-weight: 650; }
 
+/* 没有「时长」这个能力的平台（EPIC）改显示装没装 —— 换指标的逻辑在 js/ui.js 的 hoursCell。
+   与 .card-year 同口径（小胶囊）；.on 借用完成态的绿。
+   🔴 这里刻意不用 `--st-*` 之外的新变量：.card-inst 只表示"装没装"，
+      与状态胶囊（.card-status-pill）不是一回事，别让它看起来像状态。 */
+.card-inst {
+  font-size: 11px;
+  color: var(--text-faint);
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 20px;
+  padding: 1px 7px;
+  white-space: nowrap;
+}
+.card-inst.on {
+  color: var(--st-completed);
+  border-color: color-mix(in srgb, var(--st-completed) 38%, transparent);
+  background: color-mix(in srgb, var(--st-completed) 12%, transparent);
+}
+
 .card-year {
   font-size: 11px;
   color: var(--text-faint);
@@ -719,7 +810,10 @@ input, textarea, select { font-family: inherit; }
 .empty { text-align: center; padding: 60px 20px; color: var(--text-faint); }
 .empty-mark { font-size: 42px; color: var(--border); margin-bottom: 12px; }
 .empty h3 { font-size: 15px; color: var(--text-dim); font-weight: 600; margin-bottom: 6px; }
-.empty p { font-size: 13px; }
+/* 行宽上限：占位区里那句「这个平台还没接入 / 缺什么」有 100+ 字，
+   不限宽时在 1400px 视口下会铺成**一整行**，眼睛得横着扫过去（出图时实测很难读）。
+   居中是因为 .empty 本来就是 text-align:center —— 限宽后不从中间算会看着歪。 */
+.empty p { font-size: 13px; max-width: 620px; margin: 0 auto; }
 
 /* ===================== 详情抽屉 ===================== */
 
@@ -1134,6 +1228,57 @@ svg.ico.wipe-ico, .wipe-title .ico { width: 16px; height: 16px; }
 .field input::placeholder, .field textarea::placeholder { color: var(--text-faint); }
 .field select option { background: var(--bg-elev); }
 
+/* ======================================================================
+   手动添加 · 商店搜索候选（#mSuggest）
+   ----------------------------------------------------------------------
+   贴在「游戏名称」输入框下面，看起来像一个下拉。
+   它**在 <label> 内部**（所以 .field 的 gap 6px 正好当间距），
+   列表项因此用 <div> 而不是 <button> —— button 会打断 label → input 的
+   聚焦转发，点一下候选反而丢掉焦点。
+   小图是接口直接给的 231×87 缩略图，按 46×22 显示（大约 1/5 缩放），
+   只为「一眼认出来是哪个」服务，所以不做高清替换 —— 那要多问一次
+   appdetails，为一个联想列表付这个代价不值。
+   ====================================================================== */
+.sg-list {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev-2);
+  max-height: 252px;
+  overflow-y: auto;
+  padding: 4px;
+}
+.sg-item {
+  display: flex; align-items: center; gap: 9px;
+  padding: 6px 7px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.sg-item:hover { background: var(--bg-hover); }
+/* 键盘上下键的高亮项 —— 和 hover 同一档视觉，但用主色描出来，
+   因为此时鼠标可能不在列表上，光靠底色用户不知道该按回车选哪个 */
+.sg-item.on { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+/* 比例 2.667 是接口给的缩略图本身的比例（capsule_sm_120 ≈ 120×45）。
+   ⚠️ 别改成 46×22 那种"看起来差不多"的数 —— 比例不对就会拉变形，
+   配套 object-fit: cover 也只是把变形换成裁切。 */
+.sg-thumb {
+  width: 64px; height: 24px; flex: none;
+  border-radius: 3px; background: var(--bg);
+  object-fit: cover;
+}
+.sg-name {
+  flex: 1; min-width: 0;
+  font-size: 13px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 「已在你的游戏单」小标 —— 低调的灰边，不抢候选名字的注意力 */
+.sg-own {
+  flex: none; font-size: 11px; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px;
+}
+.sg-hint { padding: 7px 8px; font-size: 12px; color: var(--text-faint); }
+/* 搜失败（链路问题）和「确实没这款」是两件事，颜色上要分得开 */
+.sg-hint.err { color: var(--st-playing); }
+
 /* ===== 设置弹窗：收藏夹 -> 状态 ===== */
 .set-hint {
   font-size: 12.5px;
@@ -1365,6 +1510,11 @@ svg.ico.wipe-ico, .wipe-title .ico { width: 16px; height: 16px; }
 
 @media (max-width: 900px) {
   .layout { flex-direction: column; }
+
+  /* 平台条在手机上要压薄：上面已经有顶栏、下面紧跟着侧栏横滑条，
+     三层堆在 375px 宽的第一个屏幕里，这条每省 6px 都看得见。 */
+  .platformtabs { padding: 0 10px; }
+  .ptab { padding: 7px 10px 5px; font-size: 12.5px; }
 
   .sidebar {
     display: flex;

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GameVault — 把出好的桌面版 exe 打成**可以直接发人**的 zip。
+MyGameVaultList — 把出好的桌面版 exe 打成**可以直接发人**的 zip。
 
-为什么不能直接发 `dist/gamevault-desktop/` 目录
+为什么不能直接发 `dist/mygamevaultlist-desktop/` 目录
 ------------------------------------------------
 1. 三百来个文件，微信/QQ 传不了目录，**必须先压成一个文件**；
 2. onedir 形态下 `exe` 与 `_internal/` 是一套，**单独把 exe 拖出来就跑不起来** ——
@@ -26,10 +26,10 @@ GameVault — 把出好的桌面版 exe 打成**可以直接发人**的 zip。
 
 产物
 ----
-    ../_build_desktop/share/GameVault-试用版-YYYYMMDD.zip
+    ../_build_desktop/share/MyGameVaultList-试用版-YYYYMMDD-HHMM.zip
         ├── 使用说明.txt                 ← 放**根**上，解压第一眼就看见
-        └── gamevault-desktop/           ← 整个目录，缺一不可
-            ├── gamevault-desktop.exe
+        └── mygamevaultlist-desktop/     ← 整个目录，缺一不可
+            ├── mygamevaultlist-desktop.exe
             └── _internal/
 
 ⚠️ 产物一律在**项目外**（与 pack_win.py 同理）—— 免得被 git / 发布工具顺手上传。
@@ -48,17 +48,24 @@ sys.path.insert(0, HERE)
 
 import pack_win  # noqa: E402  复用它的体检规则与产物路径
 
-APP_DIRNAME = "gamevault-desktop"
+# 🔴 **不许**在这里再抄一遍目录名 —— 直接从 pack_win 取。
+#    `APP_DIRNAME` 与 `pack_win.APP_NAME` 必须永远相同（zip 里的 exe 路径就是
+#    `APP_DIRNAME/APP_DIRNAME.exe`，对不上会在 audit_zip 里报"zip 里没有主 exe"，
+#    而那看起来像"打包坏了"，其实是两个文件各写了一份字面量、改了一个没改另一个）。
+APP_DIRNAME = pack_win.APP_NAME
 README_NAME = "使用说明.txt"
 
 # 说明书里要写的本机路径（与 desktop/main.py 的 webview_data_dir() 同根）
+# 🔴 **改名时不要碰这一行**：它是**数据目录**，用户的桌面版库
+#    （IndexedDB，落在 `…\MyGameVault\webview`）与 `desktop.json`（Steam 目录 + Key）
+#    都在里面。跟着应用名一起改 = 用户手上的库和凭证当场"消失"。
 DATA_HINT = r"%LOCALAPPDATA%\MyGameVault"
 
 
 def readme_text(built_on):
     """试用说明。收包的人**只有这一份**上下文，所以按"他会在哪一步卡住"来写。"""
     return u"""\
-GameVault 桌面版 · 试用说明
+MyGameVaultList 桌面版 · 试用说明
 ============================================================
 打包日期：{built_on}
 
@@ -71,7 +78,7 @@ GameVault 桌面版 · 试用说明
 1. 先把压缩包**整个解压出来**（右键 → 全部解压缩）。
    不要在压缩包里直接双击 —— 那样打不开。
 
-2. 进 gamevault-desktop 文件夹，双击 gamevault-desktop.exe
+2. 进 {app_dir} 文件夹，双击 {app_dir}.exe
 
 3. Windows 可能弹出蓝色的「Windows 已保护你的电脑」：
    点「更多信息」→「仍要运行」。
@@ -84,7 +91,7 @@ GameVault 桌面版 · 试用说明
 
 二、⚠️ exe 不能单独拖出来
 ------------------------------------------------------------
-gamevault-desktop 文件夹里的 exe 和 _internal 文件夹是**一套**，
+{app_dir} 文件夹里的 exe 和 _internal 文件夹是**一套**，
 少一个都启动不了。要挪地方就整个文件夹一起挪。
 
    症状对照：只拿了 exe 的话，双击后会一闪而过，
@@ -106,6 +113,19 @@ gamevault-desktop 文件夹里的 exe 和 _internal 文件夹是**一套**，
      刚导进来时卡面先显示「App 数字」占位，别以为是坏数据。
    ⚠️ 愿望单要能被读到，得在 Steam 网页版把「愿望单」的隐私设成**公开**。
 4. 没装 Steam 也能用 —— 点「添加」手动录入想记的游戏。
+   输游戏名的时候它会**自动去 Steam 商店查同名游戏**，在输入框下面列出候选
+   （带小封面），点一下就把**官方名称和 AppID** 填好，省得你手抄一串数字。
+   下面会标「已在游戏单」的，是你已经记过的，别重复添加。
+
+   · 加完之后**类型、开发商、发售年份**也会自动补上（点开这款的详情就能看到），
+     不用你填、也不用手动去点同步 —— 存完过一下就会自己出现
+     （这一步要联网，网慢时多等几秒；没网就补不上，其余一切照旧）。
+   · 这一步**只查你打进去的那个名字**（一次最多列 10 条 —— 是 Steam 那边的上限），
+     不会动你已有的游戏单。
+   · 搜不到、不想用、或者机器没联网 —— 都可以不管它，直接手填名字保存，
+     和以前一样能用，不要因为这个功能卡住。
+   · 没装 Steam 客户端也能搜（它问的是 Steam 的商店网页，不是本机 Steam）。
+
 5. 加入过 Steam 家庭组的话，「同步」还会顺带读家人**公开的** Steam 库，
    这些游戏单独标成「家人拥有」，默认**不显示**
    （在「我的游戏单 → 筛选」里打开「家人拥有」才看得到）。
@@ -134,7 +154,7 @@ gamevault-desktop 文件夹里的 exe 和 _internal 文件夹是**一套**，
 · 没有首次启动向导：没装 Steam 时界面是空的，只有控制台里一行提示。
 · 控制台黑窗口暂时去不掉：那些提示都走它，去掉就什么都看不见了。
 · 界面配色 / 交互还在改，随便提意见。
-""".format(built_on=built_on, data_hint=DATA_HINT)
+""".format(built_on=built_on, data_hint=DATA_HINT, app_dir=APP_DIRNAME)
 
 
 # ---------------------------------------------------------------- 打包
@@ -242,7 +262,7 @@ def verify_extract(zip_path, dest):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dist", default=os.path.join(pack_win.DIST_DIR, APP_DIRNAME),
-                    help="产物目录（默认 dist/gamevault-desktop）")
+                    help="产物目录（默认 dist/%s）" % APP_DIRNAME)
     ap.add_argument("--out", default=os.path.join(pack_win.OUT_ROOT, "share"),
                     help="zip 落点目录")
     ap.add_argument("--verify", action="store_true",
@@ -281,7 +301,7 @@ def main():
     #    反馈就变成"我测的还是有问题"——查不下去。说明书里也同步带上时间。
     stamp = time.strftime("%Y%m%d-%H%M")
     built_on = time.strftime("%Y-%m-%d %H:%M")
-    name = "GameVault-试用版-%s.zip" % stamp
+    name = "MyGameVaultList-试用版-%s.zip" % stamp
     out_path = os.path.join(args.out, name)
 
     # ⚠️ 先写临时名再 os.replace —— 覆盖同期旧包时，OS 上只需一次单文件替换，
@@ -327,7 +347,7 @@ def main():
     print("大小  ：%.1f MB" % (zsize / 1048576.0))
     print("校验码：SHA-256 %s" % sha256_of(out_path))
     print("       （对方说打不开时，先让他核这个值 —— 对不上就是传输掉了包）")
-    print("收包的人只要做两件事：解压 → 双击 gamevault-desktop.exe")
+    print("收包的人只要做两件事：解压 → 双击 %s.exe" % APP_DIRNAME)
     print("=" * 60)
     return 0
 

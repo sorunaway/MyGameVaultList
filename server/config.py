@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-我的游戏生涯 — 服务端配置
+MyGameVaultList — 服务端配置
 
 优先级：环境变量 > 项目根 .env 文件 > 内置默认值。
 
@@ -94,10 +94,10 @@ WEB_DIR = BASE_DIR
 #    应用本体有登录门，但静态文件不走登录，放进来等于开了个绕过登录的
 #    后门（任何知道 URL 的人都能下）。要公开某张图就单独往 assets/ 放。
 #
-# ⚠️ 这是**名单制**：新增一个静态目录（比如 vendor/）必须在这里登记，
-#    否则线上 404。而本地双击 index.html 时不经过这个服务端，
-#    所以本地测一切正常、只有线上挂 —— 改完务必用线上 curl 验一次。
-STATIC_DIRS = ("css", "js", "assets", "vendor")
+# ⚠️ 这是**名单制**：新增一个静态目录必须在这里登记，否则一律 404。
+#    2026-09-28 线上版下线后，这个服务端只剩**桌面版**在用（本机 127.0.0.1），
+#    白名单机制没变 —— 漏登记的目录在桌面版里同样取不到。
+STATIC_DIRS = ("css", "js", "assets")
 STATIC_FILES = ("index.html", "favicon.ico", "manifest.webmanifest",
                 "sw.js", "robots.txt")
 
@@ -106,17 +106,31 @@ STATIC_FILES = ("index.html", "favicon.ico", "manifest.webmanifest",
 # js/seed-data.js 是本地双击版用来灌初始数据的，内容就是**完整的个人游戏库**
 # （含手写笔记）。它躺在白名单目录 js/ 里，不单独拦掉的话，
 # 任何人都能 GET /js/seed-data.js 把你的库整个下走。
-# 云端版根本用不到它，本地版走 file:// 也不经过这个服务端，所以直接禁掉最省事。
+# 本地版走 file:// 不经过这个服务端，所以直接禁掉最省事。
 #
-# vendor/README.md 是给维护者看的升级说明（包名、版本、哈希、步骤）。
-# 它无害但对外毫无价值，反而白送一份技术栈清单 ——
-# 目录一旦进白名单就是**整个目录**开放，所以这类文档要单独拦。
-STATIC_DENY = ("js/seed-data.js", "vendor/README.md")
+# ⚠️ 目录一旦进白名单就是**整个目录**开放，所以往白名单目录里放文件之前，
+#    先想清楚"这个是不是该让任何人看到"；不该的，在这里补一条。
+STATIC_DENY = ("js/seed-data.js",)
 
 # ===== Steam =====
 STEAM_OPENID_ENDPOINT = "https://steamcommunity.com/openid/login"
 API = "https://api.steampowered.com"
 STORE_API = "https://store.steampowered.com/api/appdetails"
+
+# 商店**搜索**接口 —— 「我只有名字，帮我找 appid」走它（商店搜索框背后那个接口）。
+#
+# ⚠️ 它和 STORE_API 是两件事，别混：
+#   · STORE_API        知道 appid → 问详情（一款一次，可批量壳，见 _api_store）
+#   · STORE_SEARCH_API 只有名字   → 找 appid（**一次最多回 10 条**）
+#
+# 🔴 那 10 条是**接口自己的上限**，不是我们截的，也没有翻页参数 ——
+#    所以它只适合「输个名字，认一下是哪个」，不能拿来找"全部同名游戏"。
+#    想要完整目录得走 IStoreService/GetAppList（要 Key + 几万条，另一个量级）。
+#
+# ⚠️ **没有官方文档**。它是商店前端自己用的接口，所以：
+#    · 变更风险由 steam_client.search_apps 一层封住，官方哪天改了只动那一个函数；
+#    · 备选是 `steamcommunity.com/actions/SearchApps/<term>`（字段更少、无 type 无法过滤捆绑包）。
+STORE_SEARCH_API = "https://store.steampowered.com/api/storesearch/"
 
 # ⚠️ 2026-09-20 实测纠正：这里原来写的是「Steam 官方限制约 1 请求/秒」，**那是错的**。
 #    1 请求/秒是 **store.steampowered.com（商店网页接口）** 的社区经验值，

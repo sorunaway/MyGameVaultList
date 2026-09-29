@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-我的游戏生涯 —— Windows 桌面版启动器（离线）。
+MyGameVaultList —— Windows 桌面版启动器（离线）。
 
 做三件事：
   1. 设 `GV_DESKTOP=1`（**必须在 import config 之前** —— 那个开关是导入期读环境变量的）
@@ -82,7 +82,7 @@ os.environ["GV_DESKTOP"] = "1"
 import app as gv_app              # noqa: E402  (server/app.py)
 import steam_local                # noqa: E402
 
-WINDOW_TITLE = "我的游戏生涯"
+WINDOW_TITLE = "MyGameVaultList"
 
 
 def is_our_service(port, timeout=1.5):
@@ -261,7 +261,7 @@ def main(argv=None):
         return 3
 
     print("=" * 56)
-    print("我的游戏生涯 · 桌面版（离线）")
+    print("MyGameVaultList · 桌面版（离线）")
     print("本机地址：%s" % url)
     print("监听范围：仅本机回环（127.0.0.1）—— 局域网内别的机器连不上")
     if attached:

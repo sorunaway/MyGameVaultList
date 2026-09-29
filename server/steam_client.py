@@ -17,8 +17,8 @@ import urllib.request
 import zlib
 from concurrent import futures
 
-from config import (API, STORE_API, STORE_MIN_INTERVAL, STEAM_MAX_CONCURRENCY,
-                    STEAM_MIN_INTERVAL, UA)
+from config import (API, STORE_API, STORE_MIN_INTERVAL, STORE_SEARCH_API,
+                    STEAM_MAX_CONCURRENCY, STEAM_MIN_INTERVAL, UA)
 
 # 单次尝试的超时下限（秒）。再短就没有意义了 —— 跨境链路健康时一次也要
 # 0.3~1.3 秒，1 秒以内的超时等于「必定失败」，只会白烧一次尝试。
@@ -857,7 +857,7 @@ def get_wishlist_ex(key, steamid, budget=None):
 
     ⚠️ 调用方拿到 "unavailable" 时**不要**直接清空本地的愿望单记录：
     用户可能只是把隐私设置从「公开」改成了「仅好友」，而 Steam 的返回
-    与「真的清空了」完全一样。见 cloud.js 里 syncWishlist 的删除条件。
+    与「真的清空了」完全一样。见 local-src.js 里 syncWishlist 的删除条件。
 
     budget：总耗时上限（秒），语义同 _fetch_json。
     """
@@ -973,3 +973,77 @@ def get_app_details_ex(appid, cc="cn", lang="schinese", filters="", budget=None)
 # ⚠️ 不要再用 filters=basic —— 它确实能压小响应体，但会连
 #    release_date / genres / developers 一起砍掉（实测 570 返回 release:null），
 #    而「发售年份 + 类型」正是我们问商店的目的（见 get_app_details 注释）。
+
+
+def search_url(term, cc="cn", lang="schinese"):
+    """拼商店搜索接口的 URL。抽出来是为了让探活脚本能用同一套拼接去对比。
+
+    尾斜杠不能省：`/api/storesearch/` 是商店自己的写法，去掉后部分链路会 301，
+    而 301 在预算紧的时候会白吃掉一次尝试。
+    """
+    return "%s?term=%s&l=%s&cc=%s" % (STORE_SEARCH_API, urllib.parse.quote(term),
+                                      lang, cc)
+
+
+def _parse_search_items(d):
+    """把 storesearch 的响应整理成候选列表（滤掉捆绑包）。
+
+    ⚠️ 原始结构里 `type` 有 "app" 和 "sub" 两种：**sub 是捆绑包/合集**，
+    它的 `id` 是 subid 不是 appid —— 套进游戏单会得到一个点不开、封面也抓不到的
+    条目。这个接口是我们唯一能拿到 `type` 的地方（备选的 SearchApps 接口没有
+    这个字段，所以那边过滤不了），既然有就一定要用上。
+
+    字段来源（样本）：
+        {"type":"app","name":"…","id":292030,
+         "price":{"currency":"CNY","initial":3999,"final":3999} | null,
+         "tiny_image":"https://…/capsule_sm_120.jpg",   ← 231×87 的小卡图
+         "metascore":"93","platforms":{"windows":true,…}}
+    """
+    items = []
+    for it in (d.get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        # 只要真正的游戏本体。判据刻意写 `!= "app"` 而不是 `== "sub"`：
+        # 将来多出别的类型（demo / music）也一并挡掉，不用回来改这里。
+        if it.get("type") != "app":
+            continue
+        appid = it.get("id")
+        name = (it.get("name") or "").strip()
+        # appid 必须是**正整数**才收：它是后面拼封面 URL、写进记录的原料，
+        # 混进非数字会让下游拼出一个 404 的地址，而报错点在很远的地方。
+        if not isinstance(appid, int) or appid <= 0 or not name:
+            continue
+        items.append({
+            "appid": appid,
+            "name": name,
+            "tiny": it.get("tiny_image") or "",
+        })
+    return items
+
+
+def search_apps(term, cc="cn", lang="schinese", budget=None):
+    """按名字搜 Steam 商店，给「手动添加游戏」当联想用。
+
+    这是「输个名字 → 认出是哪个」用的，**不是**翻页找游戏的接口 ——
+    结果最多 10 条，上限在 Steam 那边（见 config.STORE_SEARCH_API 的说明）。
+
+    返回 (items, err)：
+        (list, "")    搜完了。**空列表是合法结果**（确实没这款）。
+        (None, "…")   这次没搜成（链路/限流）—— 调用方**必须**把两种情况分开，
+                      否则「网络抽风」会被前端显示成「没搜到这款游戏」，
+                      用户就会以为自己游戏名的字打错了。
+
+    ✅ 中文匹配质量**已实测通过**（2026-09-28 用户在能上网的机器上验的）：输「生化危机」
+       列出 Resident Evil 4/2/7/Village/3/6 等，官方名与「已在游戏单」标注都对。
+       所以**不要**再往"中英文各搜一次再合并"那个方向改 —— 那是为"中文搜不准"准备的退路，
+       现在没有触发条件，改了只会让请求数翻倍。
+       （原话留档：`l=schinese` 确实按商店中文名匹配。英文名也照旧能用。）
+    """
+    d, err = _fetch_json_ex(search_url(term, cc, lang),
+                            timeout=8, retries=1, throttle=_throttle_store,
+                            budget=budget)
+    if err or d is None:
+        return None, (err or "没拿到响应")
+    if not isinstance(d, dict):
+        return None, "响应不是预期的 JSON 对象"
+    return _parse_search_items(d), ""

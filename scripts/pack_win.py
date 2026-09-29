@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GameVault — Windows 桌面版 exe 出包脚本（PyInstaller，白名单制）
+MyGameVaultList — Windows 桌面版 exe 出包脚本（PyInstaller，白名单制）
 
-🔴 与 `scripts/pack_deploy.py` 的分工（**别互相顶替**）
+🔴 与 `scripts/pack_share_zip.py` 的分工（**别互相顶替**）
 
-| 脚本 | 产物 | 白名单里 `.env` 的地位 |
+| 脚本 | 产物 | 用途 |
 |---|---|---|
-| `pack_deploy.py` | **线上**部署包（`../_deploy_gamevault`） | **有意放行** —— 服务端要用它代表访问者查 Steam |
-| `pack_win.py`（本文件） | **桌面版** exe | **绝对禁止** —— 那是开发机自己的 key |
+| 本文件 | `../_build_desktop/dist/mygamevaultlist-desktop/` | **中间产物**：本机自测 / 被下面那个脚本打进 zip |
+| `pack_share_zip.py` | `../_build_desktop/share/MyGameVaultList-试用版-<日期-时分>.zip` | **对外发的唯一形态** |
+
+（这里原来还并排着一个 `pack_deploy.py` —— **线上**部署包，它的白名单**有意放行** `.env`，
+因为线上服务端要用它代表访问者查 Steam。线上版 2026-09-28 下线，脚本已删。
+⚠️ 桌面版这份白名单**绝对禁止** `.env`，别把两套规则混起来。）
 
 桌面版是**发给别人**的：`api_key()` 的优先级是「用户填的 > `.env`」，所以
 exe 里一旦夹带 `.env`，别人机器上就会用开发机那把 key 去查 Steam（烧开发者的配额），
 而且那个 key 就明文躺在 `_internal/.env` 里，谁都能翻出来。
 同理必须挡住的还有 `js/seed-data.js`（完整个人游戏库）与 `data/`。
 
-做法（与 `pack_deploy.py` 同一套思路）
---------------------------------------
+做法（白名单拷贝 + 两次体检）
+------------------------------
 1. **先按白名单拷到一个 staging 目录**（默认 `<项目外>/_build_desktop/app`）；
 2. **打包前对 staging 体检一次** —— 早失败，省掉一次几分钟的构建；
 3. 把 staging 整体 `--add-data` 进 exe；
@@ -57,17 +61,17 @@ import time
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 产物一律放**项目外** —— 免得被 git / 发布工具顺手上传（与 pack_deploy.py 同理）
+# 产物一律放**项目外** —— 免得被 git / 发布工具顺手上传
 OUT_ROOT = os.path.join(os.path.dirname(BASE_DIR), "_build_desktop")
 DIST_DIR = os.path.join(OUT_ROOT, "dist")
 WORK_DIR = os.path.join(OUT_ROOT, "work")
 SPEC_DIR = os.path.join(OUT_ROOT, "spec")
 # 删不掉的旧产物会改名归档到这里（与 _build_desktop **同一个盘**，
 # 因为 os.replace 不跨文件系统）
-TRASH_ROOT = os.path.join(os.path.dirname(BASE_DIR), "_trash_gamevault")
+TRASH_ROOT = os.path.join(os.path.dirname(BASE_DIR), "_trash_mygamevaultlist")
 # staging 目录放系统临时区、且**每次新建**（理由见 copy_stage 的说明）
 
-APP_NAME = "gamevault-desktop"
+APP_NAME = "mygamevaultlist-desktop"
 ENTRY = os.path.join(BASE_DIR, "desktop", "main.py")
 SERVER_DIR = os.path.join(BASE_DIR, "server")
 
@@ -82,13 +86,11 @@ ALLOW_DIRS = (
     "css",
     "js",
     "assets",
-    "vendor",
 )
 
 # 白名单目录内部再单独挡掉（相对项目根的 POSIX 路径）
 DENY_REL = {
     "js/seed-data.js",     # 🔴 完整个人游戏库（含手写笔记），桌面版零用途
-    "vendor/README.md",    # 维护者说明，对外无价值
 }
 
 SKIP_DIR_NAMES = {"__pycache__", ".git", "node_modules"}
@@ -309,7 +311,7 @@ def clean_previous(name):
       · `work/<name>` —— PyInstaller 的中间目录（本项目就是被它拦住的）
 
     先试子进程删除（正常环境一次搞定）；删不掉就**改名归档**到
-    `_trash_gamevault/`（`os.replace` 是单次操作，不进批量删除阈值）。
+    `_trash_mygamevaultlist/`（`os.replace` 是单次操作，不进批量删除阈值）。
     构建照常进行，只是磁盘上多留一份旧目录 —— 会明确打印出来让人自己删。
     """
     stamp = time.strftime("%Y%m%d_%H%M%S")
