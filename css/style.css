@@ -1458,8 +1458,29 @@ svg.ico.wipe-ico, .wipe-title .ico { width: 16px; height: 16px; }
 .sync-status.err { color: #f85149; border-color: rgba(248,81,73,.35); }
 
 .sync-diff { font-size: 12.5px; color: var(--text-dim); line-height: 1.75; }
-.sync-diff .dl { display: flex; justify-content: space-between; padding: 3px 0; }
-.sync-diff .dl b { color: var(--text); font-variant-numeric: tabular-nums; }
+/* 🔴 明细行是「标签左 / 值右」的两列。旧写法只有
+     `.dl { display: flex; justify-content: space-between; }`
+   值是长句时整行**画到弹窗外被裁掉**（用户 2026-09-29 报的"同步信息超出了信息框
+   限制"）。根因是 flex 子项的 `min-width` 默认 `auto` = 「不许缩到内容宽度以下」——
+   `<b>` 撑住不放，反过来把 `<span>`（标签）挤成两行。三处改动缺一不可：
+   ① `min-width: 0`（在 `b` 上）解开"不许收缩"，这是**硬修**，不加必溢出；
+   ② `overflow-wrap: anywhere` 兜底：将来出现超长无空格的串（URL 等）也在框内断行。
+      用 `anywhere` 而不是 `break-word` 是有意的：`anywhere` 会**参与** min-content
+      计算，元素才肯被压到很窄；`break-word` 不影响固有宽度，压不下去。
+   ③ `flex-wrap: wrap` 顺带实现"放不下就整行铺开"—— 换行判据正是 `<b>` 的内容宽度：
+      短值仍与标签同行、两端对齐；长值独占一行、左对齐、自己折行。
+      ⚠️ 这一条**刻意用 CSS 而不是 JS 量文字宽度**：明细有可能在面板 `hidden` 时就被
+      写进去，那时 `offsetWidth` 恒为 0，量出来"每行都放得下"→ 静默全体判错。
+      纯 CSS 的判据来自布局本身，不存在这个退化。 */
+.sync-diff .dl {
+  display: flex; flex-wrap: wrap; justify-content: space-between;
+  align-items: baseline; column-gap: 14px; row-gap: 2px; padding: 3px 0;
+}
+.sync-diff .dl > span { flex: none; }
+.sync-diff .dl > b {
+  min-width: 0; overflow-wrap: anywhere;
+  color: var(--text); font-variant-numeric: tabular-nums;
+}
 
 /* ===================== 页脚 ===================== */
 
