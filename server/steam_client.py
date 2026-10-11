@@ -8,7 +8,9 @@ Steam Web API 客户端 —— 服务端专用。
 """
 
 import gzip
+import html as html_mod
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -17,7 +19,9 @@ import urllib.request
 import zlib
 from concurrent import futures
 
-from config import (API, STORE_API, STORE_MIN_INTERVAL, STORE_SEARCH_API,
+from config import (API, COMMUNITY_API, COMMUNITY_MIN_INTERVAL,
+                    REVIEW_LIST_MAX_PAGES, STORE_API,
+                    STORE_MIN_INTERVAL, STORE_SEARCH_API,
                     STEAM_MAX_CONCURRENCY, STEAM_MIN_INTERVAL, UA)
 
 # 单次尝试的超时下限（秒）。再短就没有意义了 —— 跨境链路健康时一次也要
@@ -137,13 +141,18 @@ def classify_error(err):
     return _ERROR_OTHER
 
 # ===== 出站节流 =====
-# 两条独立的节流线，因为它们打的是两台机器、两套限流：
-#   _throttle()        Web API（api.steampowered.com），官方约 1 请求/秒
-#   _throttle_store()  商店网页接口（store.steampowered.com），宽松得多
+# 三条独立的节流线，因为它们是**三台机器、三套限流**：
+#   _throttle()            Web API（api.steampowered.com），有配额
+#   _throttle_store()      商店网页接口（store.steampowered.com），宽松得多
+#   _throttle_community()  社区网页（steamcommunity.com），**给人浏览的页面**
+# 🔴 三者**不许合并成一条**：合并之后，一次批量补封面（几十次商店请求）
+#    会把社区页那条挤到队尾 —— 而社区页一次只问一款、用户正盯着详情面板等。
 _rate_lock = threading.Lock()
 _last_call = [0.0]
 _store_rate_lock = threading.Lock()
 _last_store_call = [0.0]
+_community_rate_lock = threading.Lock()
+_last_community_call = [0.0]
 
 
 def _throttle():
@@ -162,6 +171,15 @@ def _throttle_store():
         if wait > 0:
             time.sleep(wait)
         _last_store_call[0] = time.time()
+
+
+def _throttle_community():
+    with _community_rate_lock:
+        now = time.time()
+        wait = COMMUNITY_MIN_INTERVAL - (now - _last_community_call[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_community_call[0] = time.time()
 
 
 def _decompress(raw, encoding):
@@ -258,6 +276,63 @@ def _fetch_json(url, timeout=20, retries=1, budget=None, throttle=None):
     要 gzip 能把传输量压掉约 80%。urllib 不会自动解压，必须自己看 Content-Encoding。
     """
     return _fetch_json_ex(url, timeout, retries, budget, throttle)[0]
+
+
+def _fetch_text_ex(url, timeout=20, retries=1, budget=None, throttle=None):
+    """GET 一个**网页**（HTML），返回 (text, err)；err 为空串表示成功。
+
+    🔴 为什么不能复用 `_fetch_json_ex`：那个函数在 try 里调 `json.loads`，
+       于是「响应不是合法 JSON」会被当成一次**失败尝试**并触发重试。
+       社区页返回的是 HTML，套进去会得到「重试 N 次、每次都 JSONDecodeError」，
+       最后报一个和真实原因毫不相干的错。
+       —— 判据是这个函数要守的语义：**拿到 HTTP 响应就算成功**，
+          至于内容对不对，交给调用方的解析器去判（见 get_user_review_ex）。
+
+    ⚠️ 预算逻辑与 `_fetch_json_ex` 同源（那段 MIN_ATTEMPT_TIMEOUT 的处理很微妙）。
+       改任何一边都要同步另一边；`_t_srv.py` 有一条断言钉住两个函数里的
+       `budget` 分支都存在。这是刻意的重复 —— 见 `local-src.js` 里
+       getJSON / postJSON / getJSONLoose 三个壳子也是各自独立实现的。
+    """
+    opener = urllib.request.build_opener()
+    headers = {
+        "User-Agent": UA,
+        # 社区页按 Accept-Language 出中文 / 英文版；固定成中文，
+        # 让解析器里那几个中文标签（「总时数」「推荐」）稳定成立。
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+    }
+    if budget:
+        gap = 1.2 * retries
+        while retries > 0 and \
+                (MIN_ATTEMPT_TIMEOUT * (retries + 1) + 1.2 * retries) > budget:
+            retries -= 1
+            gap = 1.2 * retries
+        per = (budget - gap) / (retries + 1)
+        timeout = max(MIN_ATTEMPT_TIMEOUT, min(timeout, per))
+
+    wait = throttle or _throttle
+    last = ""
+    for attempt in range(retries + 1):
+        wait()
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with opener.open(req, timeout=timeout) as resp:
+                raw = resp.read()
+                enc = resp.headers.get("Content-Encoding", "")
+            # 解码失败不抛：Steam 的页面偶有非法字节，errors="replace" 顶掉即可。
+            return _decompress(raw, enc).decode("utf-8", "replace"), ""
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace")[:200]
+            except Exception:
+                body = ""
+            last = "HTTP%d %s" % (e.code, body)
+        except Exception as e:
+            last = "%s: %s" % (type(e).__name__, e)
+        if attempt == retries:
+            return None, last
+        time.sleep(1.2)
+    return None, last
 
 
 def probe(url, timeout=12):
@@ -1047,3 +1122,412 @@ def search_apps(term, cc="cn", lang="schinese", budget=None):
     if not isinstance(d, dict):
         return None, "响应不是预期的 JSON 对象"
     return _parse_search_items(d), ""
+
+
+# ===========================================================================
+# 玩家评测 —— 走 steamcommunity.com 的公开网页（2026-10-11 新增）
+#
+# 通道与「为什么不用官方接口」的实测依据见 config.COMMUNITY_API。
+# 一句话：官方 appreviews 接口**不支持按作者筛**（三个候选参数实测全被忽略），
+# 而社区页 `profiles/<steamid64>/recommended/<appid>/` 是**按 (人, 款) 唯一定位**的。
+#
+# 🔴 这是全项目**唯一**一个解析 HTML 的地方。它和其它接口的本质区别：
+#    别人返回 JSON（字段有契约），它返回**给人看的网页**（结构随时可能改版）。
+#    所以：
+#      · 解析集中在这一个文件，且全部锚在 `id` / `class` 上（**不锚中文标签**）——
+#        语言变了文案会变，`id="ReviewText"` 不会；
+#      · 失败**必须**报出来，绝不许落成空值（否则"抓不到"会被看成"没写过"）。
+# ===========================================================================
+
+# 正文。Steam 把用户写的原文原样放进这个 div（`white-space: pre-wrap`），
+# 缩进/换行是模板加的，见 _clean_text。
+_REVIEW_TEXT = re.compile(r'<div id="ReviewText"[^>]*>(.*?)</div>', re.S)
+# 「推荐 / 不推荐」那一行
+_REVIEW_SUMMARY = re.compile(r'<div class="ratingSummary"[^>]*>(.*?)</div>', re.S)
+# 「发布于：8 月 23 日 上午 5:49」
+_REVIEW_DATE = re.compile(r'<div class="recommendation_date"[^>]*>(.*?)</div>', re.S)
+# 「过去 2 周 0.0 小时 / 总时数 16.8 小时」
+_REVIEW_PLAYTIME = re.compile(r'<div class="playTime"[^>]*>(.*?)</div>', re.S)
+
+# 「总时数 16.8 小时」/「Total: 16.8 hours」—— 优先取这个
+_REVIEW_TOTAL_HOURS = re.compile(
+    r"(?:总时数|Total)\s*[:：]?\s*([\d.]+)\s*(?:小时|hours)", re.I)
+_ANY_HOURS = re.compile(r"([\d.]+)\s*(?:小时|hours)", re.I)
+
+# 🔴🔴 「没写过」与「抓不到」的分界标记 —— 本模块最容易搞错、后果最隐蔽的一处。
+#
+# 实测三种页面的指纹（2026-10-11，同一个账号，同一套 UA）：
+#   · 写过   ：**有** `id="ReviewText"`，没有 sharedfiles_tabs_ctn
+#   · 没写过 ：没有 ReviewText，**有** sharedfiles_tabs_ctn
+#              （页面退化成该用户的「游戏 → 评测」标签页，是个正常列表页）
+#   · 异常   ：**两个都没有**（账号不存在 / profile 私密 / 被反爬拦下时
+#              Steam 返回的是一张错误页，实测 title = "Steam 社区 :: 错误"）
+#
+# 所以判据必须是**两条正面标记二选一**，绝不能写成「没找到正文 = 没写过」：
+# 后者会把"私密设置"和"链路抽风"一并说成"你没写过"，用户会回 Steam 反复
+# 确认自己的评测还在不在，而真正的原因被这句话盖住了。
+_PAGE_TABS_MARK = "sharedfiles_tabs_ctn"
+
+# 四态。**不许塌成两态**（理由同上）。
+#
+# ⚠️ 后两态必须分开，因为用户要做的事完全不同：
+#      network → 「稍等再试」（通用链路文案，和其它接口一致）
+#      unknown → 「你的评测可能没公开」+ 一个去改隐私设置的入口
+#    合成一个的话，两种场景里总有一种会收到一句毫无用处的建议。
+REVIEW_STATE_OK = "ok"                 # 拿到了
+REVIEW_STATE_NONE = "none"             # 确定：这位玩家没为这款写过
+REVIEW_STATE_NETWORK = "network"       # 请求本身没成功（链路 / 限流 / 超时）
+REVIEW_STATE_UNKNOWN = "unknown"       # 页面拿到了，但形态不认识（私密 / 改版 / 被拦）
+
+# 评测正文的字符上限。Steam 自己的输入上限是 8000（页面上 maxlength=8000），
+# 留一点余量；截断只为防一条畸形记录把整库撑大，正常内容碰不到它。
+REVIEW_MAX_LEN = 8000
+
+
+def _to_float(s):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_text(s):
+    """网页片段 → 可显示的纯文本。
+
+    ⚠️ **只做「反转义 + 去模板缩进」两件事，不剥标签**：
+       Steam 会把用户写的 `<b>` 转义成 `&lt;b&gt;`，反转义后变回 `<b>` ——
+       那是**用户原文**，前端用 esc() 再转义一次，显示成字面 `<b>`（正确）。
+       在这里剥掉的话，用户写的 `<xxx>` 会被静默吃掉（内容丢失）。
+    """
+    if not isinstance(s, str) or not s:
+        return ""
+    t = html_mod.unescape(s)
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"\n[ \t]+", "\n", t)      # 模板给每行加的缩进
+    t = re.sub(r"[ \t]+\n", "\n", t)      # 行尾空白
+    t = re.sub(r"\n{3,}", "\n\n", t)      # 超过一个空行的部分压掉
+    return t.strip()[:REVIEW_MAX_LEN]
+
+
+def _clean_review_date(s):
+    """评测的日期那句话 → 干净的年月日。
+
+    🔴 两个来源的原文长得**不一样**，清洗必须都覆盖（否则同一款先被列表页扫到、
+       再被点「重新抓取」升级成单篇页之后，日期会从「8 月 23 日」变成别的样子，
+       看起来像数据被改坏了）：
+
+         · 单篇评测页的 `recommendation_date`：`8 月 23 日 上午 5:49`（没有前缀）
+         · 列表页的 `posted`：`发布于 8 月 23 日。`（有前缀、有句号）
+
+    🔴 评测被**编辑过**时，那句话后面还跟着一段「最后编辑于 …」（**两个页面都会**，
+       实测 404790 / 1286680 两款都中了）。本字段只表示**发布日期**，所以切掉它；
+       同时把模板塞进来的连续空白（一长串 tab）压成单空格 ——
+       不清的话日期会变成
+       `2025 年 7 月 30 日。<一堆 tab>最后编辑于 2025 年 7 月 30 日`，原样上屏。
+    """
+    t = _clean_text(s)
+    t = re.split(r"[\s]*(?:最后编辑于|Last edited\s*[:：]?)", t)[0]
+    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"^(?:发布于|Posted)\s*[:：]?\s*", "", t).strip()
+    return t.rstrip("。.").strip()
+
+
+def _parse_playtime(text):
+    """从 playTime 那句里取**总时数**。
+
+    🔴 口径是「总时数」，不是「过去 2 周」那个数。页面原文形如
+       `过去 2 周 0.0 小时 / 总时数 16.8 小时` —— 按位置取第一个数会拿到 0.0
+       （近两周没玩的时候），显示出来就是"这游戏他只玩了 0 小时"，纯属误导。
+    """
+    t = text or ""
+    m = _REVIEW_TOTAL_HOURS.search(t)
+    if m:
+        return _to_float(m.group(1))
+    nums = _ANY_HOURS.findall(t)          # 退路：语言标签没认出来时取最后一个
+    return _to_float(nums[-1]) if nums else None
+
+
+def review_url(steamid, appid, lang="schinese"):
+    """这位玩家为这款游戏写的评测页。抽出来是为了诊断端点能复用同一套拼接。
+
+    ⚠️ appid 走 `int()` 而不是字符串拼接：它是从查询参数直接来的，
+       不转成整数就等于把 URL 的一段交给了外部输入（`../` 之类）。
+    """
+    return "%s/profiles/%s/recommended/%d/?l=%s" % (
+        COMMUNITY_API, urllib.parse.quote(str(steamid)), int(appid), lang)
+
+
+def _parse_review_html(page):
+    """评测页 HTML → (review, state)。
+
+    review（state == "ok" 时）：
+        text           正文（已清洗；可能是空串 —— 见下）
+        recommend      True / False / None（认不出推荐与否）
+        recommendText  原文那两个字（「推荐」/「不推荐」）
+        date           原文日期（已去掉「发布于：」前缀）
+        hours          总时数（float）或 None
+
+    ⚠️ `text == ""` 且 state == "ok" 是**合法**的：Steam 允许只投一票推荐、
+       一个字都不写。那叫「写过」（用户表达了态度），跟"从没写过"是两回事。
+    """
+    if not isinstance(page, str) or not page:
+        return None, REVIEW_STATE_UNKNOWN
+
+    m = _REVIEW_TEXT.search(page)
+    if not m:
+        # 正文块不在 —— 这时**才**需要看是哪一种"不在"（见 _PAGE_TABS_MARK）
+        if _PAGE_TABS_MARK in page:
+            return None, REVIEW_STATE_NONE
+        return None, REVIEW_STATE_UNKNOWN
+
+    ms = _REVIEW_SUMMARY.search(page)
+    raw_summary = _clean_text(ms.group(1)) if ms else ""
+    if "不推荐" in raw_summary:
+        recommend = False
+    elif "推荐" in raw_summary:
+        recommend = True
+    else:
+        recommend = None
+
+    md = _REVIEW_DATE.search(page)
+    date = _clean_review_date(md.group(1) if md else "")
+
+    mp = _REVIEW_PLAYTIME.search(page)
+    hours = _parse_playtime(_clean_text(mp.group(1)) if mp else "")
+
+    return {
+        "text": _clean_text(m.group(1)),
+        "recommend": recommend,
+        "recommendText": raw_summary,
+        "date": date,
+        "hours": hours,
+    }, REVIEW_STATE_OK
+
+
+def get_user_review_ex(steamid, appid, budget=None, lang="schinese"):
+    """抓「这位玩家为这款游戏写的评测」。
+
+    返回 (review, state)：
+        ({...}, "ok")            抓到了（字段见 _parse_review_html）
+        (None, "none")           确定：这位玩家**没为这款写过**评测
+        (None, "network")        请求本身没成功（链路 / 限流）→ 调用方回通用链路失败
+        (None, "unknown")        页面拿到了但形态不认识（隐私设置 / 改版 / 被拦）
+
+    🔴 **不需要 API Key** —— 这是社区网页，不经过 Web API。
+       所以调用方也别拿「有没有 Key」当门槛：没填 Key 的用户同样能用。
+    🔴 **四态不许塌成两态**（同上，见 _PAGE_TABS_MARK）：把 "unknown" 说成 "none"，
+       用户会去 Steam 反复确认自己到底写没写；把 "network" 说成 "none" 同理。
+    """
+    sid = str(steamid or "").strip()
+    if not re.match(r"^\d{17}$", sid):
+        return None, REVIEW_STATE_UNKNOWN
+    try:
+        ap = int(appid)
+    except (TypeError, ValueError):
+        return None, REVIEW_STATE_UNKNOWN
+
+    page, err = _fetch_text_ex(review_url(sid, ap, lang),
+                               timeout=10, retries=1,
+                               throttle=_throttle_community, budget=budget)
+    if err or page is None:
+        return None, REVIEW_STATE_NETWORK
+    return _parse_review_html(page)
+
+
+# ---------------------------------------------------------------------------
+# 玩家的评测**列表**页 —— 一次把「写过哪些评测」连同正文全拿下来
+# ---------------------------------------------------------------------------
+#
+# 为什么要有这条路（2026-10-11 实测）：
+#   单篇页是「一个人 × 一款游戏」的定位，只能一款一次地问。而库里 1000+ 款、
+#   一个人写过评测的通常只有几十款 —— 逐款去问，99% 的请求换来一句"没写过"，
+#   按 1.2 秒的礼貌间隔要走 20 分钟以上。
+#
+#   实测发现同一张社区站上还有**该玩家的评测列表**：
+#     `profiles/<steamid64>/recommended/`（= 单篇页判 none 时退化成的那一页）
+#   · 每页固定 10 条（`numperpage` 实测无效），`?p=N` 翻页
+#   · 页面顶部写着「正在显示第 1 - 10 项，共 N 项条目」→ **总数不用猜**
+#   · 🔴 **每条自带正文 / 推荐与否 / 日期 / 总时数**，实测与单篇页**逐字一致**
+#     ⇒ 扫几页就把几十篇连同正文全填进库，请求数从 1000+ 降到个位数。
+#
+# ⚠️ 它同样是 HTML 解析（同一条脆弱性），且**列表页 ≠ 单篇页**：
+#    列表页的日期没有具体时刻（`发布于 8 月 23 日。` vs `8 月 23 日 上午 5:49`），
+#    推荐与否是图标不是文字。所以解析器是两套 —— 别把正则混着用。
+
+# 一条评测的外壳。⚠️ 锚在 `class="review_box"` 上，不用那串带 `&quot;` 转义的
+# `data-panel` 属性（HTML 转义写进正则会又长又脆）。
+# ⚠️ 它**不会**误命中 `class="review_box_content"` —— 后者要求 `review_box` 后面
+#    紧跟 `"`，而它跟的是 `_`。
+_REVIEW_BOX = re.compile(r'<div\b[^>]*\bclass="review_box"[^>]*>')
+
+# 顶部那句「正在显示第 1 - 10 项，共 12 项条目」。这是**权威总数**，
+# 有了它就不用「一直翻到没新条目为止」去猜页数（省掉一次必然落空的请求）。
+_REVIEW_LIST_TOTAL = re.compile(r'共\s*(\d+)\s*项条目')
+_REVIEW_LIST_TOTAL_EN = re.compile(r'\bof\s+(\d+)\s+entr', re.I)
+
+# 列表页**条目内**的字段（注意与单篇页那组正则的差异 —— 见上面那段说明）
+_BOX_APPID = re.compile(r'/app/(\d+)')
+_BOX_HOURS = re.compile(r'<div class="hours">\s*(.*?)\s*</div>', re.S)
+_BOX_DATE = re.compile(r'<div class="posted">\s*(.*?)\s*</div>', re.S)
+_BOX_TEXT = re.compile(r'<div class="content\s*">(.*?)</div>', re.S)
+# 推荐与否在列表页是**图标**（单篇页才是「推荐 / 不推荐」那行字）
+_BOX_UP_MARK = "icon_thumbsUp"
+_BOX_DOWN_MARK = "icon_thumbsDown"
+
+# 实测固定 10 条一页（`&numperpage=100` / `=50` 都被忽略）。
+# 只用来算"还要翻几页"，不当作契约 —— 真按解析出来的条数走。
+REVIEW_LIST_PAGE_SIZE = 10
+
+
+def review_list_url(steamid, page=1, lang="schinese"):
+    """这位玩家的评测列表页（第 page 页）。抽出来是为了诊断端点能复用同一套拼接。"""
+    base = "%s/profiles/%s/recommended/?l=%s" % (
+        COMMUNITY_API, urllib.parse.quote(str(steamid)), lang)
+    p = int(page)
+    return base + ("&p=%d" % p if p > 1 else "")
+
+
+def _parse_review_list_html(page):
+    """列表页 HTML → (items, total, state)。
+
+    items: [{appid, text, recommend, recommendText, date, hours}, …]
+    total: 页面自报的条目总数；读不到时 None
+    state: ok / unknown（这里**不会**返回 none —— 见下）
+
+    🔴 三态的分界同单篇页那条纪律（见 `_PAGE_TABS_MARK`）：
+       · 页面是列表页（有 `sharedfiles_tabs_ctn`）→ ok（items 可能是空的）
+       · 别的形状（错误页 / 改版）→ unknown
+       把 unknown 落成"没写过"是**错误归因**：用户会回 Steam 反复确认自己的
+       评测还在不在，而真正的原因（隐私 / 链路）被这句话盖住了。
+
+    🔴🔴 还有一条**最容易漏**的兜底（就写在下面）：
+       页面自己说「共 N 项条目」（N>0），我们却一条都没切出来
+       —— 那是**我们读不懂**，不是"他没写过"。必须报 unknown。
+       没有这条，Steam 一改条目结构，全库用户都会被告知"你没写过评测"。
+    """
+    if not isinstance(page, str) or not page:
+        return [], None, REVIEW_STATE_UNKNOWN
+    if _PAGE_TABS_MARK not in page:
+        return [], None, REVIEW_STATE_UNKNOWN
+
+    m = _REVIEW_LIST_TOTAL.search(page) or _REVIEW_LIST_TOTAL_EN.search(page)
+    total = int(m.group(1)) if m else None
+
+    items = []
+    for chunk in _REVIEW_BOX.split(page)[1:]:
+        ma = _BOX_APPID.search(chunk)
+        if not ma:
+            continue
+        try:
+            appid = int(ma.group(1))
+        except (TypeError, ValueError):
+            continue
+
+        if _BOX_DOWN_MARK in chunk:
+            recommend, rtext = False, "不推荐"
+        elif _BOX_UP_MARK in chunk:
+            recommend, rtext = True, "推荐"
+        else:
+            recommend, rtext = None, ""
+
+        mt = _BOX_TEXT.search(chunk)
+        mh = _BOX_HOURS.search(chunk)
+        md = _BOX_DATE.search(chunk)
+        items.append({
+            "appid": appid,
+            "text": _clean_text(mt.group(1)) if mt else "",
+            "recommend": recommend,
+            "recommendText": rtext,
+            "date": _clean_review_date(md.group(1) if md else ""),
+            "hours": _parse_playtime(_clean_text(mh.group(1)) if mh else ""),
+        })
+
+    # 👇 那两条兜底，缺一不可（理由见 docstring 最后一段）
+    if total and not items:
+        return [], total, REVIEW_STATE_UNKNOWN
+    if total is None and not items:
+        # 连总数都读不到、条目也一条没切出来 —— 分不清"真空列表"和"读不懂"，
+        # 按**保守**一侧报（unknown 不会让前端写下任何否定结论）。
+        return [], None, REVIEW_STATE_UNKNOWN
+
+    return items, total, REVIEW_STATE_OK
+
+
+def get_user_review_list_ex(steamid, max_pages=None, budget=None,
+                            deadline=None, lang="schinese"):
+    """把「这位玩家写过的评测」整批抓下来（列表页逐页翻）。
+
+    返回 (items, meta, state)：
+
+      items  [{appid, text, recommend, recommendText, date, hours}, …]（已去重）
+      meta   {total, scanned, complete, pages}
+               total    页面自报的总条数（读不到时 None）
+               scanned  这次真的解析出来的条数
+               complete 是否**确定**扫全了（total 已知且 scanned >= total）
+               pages    实际发出去的页数
+      state  ok / network / unknown
+
+    ⚠️ 与单篇页不同，这里**没有 "none"**：空列表就报 ok + items=[]，
+       由调用方决定怎么措辞（本项目的做法是"什么都不写"，见 `setReviewsBulk`）。
+
+    🔴 中途断掉时**已拿到的页照常返回**（把 complete 置 False），不要整体作废：
+       这是"补资料"，不是"对账" —— 扫到几页算几页，剩下的下次同步再来。
+       整体作废会让链路抖一下就把这次白扫的几十条全扔掉。
+    """
+    sid = str(steamid or "").strip()
+    if not re.match(r"^\d{17}$", sid):
+        return [], None, REVIEW_STATE_UNKNOWN
+
+    try:
+        cap = int(max_pages if max_pages is not None else REVIEW_LIST_MAX_PAGES)
+    except (TypeError, ValueError):
+        cap = REVIEW_LIST_MAX_PAGES
+    cap = max(1, cap)
+
+    items, seen = [], set()
+    total = None
+    pages = 0
+
+    for page in range(1, cap + 1):
+        # 到点就收手（外层整批的截止时间，防止"写得特别多"的账号把同步拖死）
+        if deadline is not None and deadline - time.time() < MIN_ATTEMPT_TIMEOUT:
+            break
+
+        h, err = _fetch_text_ex(review_list_url(sid, page, lang),
+                                timeout=12, retries=1,
+                                throttle=_throttle_community, budget=budget)
+        pages += 1
+
+        if err or h is None:
+            if page == 1:
+                return [], None, REVIEW_STATE_NETWORK   # 第一页就没拿到 = 链路问题
+            break                                       # 中途断 → 用已经拿到的
+
+        page_items, page_total, st = _parse_review_list_html(h)
+        if st == REVIEW_STATE_UNKNOWN:
+            if page == 1:
+                return [], None, REVIEW_STATE_UNKNOWN
+            break
+
+        if page_total is not None and total is None:
+            total = page_total
+
+        n_new = 0
+        for it in page_items:
+            if it["appid"] in seen:
+                continue
+            seen.add(it["appid"])
+            items.append(it)
+            n_new += 1
+
+        if not page_items:
+            break          # 空页 = 到底了
+        if not n_new:
+            break          # 整页都是重复 —— 页码越界时 Steam 会退化成最后一页
+        if total is not None and len(items) >= total:
+            break          # 拿够了，别再多白翻一页
+
+    complete = (total is not None and len(items) >= total)
+    meta = {"total": total, "scanned": len(items),
+            "complete": complete, "pages": pages}
+    return items, meta, REVIEW_STATE_OK

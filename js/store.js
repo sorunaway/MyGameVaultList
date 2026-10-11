@@ -311,6 +311,113 @@
     return { filled: changed.length, unknown: unknown };
   }
 
+  /**
+   * 写入「这位玩家为这款游戏写的评测」—— **专用 setter，只动三个字段**。
+   *
+   * 🔴 为什么不复用 mergeSteam / mergeMeta：那两个是**同步**用的，语义是
+   *    "外部数据源覆盖本机记录"。而这条数据是从网页抓来的**一小段文本** ——
+   *    它既不改变"这条记录是不是我的"，也不改变归类状态。走同步那条路就会被
+   *    mergeSteam 那套规则顺手改写 `source`（2026-10-10 已经因此把一批愿望单的款
+   *    标成「已拥有」，见 mergeMeta 的说明）。
+   *
+   * 🔴 也不碰 `status` / `collections` / 时长 / 成就 —— 抓一条评测不该让这款
+   *    在「我的游戏单」和「正在游玩」之间跳一下。
+   *
+   * 三态的字段约定见 `makeGame` 里 `steamReview` 那段。
+   *
+   * @param {object} g      记录（调用方手里那条）
+   * @param {object|null} review
+   *        正常抓到时传 `{text, recommend, recommendText, date, hours}`；
+   *        传 `null` = 记下「抓过了，这位玩家确实没写」。
+   *        ⚠️ 传 null **不等于**"抓取失败" —— 失败根本不该调用这个函数
+   *        （失败了库里的旧值要原样留着，不能被一次链路抖动清掉）。
+   * @returns {boolean} 有没有真的改动
+   */
+  function setReview(g, review) {
+    if (!g) return false;
+    const now = Math.floor(Date.now() / 1000);
+
+    if (!review) {
+      // 「确定没写过」也要落时间戳，否则下次打开又变回"从没抓过"，
+      // 用户会以为上次那次抓取白点了。
+      // 幂等：已经是"抓过且为空"就什么都不做（别每次都写一遍库）。
+      if (g.steamReviewAt && !g.steamReview) return false;
+      g.steamReview = '';
+      g.steamReviewAt = now;
+      g.steamReviewMeta = null;
+      return true;
+    }
+
+    g.steamReview = (typeof review.text === 'string') ? review.text : '';
+    g.steamReviewAt = now;
+    g.steamReviewMeta = {
+      // 三值：true / false / null（认不出推荐与否 —— 那就别显示一个猜的结论）
+      recommend: (review.recommend === true || review.recommend === false)
+        ? review.recommend : null,
+      recommendText: String(review.recommendText || ''),
+      date: String(review.date || ''),
+      hours: (typeof review.hours === 'number' && isFinite(review.hours))
+        ? review.hours : null
+    };
+    return true;
+  }
+
+  /**
+   * 批量写入「同步时扫到的评测列表」（走 `GVLocal.fetchReviews` 那条路）。
+   *
+   * 🔴 **专用 setter**：只碰 `steamReview` / `steamReviewAt` / `steamReviewMeta`
+   *    （具体三态见 `makeGame` 里 `steamReview` 那段）。
+   *    绝不借 `mergeSteam` / `mergeMeta` —— 那两个是**同步**用的，会顺手改写
+   *    `source`（2026-10-10 已经因此把一批愿望单的款标成「已拥有」，见 `setReview` 的说明）。
+   *    也绝不碰 `status` / `collections` / 时长 / 成就 —— 填一条评测不该让这款
+   *    在「我的游戏单」和「正在游玩」之间跳一下。
+   *
+   * 🔴 只对**库里已经有**的那条写：按 (平台, appid) 定位，找不到就跳过。
+   *    扫到一篇"库里没有的款"的评测是正常的（评测页比库留得久），
+   *    为它新建一条记录等于凭空往库里塞游戏。
+   *
+   * 🔴 只**填空**，不覆盖已有的正文。
+   *    已经有 `steamReview` 的那条是用户点「重新抓取」从单篇页拿到的 ——
+   *    日期**精确到分钟**（`8 月 23 日 上午 5:49`），而列表页只有日期
+   *    （`8 月 23 日`）。被简略版盖掉，用户会觉得"我抓的那次白抓了"。
+   *    ⚠️ 反过来，「抓过但确认没写过」（`steamReviewAt` 有值、正文为空）**要**写 ——
+   *       列表页里出现了它，说明他后来写了（或者当初那次判断错了）。
+   *
+   * @param {Array} items [{appid, text, recommend, recommendText, date, hours}, …]
+   * @returns {Promise<{scanned:number, matched:number, written:number}>}
+   *          scanned = 扫到几篇；matched = 其中库里有的几篇；written = 真写进去的几篇
+   */
+  async function setReviewsBulk(items) {
+    const list = Array.isArray(items) ? items : [];
+    if (!list.length) return { scanned: 0, matched: 0, written: 0 };
+
+    const existing = await DataStore.all();
+    const byKey = new Map();
+    (existing || []).forEach(g => {
+      if (!g || g.appid == null) return;
+      byKey.set(GVPlatforms.of(g) + ':' + String(g.appid), g);
+    });
+
+    const toSave = [];
+    let matched = 0;
+    list.forEach(src => {
+      if (!src || src.appid == null) return;
+      // ⚠️ 键里带平台：评测页是 Steam 的，它的答案只对默认平台那条记录有效
+      //    （同 mergeMeta 里那条注释）。别的平台的记录天然落不进来。
+      const g = byKey.get(GVPlatforms.DEFAULT_ID + ':' + String(src.appid));
+      if (!g) return;
+      matched++;
+      if (g.steamReview) return;          // 已有正文 → 保留（见上面第三条）
+      if (setReview(g, src)) {
+        g.updatedAt = Date.now();
+        toSave.push(g);
+      }
+    });
+
+    if (toSave.length) await DataStore.saveMany(toSave);
+    return { scanned: list.length, matched: matched, written: toSave.length };
+  }
+
   /** 分钟 -> "12.5h" 形式 */
   function minutesToHours(min) {
     if (!min || min <= 0) return 0;
@@ -398,7 +505,18 @@
       manualHidden: null,       // 手动设定过隐藏开关；非空则优先于自动判定
       dismissedCollection: false, // 用户主动把它从「已通关」挪走过，不再被收藏夹拉回
       hidden: false,            // 是否隐藏（工具/软件默认隐藏）
-      steamReview: '',          // 玩家在 Steam 写的评价（抓不到就空）
+      // 玩家自己写的评测（从社区页抓的，见 `local-src.js` 的 fetchReview）—— **三态**：
+      //   steamReviewAt === 0            从没抓过（详情面板显示「抓取」按钮）
+      //   > 0 且 steamReview === ''      抓过，这位玩家确实没写（**这不是失败**）
+      //   steamReview !== ''             有正文
+      // 🔴 三态缺一不可：少了时间戳，「抓过但没写」会被显示成「从没抓过」，
+      //    用户会反复点那个按钮，而每次结果都一样 —— 看起来像按钮坏了。
+      steamReview: '',
+      steamReviewAt: 0,         // 上面那条是什么时候抓的（秒）；0 = 从没抓过
+      // 抓到的元信息 {recommend, recommendText, date, hours}。
+      // 只存正文的话，详情面板每次打开都要重抓一遍网页才能显示
+      // 「推荐 / 发布日 / 总时数」—— 而那三个字正是判断"这条评测有没有参考价值"的依据。
+      steamReviewMeta: null,
       myNote: '',               // 玩家手写感想
       genres: [],
       developers: [],
@@ -733,6 +851,9 @@
     touchDoneAt,
     setDoneYear,
     backfillDoneAt,
+    // 玩家评测的写入口（专用 setter，只动 steamReview / steamReviewAt / steamReviewMeta）
+    setReview,
+    setReviewsBulk,
     minutesToHours,
     parseReleaseYear,
     uid,

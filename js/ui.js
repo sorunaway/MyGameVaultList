@@ -1676,6 +1676,112 @@
     state.drawerId = null;
   }
 
+  /**
+   * 详情面板里「玩家评测」那一节。
+   *
+   * 🔴 三种状态**必须能分开**（字段约定见 `store.js` 的 makeGame）：
+   *      · 有正文        → 正文 + 元信息（推荐 / 总时数 / 发布日）
+   *      · 抓过但没写过  → 明说「这位玩家没有为这款游戏写过评测」
+   *      · 从没抓过      → 邀请点那个按钮
+   *    把后两种混起来，用户看到的永远是「还没抓取」，然后一直点按钮 ——
+   *    而真正的答案（他确实没写过）一次也说不出来。
+   *
+   * ⚠️ 抓取按钮**只在真能抓的时候画**。三种缺失各有各的说法，不许共用一个
+   *    「点了没反应」的按钮：
+   *      · 双击 index.html 的本地版没有服务端 → 说「需要桌面版」
+   *      · 没绑定账号 → 抓之前不知道「这位玩家」是谁 → 说「绑定后可用」
+   *      · 这款没有 AppID（手动添加的）→ 说「抓不了」
+   *
+   * 文案由能力名 / 平台标签拼出来，**不写平台名字面量**（`_t_srv.py` 有断言盯着）。
+   */
+  function reviewSectionHtml(g) {
+    const plan = syncPlan();
+    const hasAppid = g.appid != null && /^\d+$/.test(String(g.appid));
+    const canFetch = !!(state.desktop && hasAppid && plan.sid);
+    // 抓过（不管有没有正文）→ 按钮改叫「重新抓取」
+    const btnLabel = g.steamReviewAt ? '重新抓取' : '抓取玩家评价';
+
+    // 推荐与否 / 总时数 / 发布日期 —— 只要有 meta 就能显示，**不依赖正文**
+    // （投了票但一个字没写也是合法的一条评测，那三个标签照样有）。
+    const rm = g.steamReviewMeta || {};
+    const bits = [];
+    // 推荐与否：优先用网页原文（中文「推荐」/「不推荐」），
+    // 原文没有时退回用布尔值拼 —— 两个都不行就不显示这一格（宁可少说，不猜）
+    if (rm.recommendText || rm.recommend === true || rm.recommend === false) {
+      bits.push(rm.recommendText || (rm.recommend === true ? '推荐' : '不推荐'));
+    }
+    if (typeof rm.hours === 'number' && isFinite(rm.hours)) {
+      // ⚠️ 口径是「总时数」（当前累计），**不是**「写这条评测时已经玩了多久」。
+      //    网页给的就是前者，照搬成后者会给出一个对不上的数。
+      bits.push('总时数 ' + rm.hours + ' 小时');
+    }
+    if (rm.date) bits.push('发布于 ' + rm.date);
+    const tagsHtml = bits.length
+      ? '<div class="d-tags">' +
+          bits.map(t => '<span class="d-tag">' + esc(t) + '</span>').join('') +
+        '</div>'
+      : '';
+
+    let bodyHtml;
+    if (g.steamReview) {
+      bodyHtml = '<div class="d-note">' + esc(g.steamReview) + '</div>' + tagsHtml;
+    } else if (g.steamReviewAt && g.steamReviewMeta) {
+      // 🔴「投了票、一个字没写」是**写过**，不是"没写过" —— Steam 允许只投一票推荐。
+      //    这两件事的文案必须分开（混起来会把用户自己的评测说成不存在，
+      //    他回 Steam 一看明明在，就会以为这个功能坏了）。
+      //    判据是**有没有 meta**：`setReview(null)` 才会把 meta 清成 null。
+      bodyHtml = '<div class="d-note placeholder">' +
+                 '这位玩家写过这篇评测，但没有留下正文' +
+                 (rm.recommendText
+                    ? '（只投了「' + esc(rm.recommendText) + '」）' : '') +
+                 '。</div>' + tagsHtml;
+    } else if (g.steamReviewAt) {
+      // 抓过了、确实没有 —— 这是**答案**，不是「还没抓到」
+      bodyHtml = '<div class="d-note placeholder">' +
+                 '这位玩家没有为这款游戏写过评测。</div>';
+    } else {
+      bodyHtml = '<div class="d-note placeholder">还没抓取过。</div>';
+    }
+
+    let whyHtml = '';
+    if (!canFetch) {
+      if (!state.desktop) {
+        whyHtml = '<div class="d-note placeholder">抓取评价需要桌面版。</div>';
+      } else if (!hasAppid) {
+        whyHtml = '<div class="d-note placeholder">这款没有 Steam 商品号，抓不了评价。</div>';
+      } else {
+        whyHtml = '<div class="d-note placeholder">绑定 Steam 账号后就能抓取。</div>';
+      }
+    }
+
+    return '<div class="d-sec">' +
+             '<h4>' + esc(PF.labelOf(state.platform)) + ' 评价' +
+               (canFetch
+                 ? '<button id="fetchReviewBtn">' + esc(btnLabel) + '</button>'
+                 : '') +
+             '</h4>' +
+             bodyHtml + whyHtml +
+           '</div>';
+  }
+
+  /**
+   * 抓评测失败时给用户看的那句话 —— **四种原因必须分开**（见 `GVLocal.fetchReview`）。
+   *
+   * 🔴 尤其别把「读不懂页面」说成「你没写过」：那是错误归因，
+   *    用户会回 Steam 反复确认自己的评测还在不在。
+   */
+  function reviewFailText(r) {
+    if (!r) return '抓取失败。';
+    if (r.reason === 'no_steamid') return '还没有绑定 Steam 账号，抓不了评测。';
+    if (r.reason === 'no_appid') return '这款没有 Steam 商品号，抓不了评测。';
+    if (r.state === 'network') {
+      return r.message || '没连上 Steam 社区（跨境链路波动），稍等几秒再试一次。';
+    }
+    // unknown：页面读不懂 —— 最常见的是「评测」这一项隐私没公开
+    const first = (r.howToFix && r.howToFix.length) ? r.howToFix[0] : '';
+    return (r.message || '没读到评测内容。') + (first ? '（' + first + '）' : '');
+  }
+
   function drawerHtml(g) {
     const m = META[g.status] || META[S.LIBRARY];
     const hours = fmtHours(g.totalMinutes);
@@ -1777,16 +1883,12 @@
         '</div></div>'
       : '';
 
-    // 玩家评价（自动抓的）—— **只有声明了 `review` 能力的平台才有这一节**。
+    // 玩家评价（从社区页抓的）—— **只有声明了 `review` 能力的平台才有这一节**。
     // 没有这一节不是"缺数据"，是那个平台本来就没有这个数据源；
     // 硬画出来会写一句"暂未抓取到 Steam 评价"，站在别的平台上等于在说别人的事。
+    // 三种状态的渲染与"为什么没有按钮"都在 reviewSectionHtml 里，见那里的说明。
     const reviewHtml = PF.supports(state.platform, 'review')
-      ? ('<div class="d-sec">' +
-          '<h4>' + esc(PF.labelOf(state.platform)) + ' 评价</h4>' +
-          (g.steamReview
-            ? '<div class="d-note">' + esc(g.steamReview) + '</div>'
-            : '<div class="d-note placeholder">暂未抓取到评价，可在下方写自己的感想。</div>') +
-        '</div>')
+      ? reviewSectionHtml(g)
       : '';
 
     // 我的记录
@@ -1961,6 +2063,50 @@
     if (yNow) yNow.addEventListener('click', () => setYearAndRedraw(new Date().getFullYear()));
     const yClear = el.drawerBody.querySelector('#doneYearClear');
     if (yClear) yClear.addEventListener('click', () => setYearAndRedraw(DS.DONE_UNKNOWN));
+
+    // 抓玩家评测（社区页，一款一次）—— 抓完**就地重绘**，让正文立刻出现。
+    // ⚠️ 失败时按钮必须恢复可点：一次链路抽风不该逼用户关掉抽屉再重开。
+    const revBtn = el.drawerBody.querySelector('#fetchReviewBtn');
+    if (revBtn) {
+      revBtn.addEventListener('click', async () => {
+        if (revBtn.disabled) return;
+        if (!window.GVLocal || !window.GVLocal.fetchReview) {
+          note('这个版本没有抓取能力（需要桌面版）。', 'warn');
+          return;
+        }
+        const old = revBtn.textContent;
+        revBtn.disabled = true;
+        revBtn.textContent = '抓取中…';
+        try {
+          const r = await window.GVLocal.fetchReview(g.appid, syncPlan().sid);
+          if (!r.ok) {
+            // 失败**不写库** —— 库里已有的正文要原样留着，
+            // 不能被一次链路抖动清成"没写到"。
+            note(reviewFailText(r), 'err');
+            revBtn.disabled = false;
+            revBtn.textContent = old;
+            return;
+          }
+          // r.ok 有两态：'ok'（抓到了）/ 'none'（确定没写过）。
+          // 🔴 **两态都要落库**：'none' 也带时间戳 —— 下次打开才知道"已经问过了"，
+          //    否则面板永远显示"还没抓取过"，用户会一直点这个按钮。
+          if (DS.setReview(g, r.state === 'ok' ? r.review : null)) {
+            g.updatedAt = Date.now();
+            await DS.save(g);
+          }
+          note(r.state === 'ok'
+                 ? ('已抓取「' + g.title + '」的评价。')
+                 : ('「' + g.title + '」这位玩家没有写过评测。'),
+               r.state === 'ok' ? 'ok' : 'warn');
+          await reload();
+          openDrawer(g.id);
+        } catch (e) {
+          note('抓取失败：' + ((e && e.message) || e), 'err');
+          revBtn.disabled = false;
+          revBtn.textContent = old;
+        }
+      });
+    }
 
     // 编辑记录
     const editBtn = el.drawerBody.querySelector('#editNoteBtn');
@@ -2728,6 +2874,10 @@
     // （声明位置同上：收尾文案是在 `try/finally` **之后**读它们的。）
     let localIds = null, onlineIds = null;
     let fixFixed = 0, fixBack = 0;
+    // ②.8 玩家评测（扫列表页）的结果 —— 声明位置同上（收尾文案在 `try/finally`
+    // **之后**读它，写在 try 里就是 `ReferenceError`，而 async 无 catch 会被静默吞掉）。
+    let revOk = false, revBad = '';
+    let revScanned = 0, revWritten = 0, revComplete = true;
 
     try {
       // ---- ① 本机（永远做）----
@@ -2950,6 +3100,61 @@
         }
       }
 
+      // ---- ②.8 玩家评测（社区网页，扫**一张列表**就够）----
+      //
+      // 🔴 为什么是"扫列表"而不是"逐款检测"（2026-10-11 实测）：
+      //    社区页上还有该玩家的**评测列表** `profiles/<steamid>/recommended/`，
+      //    每页 10 条，页首写着「共 N 项条目」，而且**每条自带正文 / 推荐与否 /
+      //    日期 / 总时数**（实测与单篇页逐字一致）。
+      //    ⇒ 一个人写过的通常就几十篇 → 2~5 个请求全拿回来。
+      //      而"逐款去问 1000 款有没有写过"要 1000+ 次请求（礼貌间隔下 20 分钟以上）。
+      //    所以这不是"顺带检测一下"，而是**换了条通道**：读同一张站上的另一种页面。
+      //
+      // ⚠️ 同一条纪律：**不自己判「有没有 Key」** —— 评测在公开网页上，压根不走
+      //    Web API。有账号就一律发出去，由服务端归因（缺 Key 的人正是最该用它的）。
+      //
+      // ⚠️ 明细行必须把「扫到几篇 / 有没有扫全」说到用户看得见的地方；
+      //    读不到时**绝不能**说成"你没写过"（错误归因，见 reviewFailText）。
+      //    （`rev*` 那几个变量的声明在函数顶部 —— 理由见那里的注释。）
+      if (p.sid) {
+        setSyncStatus('正在读你写过的游戏评测…', '');
+        let rv = null;
+        try { rv = await window.GVLocal.fetchReviews(p.sid); } catch (e) { rv = null; }
+        if (rv && rv.ok) {
+          revOk = true;
+          const rmeta = rv.meta || {};
+          revScanned = rmeta.scanned || (rv.items || []).length;
+          revComplete = rmeta.complete !== false;
+          // 写库走**专用 setter**：只填还没有正文的那些，绝不覆盖用户点
+          // 「重新抓取」拿到的精确版（日期带具体时刻），也绝不碰状态 / 收藏夹。
+          if (window.DataStore && window.DataStore.setReviewsBulk) {
+            try {
+              const w = await window.DataStore.setReviewsBulk(rv.items || []);
+              revWritten = (w && w.written) || 0;
+            } catch (e) { console.warn('写入玩家评测失败（不影响本次同步）', e); }
+          }
+          if (revScanned > 0) {
+            rows.push(['玩家评测',
+              '你写过 ' + revScanned + ' 篇' +
+              (revWritten ? '（新填了 ' + revWritten + ' 篇的正文）' : '') +
+              (revComplete ? '' : '（这次没扫全 —— 再点一次「同步」接着来）')]);
+          } else {
+            // 列表读到了、但一条都没有。**这不是"你没写过"**（说不准：评测设为
+            // 私密时可能也是这个样子，而我们分不出来）→ 如实说"没读到"。
+            rows.push(['玩家评测', '没读到写过的评测（也可能只是还没公开）']);
+          }
+        } else {
+          revBad = (rv && rv.message) || '这次没读到你的评测列表。';
+          rows.push(['玩家评测', revBad]);
+          // 服务端给了修法就**记进「消息」**：改隐私设置要切到 Steam 去操作，
+          // 提示条 3 秒就没了，用户得能回头照着做（同愿望单 / 成就那两步）。
+          if (rv && rv.howToFix && rv.howToFix.length) {
+            note('读不到你的评测列表。' + (rv.message || '') + '\n' +
+                 rv.howToFix.map((s, i) => (i + 1) + '. ' + s).join('\n'), 'warn');
+          }
+        }
+      }
+
       // ---- ③ 家庭库（桌面版专有）----
       //
       // 🔑 顺序放在 ② 之后，是**必须**的：①② 先把「我的」那份写完（含收藏夹、
@@ -3075,6 +3280,14 @@
                             : '（已全部核完）');
       } else if (achBad) {
         msg += '。成就没核成：' + achBad;
+      }
+      // 评测那一步：**读到了才写进状态行**（"你写过 N 篇"是用户会关心的一个数）。
+      // 读不到**不写、也不算 bad** —— 最常见的原因是「评测」这项隐私没公开，
+      // 那是用户的合法选择，不该让整条同步每次都变黄
+      // （原因和改法已经写进明细行 + 消息列表里了，见上面那步）。
+      if (revOk && revScanned > 0) {
+        msg += '，你写过的评测 ' + revScanned + ' 篇' +
+               (revWritten ? '（新填 ' + revWritten + ' 篇）' : '');
       }
       if (familyOk) {
         msg += '，家庭库 ' + familyTotal + ' 款（新进来 ' + familyAdded + ' 款）';

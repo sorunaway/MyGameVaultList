@@ -196,6 +196,34 @@ VERIFY_PROBE_STEAMID = "76561197960287930"
 # 它比游戏库小一个数量级，不会把整个同步拖过反代的断连线。
 WISH_BUDGET = 15
 
+# `/api/steam/review` 的出网预算（秒）。
+#
+# 它是**社区网页**（steamcommunity.com），健康时约 1 秒返回一张 ~40 KB 的页面。
+# 给 15 秒能容纳「2 次尝试 × 4.4 秒」+ 社区页那条 1.2 秒的礼貌间隔，链路抽风时
+# 还有一次重试机会。它和 WISH_BUDGET 同量级 —— 用户在详情面板点一下按钮，
+# 不该等出"是不是卡住了"的感觉。
+#
+# ⚠️ 别把它调大：这是**单款**请求，一次只抓一款，没有「分批」的余地，
+#    打久了既容易撞反爬，也会让用户对着转圈干等。
+REVIEW_BUDGET = 15
+
+# `/api/steam/reviews`（玩家的评测**列表**，同步时整批扫一次）的两个预算。
+#
+# ⚠️ 与上面那条**不是一件事**：上面是一次一问（用户点按钮），这里是一次同步
+#    要翻完整个列表 —— 每页固定 10 条，页数上限见 config.REVIEW_LIST_MAX_PAGES。
+#
+#   · PAGE_BUDGET 管**单页**（一次出网请求）：约 60 KB 的页面，健康时 1 秒左右，
+#     与 REVIEW_BUDGET 同量级。
+#   · DEADLINE 管**整批**（绝对时间戳，进函数那刻起算）。没有它，一个写了上千篇
+#     评测的账号能把同步拖成好几分钟 —— 而外层反代约 50 秒就断连线。
+#     10 页 × (12 秒超时 + 1.2 秒礼貌间隔) 最坏 132 秒，所以必须封顶；
+#     40 秒是「健康时约 25 秒（10 页）」+ 一倍余量，且 40 + 响应开销仍在
+#     反代断连线的安全侧（同 ACH_DEADLINE 的算法）。
+#     ⚠️ 被 deadline 截断**不算失败** —— 已经扫到的那些照常入库（见
+#        steam_client.get_user_review_list_ex 的 complete 语义）。
+REVIEW_LIST_PAGE_BUDGET = 12
+REVIEW_LIST_DEADLINE = 40
+
 # 商店接口一次最多受理多少个 appid（对外接口的上限，与 Steam 无关）。
 # ⚠️ 注意这是「我们这边一次处理几款」，**不是**「一次向 Steam 问几款」——
 # Steam 的商店接口一款一次，拼 appids=1,2,3 会被它 400 拒绝（实测）。
@@ -519,6 +547,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/steam/search":
             return self._api_steam_search()
+
+        if path == "/api/steam/review":
+            return self._api_review()
+
+        if path == "/api/steam/reviews":
+            return self._api_reviews()
 
         if config.DESKTOP_MODE:
             # 本机模式（Windows 桌面版）。线上 GV_DESKTOP 未设 → 这里永不进入，
@@ -1396,6 +1430,154 @@ class Handler(BaseHTTPRequestHandler):
 
         log("商店搜索 %r -> %d 条" % (term, len(items)))
         return self._json({"items": items, "total": len(items)})
+
+    def _api_review(self):
+        """抓「这位玩家为这款游戏写的评测」（2026-10-11 新增）。
+
+        数据来源是 **steamcommunity.com 的公开网页**，不是 Web API：
+        官方 appreviews 接口虽然每条都带 `author.steamid`，但**入参不支持按作者筛**
+        （`&steamid=` / `&author=` / `&reviewer_steamid=` 实测全被忽略，返回与不带
+        参数逐条相同），而热门游戏几万条评测翻不到底。社区页
+        `profiles/<steamid64>/recommended/<appid>/` 是「一个人 × 一款游戏」的唯一定位。
+        完整依据见 config.COMMUNITY_API。
+
+        🔴 **这里故意不调 `_guard_steam_key()`。**
+           评测在公开网页上，**不需要 API Key**。而「绑了账号、还没来得及填 Key」
+           正是最可能点这个按钮的人 —— 设 Key 门槛会把唯一需要它的用户挡在门外
+           （和 /api/steam/search 是同一条理由，见那里的说明）。
+
+        入参：`steamid`（17 位）、`appid`（数字）。
+        ⚠️ 两者都**严格校验**再往下走：appid 会被拼进 URL 路径，放行等于把路径的一段
+           交给外部输入（`../` 之类）。`steam_client.review_url` 里还有一道 `int()`。
+
+        四种回答，前端**必须分开处理**（常量见 steam_client 的 REVIEW_STATE_*）：
+
+          {"state":"ok", "review":{…}}        抓到了
+          {"state":"none"}                    确定：没为这款写过（**这不是失败**）
+          502 {"error":"steam_unreachable"}   链路没通 → 走通用重试文案
+          {"state":"unknown", "howToFix":[…]} 页面形态不认识 → 引导查评测隐私设置
+
+        🔴 后两种**绝不能**被前端说成「你没有写过评测」—— 那是错误归因：
+           用户会回 Steam 反复确认自己的评测还在不在（和愿望单那边同一类错误，
+           见 `_api_wishlist` 的说明）。
+        """
+        steamid = (self._q1("steamid") or "").strip()
+        appid = (self._q1("appid") or "").strip()
+        # ⚠️ steamid 这里比别的端点**严**：别处只判 isdigit，这里判 17 位。
+        #    因为社区页的路径是 `profiles/<steamid64>/`，位数不对时返回的是
+        #    「账号不存在」错误页 —— 那会被下游归因成"评测没公开"，
+        #    一句完全指错方向的建议。拦在门口，直接说「steamid 不合法」。
+        if not (len(steamid) == 17 and steamid.isdigit()):
+            return self._json({"error": "steamid 不合法"}, 400)
+        if not appid.isdigit():
+            return self._json({"error": "appid 不合法"}, 400)
+
+        review, state = steam_client.get_user_review_ex(
+            steamid, appid, budget=REVIEW_BUDGET)
+
+        if state == steam_client.REVIEW_STATE_OK:
+            return self._json({"state": "ok", "appid": int(appid),
+                               "review": review})
+
+        if state == steam_client.REVIEW_STATE_NONE:
+            # 200 + state：这是**确定的答案**，不是错误。
+            return self._json({
+                "state": "none",
+                "appid": int(appid),
+                "message": "这个账号还没有为这款游戏写过评测。",
+            })
+
+        if state == steam_client.REVIEW_STATE_NETWORK:
+            return self._json({
+                "error": "steam_unreachable",
+                "state": "network",
+                "message": "没连上 Steam 社区（跨境链路波动），稍等几秒再点一次就行。",
+            }, 502)
+
+        # unknown：页面拿到了，但里面既没有评测正文、也不是「没写过」那种页面。
+        # 最常见的成因是「评测」这项隐私没公开（Steam 对本科目返回的是普通资料页）。
+        return self._json({
+            "state": "unknown",
+            "appid": int(appid),
+            "error": "review_unreadable",
+            "message": "没读到评测内容。常见原因是这个账号的「评测」没有公开，"
+                       "或者 Steam 改了页面结构。",
+            "howToFix": [
+                "打开 Steam → 个人资料 → 编辑个人资料 → 隐私设置，"
+                "把「我的评测」设为「公开」",
+                "若已经是公开，可能是 Steam 改了页面结构，稍后再试一次",
+            ],
+            "privacyUrl": "https://steamcommunity.com/my/edit/settings",
+        })
+
+    def _api_reviews(self):
+        """扫「这位玩家写过的全部评测」（评测**列表**页，同步时整批跑一次）。
+
+        🔴 与 `/api/steam/review`（单篇）的分工：
+           单篇 = 「一个人 × 一款游戏」，用户点按钮**按需**抓一款，拿到精确时刻；
+           列表 = 「这个人写过的所有评测」，一次同步扫几页，**每条自带正文**
+                  （实测与单篇页逐字一致）。有了它，就不用拿 1000+ 次请求去问
+                  「这 1000 款里哪几款你写过」—— 那是 20 分钟的活。
+           两条路共用同一张社区页的解析纪律（四态、不许把 unknown 说成"没写过"）。
+
+        🔴 **这里同样故意不调 `_guard_steam_key()`**（理由同 `_api_review`）：
+           评测在公开网页上，不需要 Web API Key。绑了账号、还没填 Key 的用户
+           正是最该用上这个功能的人。
+
+        入参：`steamid`（17 位，与单篇页同一条严格校验 —— 位数不对会拿到
+              「账号不存在」错误页，被下游误归因成"评测没公开"）、
+              `pages`（可选，翻页上限；服务端还会按 config 封顶）。
+
+        三种回答（**没有 "none"** —— 空列表是 ok，见前端怎么措辞）：
+          {"state":"ok", "items":[…], "meta":{total,scanned,complete,pages}}
+          502 {"error":"steam_unreachable"}   链路没通 → 通用重试文案
+          {"state":"unknown", "howToFix":[…]} 页面形态不认识 → 引导查隐私设置
+
+        ⚠️ `meta.complete == false` 是**正常**结果（写得多 / 链路中途抖），
+           前端要如实说「这次没扫全」，不能报成"你就写了这些"。
+        """
+        steamid = (self._q1("steamid") or "").strip()
+        if not (len(steamid) == 17 and steamid.isdigit()):
+            return self._json({"error": "steamid 不合法"}, 400)
+
+        pages = (self._q1("pages") or "").strip()
+        max_pages = None
+        if pages.isdigit():
+            # 只许**收紧**不许放宽：客户端传多大都过不了 config 那道闸
+            max_pages = min(int(pages), config.REVIEW_LIST_MAX_PAGES)
+
+        items, meta, state = steam_client.get_user_review_list_ex(
+            steamid, max_pages=max_pages,
+            budget=REVIEW_LIST_PAGE_BUDGET,
+            deadline=time.time() + REVIEW_LIST_DEADLINE)
+
+        if state == steam_client.REVIEW_STATE_OK:
+            log("评测列表 %s -> %d 篇（页面自报 %s，%s，共翻 %s 页）"
+                % (steamid, meta["scanned"], meta["total"],
+                   "已扫全" if meta["complete"] else "未扫全", meta["pages"]))
+            return self._json({"state": "ok", "items": items, "meta": meta})
+
+        if state == steam_client.REVIEW_STATE_NETWORK:
+            return self._json({
+                "error": "steam_unreachable",
+                "state": "network",
+                "message": "没连上 Steam 社区（跨境链路波动），稍等几秒再试一次就行。",
+            }, 502)
+
+        # unknown：页面拿到了，但不是评测列表页的样子。
+        # 最常见的成因与单篇页那次一致 —— 「评测」这项隐私没公开。
+        return self._json({
+            "state": "unknown",
+            "error": "review_list_unreadable",
+            "message": "没读到你的评测列表。常见原因是这个账号的「评测」没有公开，"
+                       "或者 Steam 改了页面结构。",
+            "howToFix": [
+                "打开 Steam → 个人资料 → 编辑个人资料 → 隐私设置，"
+                "把「我的评测」设为「公开」",
+                "若已经是公开，可能是 Steam 改了页面结构，稍后再试一次",
+            ],
+            "privacyUrl": "https://steamcommunity.com/my/edit/settings",
+        })
 
     # ---------- 静态 ----------
     def _static(self, path):

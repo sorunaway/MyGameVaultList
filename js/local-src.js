@@ -944,6 +944,139 @@
     };
   }
 
+  // ===== 玩家评测（steamcommunity.com 的公开网页，2026-10-11 新增）=====
+  //
+  // 两条路，同一张社区站、同一套四态纪律，但**代价差三个数量级**：
+  //
+  //   · `fetchReview`  —— 单篇：「**这个人 × 这一款**」的评测页。
+  //     ⚠️ 一次请求只回答一款。绝不能拿它去逐款问"你有没有写过" ——
+  //        库里 1000+ 款、按 1.2 秒的礼貌间隔就是 20 分钟以上，
+  //        而且 99% 的请求只换来一句"没写过"。
+  //   · `fetchReviews` —— 列表：「**这个人写过的所有评测**」。
+  //     实测列表页每页 10 条，且**每条自带正文 / 推荐与否 / 日期 / 总时数**
+  //     （与单篇页**逐字一致**），页首还写着「共 N 项条目」。
+  //     ⇒ 同步时扫几页（几十条通常 2~5 页）就把写过的那几十篇连同正文全填进库。
+  //     这才是「同步时检测」的正确形态：不是检测 1000 款，是读一张列表。
+  //
+  // ⚠️ 单篇那条仍然必须留着：①「重新抓取」的兜底（日期能精确到分钟）；
+  //    ② 列表页读不到时（隐私 / 改版）的唯一退路。
+  var REVIEW_TIMEOUT = 20000;        // 服务端 REVIEW_BUDGET(15s) + 回环余量
+  var REVIEW_LIST_TIMEOUT = 55000;   // 服务端 REVIEW_LIST_DEADLINE(40s) + 回环余量
+
+  /**
+   * 抓「这位玩家为这款游戏写的评测」。
+   *
+   * 🔴 **不需要 API Key** —— 评测在社区公开网页上，不走 Web API。
+   *    所以别在这里加"有没有 Key"的前置判断：那会把唯一需要它的人挡住
+   *    （绑了账号、还没来得及申请 Key，和商店搜索是同一条理由）。
+   *    但它**需要 steamid** —— 没绑定账号就无从知道"这位玩家"是谁。
+   *
+   * 返回 `{ok, state, review, reason, message, howToFix}`，四种结果**必须分开报**：
+   *
+   *   ok:true   state:'ok'       review = {text, recommend, recommendText, date, hours}
+   *   ok:true   state:'none'     确定：这位玩家没为这款写过（**这不是失败**）
+   *   ok:false  state:'network'  链路没通 → 走通用"稍等再试"文案
+   *   ok:false  state:'unknown'  页面形态不认识（多半是「评测」隐私没公开）
+   *
+   * 🔴 后两种**绝不能**报成 'none'。那是错误归因：用户会回 Steam 反复确认
+   *    自己的评测还在不在（库里的文字还在，你却说他没写过），而真正的原因
+   *    ——「隐私设置」或「链路抽风」—— 被这句话盖住了。
+   *    判据的分界见服务端 `steam_client._PAGE_TABS_MARK` 那段。
+   */
+  async function fetchReview(appid, steamid) {
+    var ap = String(appid == null ? '' : appid).trim();
+    var sid = String(steamid == null ? '' : steamid).trim();
+    // 前置校验：这两个不满足时按钮本来就不该显示（见 ui.js 的抽屉渲染）。
+    // 保留这一层是为了"万一调到了"能给出准确原因，而不是发一个注定 400 的请求。
+    if (!/^\d+$/.test(ap)) {
+      return { ok: false, state: 'unknown', reason: 'no_appid' };
+    }
+    if (!/^\d{17}$/.test(sid)) {
+      return { ok: false, state: 'unknown', reason: 'no_steamid' };
+    }
+
+    var d;
+    try {
+      d = await getJSONLoose(
+        '/api/steam/review?steamid=' + encodeURIComponent(sid) +
+        '&appid=' + encodeURIComponent(ap), REVIEW_TIMEOUT);
+    } catch (e) {
+      return { ok: false, state: 'network', reason: 'fetch_failed' };
+    }
+
+    var state = d && d.state;
+    if (state === 'ok' && d.review) {
+      return { ok: true, state: 'ok', review: d.review };
+    }
+    if (state === 'none') {
+      return { ok: true, state: 'none', message: d.message || '' };
+    }
+    if (state === 'network') {
+      return { ok: false, state: 'network', reason: 'fetch_failed',
+               message: d.message || '' };
+    }
+    return {
+      ok: false, state: 'unknown', reason: 'unreadable',
+      message: (d && d.message) || '',
+      howToFix: (d && d.howToFix) || []
+    };
+  }
+
+  /**
+   * 扫「这位玩家写过的所有评测」（列表页，同步时整批跑一次）。
+   *
+   * 返回 `{ok, state, items, meta, reason, message, howToFix}`：
+   *
+   *   ok:true   state:'ok'       items = [{appid,text,recommend,recommendText,date,hours}, …]
+   *                              meta  = {total,scanned,complete,pages}
+   *   ok:false  state:'network'  链路没通 → 走通用"稍等再试"文案
+   *   ok:false  state:'unknown'  页面形态不认识（多半是「评测」隐私没公开）
+   *
+   * 🔴 **这里没有 'none'** —— 空列表是 `ok:true` + `items:[]`（页面正常、就是没写过）。
+   *    措辞交给调用方；本项目的做法是**什么都不写**（见 DataStore.setReviewsBulk），
+   *    因为"0 条"也可能是隐私设置造成的，不足以断言"你没写过任何评测"。
+   *
+   * 🔴 同样**不需要 API Key**（公开网页），但**需要 steamid** —— 没绑账号就不知道
+   *    "这个人"是谁。（别加 Key 前置判断，理由同 fetchReview。）
+   *
+   * 🔴 后两态**绝不能**被说成"你没写过评测"（错误归因，同 fetchReview）。
+   *
+   * ⚠️ `meta.complete === false` 是**正常结果**（写得多 / 链路中途抖了一下）——
+   *    调用方要如实说「这次没扫全」，不能报成"你就写了这些"。
+   */
+  async function fetchReviews(steamid) {
+    var sid = String(steamid == null ? '' : steamid).trim();
+    if (!/^\d{17}$/.test(sid)) {
+      return { ok: false, state: 'unknown', reason: 'no_steamid' };
+    }
+
+    var d;
+    try {
+      d = await getJSONLoose('/api/steam/reviews?steamid=' +
+                             encodeURIComponent(sid), REVIEW_LIST_TIMEOUT);
+    } catch (e) {
+      return { ok: false, state: 'network', reason: 'fetch_failed' };
+    }
+
+    var state = d && d.state;
+    if (state === 'ok') {
+      return {
+        ok: true, state: 'ok',
+        items: (d && d.items) || [],
+        meta: (d && d.meta) || {}
+      };
+    }
+    if (state === 'network') {
+      return { ok: false, state: 'network', reason: 'fetch_failed',
+               message: (d && d.message) || '' };
+    }
+    return {
+      ok: false, state: 'unknown', reason: 'unreadable',
+      message: (d && d.message) || '',
+      howToFix: (d && d.howToFix) || []
+    };
+  }
+
   /**
    * 统一的设置写入。**返回形状统一成 `{ok, reason, data}`** ——
    * 调用方不该去分辨"这是 HTTP 400 还是网络断了"，两种都是"没设成"，
@@ -986,6 +1119,14 @@
      * 给「手动添加游戏」当联想用 —— **只读公共数据，不碰「拥有」语义**。
      */
     searchApps: searchApps,
+
+    /**
+     * 抓「这位玩家为这款游戏写的评测」（社区公开网页）。
+     * **按需一款一次**，不在同步流程里 —— 详情面板按一下才发。
+     * 🔴 不需要 API Key，但需要 steamid（见函数头的说明）。
+     */
+    fetchReview: fetchReview,
+    fetchReviews: fetchReviews,
 
     // ---- Steam 目录（哪台机器上 Steam 装在哪都可能不一样）----
     status: function () { return getJSON('/api/local/status', STATUS_TIMEOUT); },
