@@ -420,6 +420,83 @@ input, textarea, select { font-family: inherit; }
 .grouphead.gh-tools ~ .card { opacity: .82; }
 .grouphead.gh-tools ~ .card:hover { opacity: 1; }
 
+/* ── 年表：年份段头（「已通关」区，2026-09-30）─────────────────────────
+   段头是个 <button>：点一下收起/展开那一年的卡片。
+   拖放落点是**整段**（含卡片区，见 js/ui.js 的 bindYearDrop），但高亮只落在段头上
+   —— 段头就是那一段的标题条，亮它等于亮那一年。
+
+   🔴 按钮的默认外观必须整个清掉（border / background / font / text-align），
+      否则浏览器那套灰底圆角会把 .grouphead 那条整行下划线吃掉，
+      年表看起来就不像"分隔线"了。下划线在这里重新写一遍是必须的。 */
+button.grouphead {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+button.grouphead:hover { background: var(--bg-hover); }
+button.grouphead:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.gh-caret {
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-faint);
+  transition: transform .14s ease;
+  flex: none;
+}
+/* 收起时三角转成朝右 —— 「我的电脑」里那几组就是这个手感 */
+.grouphead[aria-expanded="false"] .gh-caret { transform: rotate(-90deg); }
+
+/* 年份用等宽数字：几段竖着排，年份不会左右错位 */
+.grouphead.gh-year .gh-label { font-variant-numeric: tabular-nums; }
+/* 「年份未定」是一份待办清单（等你拖到某年），语气弱一点，别抢主段 */
+.grouphead.gh-year-unknown .gh-label { color: var(--text-dim); }
+.grouphead.gh-year-unknown .gh-count { color: var(--text-faint); }
+
+/* 拖到某一年那一块时的落点提示（高亮打在段头上） */
+.grouphead.gh-year.dragover {
+  background: var(--accent-soft);
+  border-bottom-color: var(--accent);
+}
+.grouphead.gh-year.dragover .gh-label { color: var(--accent); }
+/* 正在被拖着的那张卡半透明，一眼看出拖的是哪一张 */
+.card.dragging { opacity: .45; }
+
+/* 拖动期：内容区上下缘的「页面正在自己滚」提示条（2026-09-30）
+   只在**真的在滚**时出现 —— `.autoscrolling` 由 ui.js 每帧按指针位置切。
+
+   🔴 **必须用 sticky 伪元素，不能用 `.content` 自己的 inset box-shadow。**
+   阴影属于容器的背景层（画在子元素**之前**），而卡片正是它的子元素 → 卡片把阴影整个盖住，
+   实测只剩卡片之间的缝隙里露一点点，用户根本看不见（典型的"写好了但没人看得见"）。
+   `position: sticky` 是**定位元素**，按绘制顺序画在所有非定位子元素之上；本项目
+   style.css 里一条 `position:` 都没有（弹窗走原生 <dialog>），所以这条稳。
+   sticky 还顺带免掉了 fixed 定位要自己算坐标的麻烦：上下各一条、自动贴合内容区。 */
+.content.autoscrolling::before,
+.content.autoscrolling::after {
+  content: '';
+  position: sticky;
+  display: block;
+  height: 16px;
+  pointer-events: none;   /* 提示条不许抢落点 —— 落点是挂在 document 上的 */
+}
+.content.autoscrolling::before {
+  top: 0;
+  margin-bottom: -16px;   /* 用负 margin 抵消占位：加了提示条不该让内容整体挪位 */
+  border-top: 2px solid var(--accent);
+  background: linear-gradient(to bottom, var(--accent-soft), transparent);
+}
+.content.autoscrolling::after {
+  bottom: 0;
+  margin-top: -16px;
+  border-bottom: 2px solid var(--accent);
+  background: linear-gradient(to top, var(--accent-soft), transparent);
+}
+
 .card {
   background: var(--bg-elev);
   border: 1px solid var(--border);
@@ -452,7 +529,10 @@ input, textarea, select { font-family: inherit; }
   background: var(--bg-elev-2);
   overflow: hidden;
 }
-.card-media img { position: relative; width: 100%; height: 100%; object-fit: contain; display: block; }
+/* 🔴 `-webkit-user-drag:none` 是封面抢拖动源的**第二道保险**（第一道是 markup 里的
+   `draggable="false"`）：WebKit/Chromium（含 WebView2）里靠它彻底断掉"拖图片"这条路。
+   年表拖放要按在封面上也能拖起卡片，见 js/ui.js 的 cardHtml / bindYearDrop。 */
+.card-media img { position: relative; width: 100%; height: 100%; object-fit: contain; display: block; -webkit-user-drag: none; }
 /* 比例对不上时铺的模糊底：同一张图放大铺满，把 contain 留出的空档填掉。
    没有 pad 类的卡片连这个伪元素都不存在 —— 不白花 decode / 合成开销。 */
 .card-media.pad::before,
@@ -858,7 +938,7 @@ input, textarea, select { font-family: inherit; }
   background: var(--bg-elev-2);
   overflow: hidden;
 }
-.d-hero img { position: relative; width: 100%; height: 100%; object-fit: contain; }
+.d-hero img { position: relative; width: 100%; height: 100%; object-fit: contain; -webkit-user-drag: none; }
 .d-hero::after {
   content: '';
   position: absolute; inset: 0;
@@ -943,6 +1023,33 @@ input, textarea, select { font-family: inherit; }
 
 /* 锁定按钮 */
 .d-lockrow { margin-bottom: 14px; }
+
+/* 详情面板：通关年份（标签 + 输入框 + 两个快捷按钮）。
+   ⚠️ 这一行是 flex，值那一侧放的是 input（有自己的固有宽度）→ 必须
+   `flex-wrap: wrap` + `min-width: 0`，否则窄屏下 input 会顶出容器
+   （同一类坑见 `.sync-diff` 那段的四条修法）。 */
+.d-doneyear {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+.d-doneyear > span { flex: none; font-size: 13px; color: var(--text-dim); }
+.d-doneyear > input {
+  flex: 0 1 auto;
+  width: 92px;
+  min-width: 0;
+  padding: 5px 9px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.d-doneyear > input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.d-doneyear .btn { padding: 5px 10px; font-size: 12px; }
 .lockbtn {
   display: inline-flex;
   align-items: center;
@@ -1457,6 +1564,46 @@ svg.ico.wipe-ico, .wipe-title .ico { width: 16px; height: 16px; }
 .sync-status.warn { color: var(--accent); border-color: rgba(240,160,32,.35); }
 .sync-status.err { color: #f85149; border-color: rgba(248,81,73,.35); }
 
+/* ===== 同步"正在跑"的可见指示（2026-10-10）=====
+   起点是用户反馈：**点了同步其实已经在跑，但界面上看不出来**（以为没开始），
+   另一半是"关掉这个窗口同步是不是就中断了"。三处一起补：
+     ① 状态行里的转圈（`.running` 才出现）
+     ② 状态行下面那行固定的「正在同步中…」（顺带答"关掉不会中断"）
+     ③ 顶栏「同步」的图标转起来 —— 面板关着时**唯一**还看得见的位置
+   为什么不做成纯文字：静止的一行字和"跑完了"长得一模一样，
+   这才是"看不出来"的根因（不是缺提示语，是缺**动**）。 */
+.sync-spin {
+  display: none;
+  flex: none;
+  width: 13px; height: 13px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: gvspin .8s linear infinite;
+}
+.sync-status.running .sync-spin { display: block; }
+@keyframes gvspin { to { transform: rotate(360deg) } }
+
+/* 状态行文字自己要能断行：它是 flex 子项、`min-width` 默认 `auto`，
+   长句 + 长串（URL / 路径）会把它顶出状态框（`.dl` 那一族的同款写法）。
+   用 `anywhere` 而不是 `break-word`：`anywhere` 参与 min-content 计算，
+   元素才肯被压窄。 */
+.sync-status-txt { min-width: 0; overflow-wrap: anywhere; }
+
+/* 「正在同步中…」那行：只在真的在跑时出现（hidden 由 ui.js 切）。
+   用强调色 —— 它是"活着"的信号，不该和说明文字一个待遇。 */
+.sync-live {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--accent);
+  padding: 0 2px;
+}
+
+/* 顶栏「同步」在跑时让图标转起来。
+   ⚠️ 只加类名、不新增按钮：顶栏按钮清单被 _t_wipe.html 的 F1b 钉死成
+   添加/同步/消息/设置四个（多一个就得先说清用途）。 */
+#btnSync.is-syncing .ico { animation: gvspin .9s linear infinite; }
+
 .sync-diff { font-size: 12.5px; color: var(--text-dim); line-height: 1.75; }
 /* 🔴 明细行是「标签左 / 值右」的两列。旧写法只有
      `.dl { display: flex; justify-content: space-between; }`
@@ -1605,8 +1752,21 @@ svg.ico.wipe-ico, .wipe-title .ico { width: 16px; height: 16px; }
   /* 详情抽屉在手机上铺满整屏更好读 */
   .drawer { width: 100% !important; max-width: 100%; }
 
-  /* 弹窗留出边距，超高时可滚 */
-  .modal { width: calc(100vw - 24px) !important; max-height: 88vh; overflow-y: auto; }
+  /* 弹窗：窄屏**只改高度上限，不改宽度**。
+     🔴 原写法是 `width: calc(100vw - 24px) !important` —— 两个后果都是量出来的
+     （2026-10-10，_t_synclayout.html 六档视口 1180/900/860/700/520/380）：
+       ① 遮罩 padding 是 20px，可用宽只有 `100vw - 40px`，它却要 `100vw - 24px`
+          → **弹窗比可用区宽 16px**（700px 视口实测：可用 660 / 弹窗 676）。
+       ② 越界之后 grid 的 `place-items:center` 在"元素比区域大"时退化成**靠左**，
+          于是左边 20px、右边只剩 4px —— 用户报的「全屏正常、窗口化超框」
+          就是它（>900px 时弹窗是 460px、居中，所以全屏看着完全正常）。
+     基础 `.modal { width: min(460px, 100%) }` 本来就够：`100%` 按**遮罩内容盒**算，
+     天然等于 `100vw - 40px`，任何宽度下都越不出去，窄屏还会自己缩到 340px。
+     ⚠️ 也别改写成 `width`（那会把 #wipeMask 那个 430px 的窄确认窗一起撑到 460）。
+     `overflow-y: auto` 一并去掉，两个理由：整个弹窗滚动会把头尾的按钮顶出视口
+     （与 `.modal` 那条"头尾固定、只有中间滚"的设计正好相反）；而且一个轴写 auto、
+     另一个轴 visible 会被折算成 auto → 横向溢出会**长出滚动条**而不是被裁。 */
+  .modal { max-height: 88vh; }
 
   /* 批量选择条允许换行 */
   .selbar { flex-wrap: wrap; gap: 8px; }
@@ -1751,6 +1911,12 @@ svg.ico.wipe-ico, .wipe-title .ico { width: 16px; height: 16px; }
   line-height: 1.55;
   text-align: left;
   max-width: min(560px, 92vw);
+  /* 🔴 必须能断"没有空格的超长串"：同步/绑定失败的文案里**带 URL**
+     （API Key 申请地址），窄窗口下这条 URL 会整条画到提示框之外
+     （2026-10-10 量出来的：380px 视口右越 126.8px）。
+     用 `anywhere` 而不是 `break-word` —— 它参与 min-content 计算，
+     元素才肯被压到 `max-width` 以内。 */
+  overflow-wrap: anywhere;
   box-shadow: var(--shadow);
   z-index: 1000;
   opacity: 0;

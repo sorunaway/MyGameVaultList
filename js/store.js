@@ -208,6 +208,109 @@
     return s ? Number(s.slice(0, 4)) : null;
   }
 
+  // ===== 通关年份（`doneAt`）=====
+  //
+  // 需求（2026-09-30）：「已通关」区要能按年份分段，一眼看出今年 / 去年通关了哪些。
+  //
+  // 🔴 **一个字段，三种取值** —— 语义必须钉死，否则下一个人会把 -1 当成脏数据清掉：
+  //      > 0        真实通关时间（秒）
+  //      -1         **已定格，但年份未知**（进「年份未定」段，用户可以拖到某年）
+  //      0 / 缺失   尚未定格（等一次回填，或等它第一次被归入「已通关」）
+  //
+  // 🔴 **已定格就永不再自动改** —— 这是需求的原话（"只要已经存在「已通关」内
+  //    （非初次归入已通关），就不再自动检测归类年表"）。所以**不能**渲染时按
+  //    `lastPlayedTs` 现算：2025 通关的款 2026 重玩一次，年份就会自己跳到 2026。
+  //    `doneAt` 是**写死的**，只有用户手动改（拖放 / 详情面板）才会变。
+  const DONE_UNKNOWN = -1;
+
+  /** 这条记录落在哪一年；"未定格 / 年份未知"都返回 null（由调用方归到「年份未定」段） */
+  function doneYearOf(g) {
+    const ts = g && g.doneAt;
+    return (ts && ts > 0) ? yearOf(ts) : null;
+  }
+
+  /**
+   * 首次归入「已通关」时写通关时间 —— **只写一次**。
+   *
+   * ⚠️ 判据是"有没有定格过"，不是"值是不是空"：`-1` 也算定格（用户把它拖到
+   *    「年份未定」了），这里必须跳过；否则下次同步又按 `lastPlayedTs` 把它塞回某年，
+   *    用户刚拖走的动作就被悄悄撤销了。
+   *
+   * @param {object} g  记录
+   * @param {number} ts 想写的时刻（秒）。拿不到时间就传 0/空 → 定格为 DONE_UNKNOWN
+   * @returns {boolean} 是否写了（已定格 / 状态不是已通关 → false）
+   */
+  function touchDoneAt(g, ts) {
+    if (!g || g.status !== STATUS.COMPLETED) return false;
+    if (g.doneAt) return false;                    // 已定格（正数或 -1）
+    const n = Number(ts);
+    g.doneAt = (isFinite(n) && n > 0) ? Math.floor(n) : DONE_UNKNOWN;
+    return true;
+  }
+
+  /**
+   * 手动把一款游戏放到某一年 —— 拖放与详情面板**共用这一个**。
+   *
+   * 规则：**只换年份，保留月日**（"2026-03-14"拖到 2025 → "2025-03-14"）。
+   *   · 2 月 29 日遇到平年 → 退回 2 月 28 日。不许让 JS 自己滚成 3 月 1 日：
+   *     那会让"只改年份"变成"日期也偷偷变了"，而用户拖的是年份。
+   *   · 原本未定格 / 年份未知 → 落成那年 **1 月 1 日中午**。
+   *     取中午而不是 0 点：`new Date(y,0,1)` 是本地零点，转成秒后再被任何一处
+   *     当成 UTC 解释就会挤到上一年 12 月 31 日（年份差一年，最难查的那种）。
+   *
+   * @param {object} g    记录
+   * @param {number} year 目标年份；传 `DONE_UNKNOWN` = 拖回「年份未定」
+   */
+  function setDoneYear(g, year) {
+    if (!g) return false;
+    if (year === DONE_UNKNOWN || year == null || year === '') {
+      g.doneAt = DONE_UNKNOWN;
+      return true;
+    }
+    const y = Number(year);
+    if (!isFinite(y) || y < 1970 || y > 2200) return false;
+    const cur = Number(g.doneAt) || 0;
+    let d;
+    if (cur > 0) {
+      d = new Date(cur * 1000);
+      const mo = d.getMonth();
+      d.setFullYear(y);
+      if (d.getMonth() !== mo) d.setDate(0);       // 2/29 → 平年：退回当月最后一天(2/28)
+    } else {
+      d = new Date(y, 0, 1, 12, 0, 0);
+    }
+    g.doneAt = Math.floor(d.getTime() / 1000);
+    return true;
+  }
+
+  /**
+   * 一次性回填：把"已经在「已通关」里、但还没定格"的记录补上年份。
+   *
+   * 🔴 为什么用 `lastPlayedTs` 而不是 `statusManualAt`：
+   *    手上这批「已通关」大多是**后来手工补录**的，`statusManualAt` 会全部挤在
+   *    补录那一天（几乎全落同一年）；而 `lastPlayedTs` 说的是"最后玩它的那一刻"，
+   *    更接近真实通关年份。
+   *
+   * ⚠️ 拿不到时间（`lastPlayedTs` 为 0：手动添加的、愿望单转正的、别的平台给不出
+   *    这一项的记录）→ 定格为 `DONE_UNKNOWN`，落在「年份未定」段等用户拖。**不许猜。**
+   *
+   * 幂等：判据就是 `touchDoneAt` 里那条"已定格就跳过"，跑多少次结果都一样。
+   * @returns {{filled:number, unknown:number}} 写了多少条 / 其中有多少落进「年份未定」
+   */
+  async function backfillDoneAt() {
+    const all = await DataStore.all();
+    const changed = [];
+    let unknown = 0;
+    (all || []).forEach(g => {
+      if (!g || g.status !== STATUS.COMPLETED) return;
+      if (!touchDoneAt(g, g.lastPlayedTs)) return;
+      if (g.doneAt === DONE_UNKNOWN) unknown++;
+      changed.push(g);
+    });
+    if (changed.length) await DataStore.saveMany(changed);
+    return { filled: changed.length, unknown: unknown };
+  }
+
   /** 分钟 -> "12.5h" 形式 */
   function minutesToHours(min) {
     if (!min || min <= 0) return 0;
@@ -288,6 +391,10 @@
       statusManualAt: 0,        // 上次手动改状态的时间戳（秒）；晚于 lastPlayedTs 则保留手动结果
       statusLocked: false,      // 锁定：为 true 时完全不参与自动归类（用户钉死的）
       autoStatus: false,        // 当前状态是否由自动规则（启动日期）产生 —— 供 UI 打标记
+      // 通关时间戳（秒）——「已通关」区年表的**唯一**依据。三种取值见 touchDoneAt。
+      // ⚠️ 必须在这里给默认值：`makeGame` 是 `Object.assign(默认值, partial)`，
+      //    默认值决定「备份导出 → 换台机器导入」时这个字段还在不在（少一行就是静默丢年份）。
+      doneAt: 0,
       manualHidden: null,       // 手动设定过隐藏开关；非空则优先于自动判定
       dismissedCollection: false, // 用户主动把它从「已通关」挪走过，不再被收藏夹拉回
       hidden: false,            // 是否隐藏（工具/软件默认隐藏）
@@ -620,6 +727,12 @@
     collectionsInData,
     tsToDate,
     yearOf,
+    // 通关年份（年表的依据）：字段语义与三条规则见上面的 `DONE_UNKNOWN` 那段
+    DONE_UNKNOWN,
+    doneYearOf,
+    touchDoneAt,
+    setDoneYear,
+    backfillDoneAt,
     minutesToHours,
     parseReleaseYear,
     uid,
@@ -781,6 +894,95 @@
     },
 
     /**
+     * 只补**公共资料**（名字 / 封面 / 发售年 / 类型 / 开发商）—— 绝不碰身份。
+     *
+     * 🔴🔴 为什么必须有这个函数（2026-10-10，用户实测投诉「愿望单里的游戏卡右下角
+     *    标成了『已拥有』，可我一款都没买」）：
+     *
+     *    `local-src.js` 的 `fillMeta()`（补商店资料的每一步）以前是直接调
+     *    `mergeSteam()` 写回的，而 `mergeSteam` 对**已存在的记录**会无条件执行
+     *    `old.source = staysFamily ? 'family' : 'steam'` —— 它只保护 family。
+     *    可 `fillMeta` 构造的记录里**根本没有 `source` 字段**（它只知道 appid 和
+     *    几个资料字段），于是：**凡是它补过资料的记录，来源一律被改成 'steam'**，
+     *    角标随之变成「已拥有」。
+     *
+     *    而愿望单刚导进来的款**正是它补得最凶的那一批**：愿望单接口只给 appid、
+     *    不给名字（见 mergeWishlist 的说明），于是它们既不满足 `fillMeta` 那条
+     *    「有名字有封面就跳过」的守卫，还正好落在 `fillMetaInBackground` 排在
+     *    第一档的「没名字的」里，并且每次同步给足 240 个额度、每次启动再补 45 个。
+     *
+     *    实测：`source:'steam'` 的记录数**远多于**「账号侧拥有 ∪ 本机读到的」
+     *    —— 多出来的全是愿望单里的款被转正的；界面上「已拥有」的数量
+     *    = 前者 + 手动录入的那几条，与用户截图逐字吻合。
+     *
+     *    所以补资料这条路**必须和「库同步」彻底分开**：它没有任何资格改变一条
+     *    记录的身份、状态、收藏夹或时长 —— 它只知道"这款在商店里叫什么、哪年出的"。
+     *
+     * ## 与 `mergeSteam` 的分工（别再合并回去）
+     *
+     * `mergeSteam` = 「**我的库**里有什么」—— 它有资格写 source / collections / 时长 /
+     * 状态归类，因为它拿到的 payload 本身就是一份拥有凭证。
+     * 本函数 = 「商店怎么说这款」—— **一个字段都不许越界**。
+     *
+     * ## 规则（刻意少，且都是"只补缺"）
+     *
+     *  · 按 **(平台, appid)** 定位已有记录；**找不到就什么都不做**（绝不新建 ——
+     *    以前那条路会因为 EPIC 记录不在默认平台索引里，把同一款**又建一条**出来，
+     *    实测 4 条记录变 5 条）。
+     *  · 只写白名单字段，且**只在当前为空时**写：`title / icon / header /
+     *    releaseDate / releaseYear / genres / developers`。
+     *    口径与 mergeSteam 一致（`src.x || old.x`），这样"本机那张离线可用的本地
+     *    封面"不会被商店的远程图盖掉。
+     *  · **一个字都不写**：`source` / `status` / `autoStatus` / `manualStatus` /
+     *    `statusLocked` / `collections` / `totalMinutes` / `recentMinutes` /
+     *    `lastPlayedTs` / `achievements` / `doneAt` / `wish*`。
+     *
+     * :param incoming [{appid, title?, header?, …}, …]
+     * :returns {asked, filled}（`filled` = 真的写进内容的条数）
+     */
+    async mergeMeta(incoming) {
+      const list = Array.isArray(incoming) ? incoming : [];
+      if (!list.length) return { asked: 0, filled: 0 };
+
+      const existing = await this.all();
+      const byKey = new Map();
+      existing.forEach(g => {
+        if (!g || g.appid == null) return;
+        byKey.set(GVPlatforms.of(g) + ':' + String(g.appid), g);
+      });
+
+      const toSave = [];
+      let asked = 0, filled = 0;
+
+      list.forEach(src => {
+        if (!src || src.appid == null) return;
+        asked++;
+        // ⚠️ 键里带平台：`/api/steam/store` 查的是 Steam 商店，它的答案只对
+        //    默认平台的那条记录有效。这样 EPIC 记录天然落不进来（不写、不新建）。
+        const g = byKey.get(GVPlatforms.DEFAULT_ID + ':' + String(src.appid));
+        if (!g) return;
+
+        const hasG = Array.isArray(g.genres) && g.genres.length > 0;
+        const hasD = Array.isArray(g.developers) && g.developers.length > 0;
+        let touched = false;
+        const put = (field, val) => { g[field] = val; touched = true; };
+
+        if (!g.title && src.title) put('title', src.title);
+        if (!g.icon && src.icon) put('icon', src.icon);
+        if (!g.header && src.header) put('header', src.header);
+        if (!g.releaseDate && src.releaseDate) put('releaseDate', src.releaseDate);
+        if (!g.releaseYear && src.releaseYear) put('releaseYear', src.releaseYear);
+        if (!hasG && src.genres && src.genres.length) put('genres', src.genres);
+        if (!hasD && src.developers && src.developers.length) put('developers', src.developers);
+
+        if (touched) { g.updatedAt = Date.now(); toSave.push(g); filled++; }
+      });
+
+      if (toSave.length) await this.saveMany(toSave);
+      return { asked: asked, filled: filled };
+    },
+
+    /**
      * 合并一捆 Steam 同步结果。
      * 规则：
      *  - appid 已存在 -> 更新 Steam 侧字段（时长/成就/最后游玩），保留用户侧字段（状态/备注/评价）
@@ -878,6 +1080,11 @@
           if (Array.isArray(src.collections)) old.collections = src.collections;
           old.updatedAt = Date.now();
 
+          // 🔴 必须在下面那段**之前**记下"这次同步之前它是不是已通关" ——
+          //    通关年份要靠这个区分「这次刚归入」（写此刻）与「本来就已通关、只是补字段」
+          //    （写最后游玩时间）。状态块里 `wasCompleted` 是块作用域的，出了块就取不到。
+          const statusBefore = old.status;
+
           // ===== 状态归类 =====
           // 优先级（高 -> 低）：
           //   1. 锁定（statusLocked）        -> 一律不动
@@ -942,6 +1149,21 @@
             }
           }
 
+          // 通关年份：上面整个状态块里**所有**"判为已通关"的分支都从这里收口 ——
+          // 只在这一处补，避免三处分头写（漏一处 = 那条路径进来的款永远没有年份）。
+          // ⚠️ 收口点必须在状态块**之后**：块内早期分支还会把状态改掉（例如
+          //    「曾通关但已不在收藏夹」会交给自动规则），提前写就会给一款
+          //    最终不算已通关的款留下年份。
+          if (old.status === STATUS.COMPLETED && !old.doneAt) {
+            if (statusBefore === STATUS.COMPLETED) {
+              // 本来就已通关、只是缺字段（老数据）→ 与 backfillDoneAt 同口径
+              touchDoneAt(old, old.lastPlayedTs);
+            } else {
+              // 这次刚归入（收藏夹 / 全成就）→ "归入的那一刻"就是现在
+              touchDoneAt(old, Math.floor(Date.now() / 1000));
+            }
+          }
+
           // 隐藏：工具/软件 or「已隐藏」收藏夹
           if (!old.manualHidden) {
             old.hidden = inHiddenCollection(old) || isToolGame(old);
@@ -963,6 +1185,14 @@
             g.totalMinutes = 0;
             g.recentMinutes = 0;
             g.lastPlayedTs = 0;
+          }
+          // 通关年份：**新建分支同样要收口**（备份导入、首次同步都会走到这里）。
+          // ⚠️ 备份文件里带 `doneAt` 的**原样保留** —— `makeGame` 是
+          //    `Object.assign(默认值, partial)`，`src.doneAt` 会盖过默认值，
+          //    换机器搬数据不许把年份搬丢；只有确实没有（旧备份 / 脚本生成的文件）
+          //    才按 `lastPlayedTs` 推一次。
+          if (g.status === STATUS.COMPLETED && !g.doneAt) {
+            touchDoneAt(g, g.lastPlayedTs);
           }
           delete g.suggestedStatus;   // 内部字段，不入库
           if (!Array.isArray(g.collections)) g.collections = [];
@@ -1067,6 +1297,97 @@
       const owned = all.filter(g => g && g.source === 'steam');
       if (!owned.length) return { added: 0, updated: 0, recollected: 0, locked: 0, abandoned: 0 };
       return this.mergeSteam(owned);
+    },
+
+    /**
+     * 把「被错标成已拥有的愿望单款」修回「未入库」。**一次性数据修复。**
+     *
+     * 🔴 起因（2026-10-10）：`fillMeta()` 补资料时走的是 `mergeSteam`，而那个函数
+     *    会把记录来源无条件改成 `'steam'`（只保护 family）→ 愿望单里的款被"转正"，
+     *    角标变「已拥有」。源头已经改用 `mergeMeta` 堵住了（见那个函数的说明），
+     *    但**已经被写坏的那批记录不会自己长回来**，光堵源头不够 ——
+     *    所以要有这个函数。
+     *
+     * ## 判据（每一条都是"宁可少修，不可错修"）
+     *
+     * 一条记录**同时**满足下面全部条件才修：
+     *  1. `wishlisted === true` —— 它此刻还在愿望单里（愿望单那一步写的身份）；
+     *  2. `source === 'steam'` —— 它现在挂着「已拥有」；
+     *  3. appid **不在 `ownedIds`**（Steam 账号侧全量库）里；
+     *  4. appid **不在 `localIds`**（本机 Steam 文件读到的库）里；
+     *  5. `totalMinutes === 0 && !lastPlayedTs && !achievements` —— 没有任何"玩过"的证据；
+     *  6. `!statusLocked && !manualStatus && !favorite && !hidden && !doneAt`
+     *     —— 用户从没亲手动过它。
+     *
+     * 🔴 **第 3、4 条是这个函数的命门，两条都少不得。** 实测（2026-10-10）：
+     *    愿望单里有一批 `wishlisted && source==='steam'`，看上去都该修 ——
+     *    但只用第 1、2 条去筛，会把那些**真的买了、真的在玩**的款也一起标成
+     *    「未入库」（被误伤的既有单机大作、也有挂机上千小时的款）—— Steam 并不
+     *    总是把已购的款从愿望单里移走（礼物、第三方 key、家庭共享都会留下）。
+     *    加上第 3、4 条之后只剩原来的一小部分命中，而且这个值**与另一个独立算法
+     *    算出的完全相同**（`source:'steam'` 的条数 − 「账号侧拥有 ∪ 本机读到的」
+     *    条数）—— 两条互不相干的路径同值，这才是可信的判据。
+     *
+     * ## 为什么"有权拥有"要用两个集合
+     *
+     * `ownedIds` 来自联网那半（`/api/steam/library`），`localIds` 来自本机那半。
+     * 少了任何一个，判据就会偏：只有 owned 的话，本机文件里那些"玩过但账号侧查不到"
+     * 的款（家庭共享、装过别人号的副本）会被误修；只有 local 的话，本机没装的
+     * "买了没碰过"的款会被误修。所以调用方**必须两个都给**。
+     *
+     * ## 空集合 = 拒绝执行
+     *
+     * 空数组会被理解成"你一款都没有" → 整库愿望单记录全被标回「未入库」。
+     * 链路抖动完全可能给出空列表，所以这里**硬拒**（返回 `skipped`）。
+     *
+     * ## 顺带把掉出「待游玩」的款放回去
+     *
+     * 被转正的记录里有相当一部分**状态也被带歪了**：它们本来由
+     * `mergeWishlist` 建在 `backlog`，被转正之后的下一次 `mergeSteam` 会走
+     * 「普通游戏」那条分流，`suggestStatus()` 给出 `library` —— 于是它们既挂了
+     * 「已拥有」、又从「待游玩」掉进了「我的游戏单」。
+     * 同一个 bug 的两个后果，所以这里一起修：`status` 放回 `backlog`
+     * （第 6 条守卫保证"只有用户没动过的"才动）。
+     *
+     * :param env {ownedIds:[…], localIds:[…]}  —— 两个都是 appid 数组
+     * :returns {fixed, toBacklog, skipped?}
+     */
+    async reclassifyWishlistOnly(env) {
+      const ownedL = env && env.ownedIds;
+      const localL = env && env.localIds;
+      if (!Array.isArray(ownedL) || !Array.isArray(localL)) return { fixed: 0, toBacklog: 0, skipped: 'no_sets' };
+      // 🔴 空集合硬拒 —— 见上面那段。宁可这次不修，也不能拿"空"当"没有"。
+      if (!ownedL.length || !localL.length) return { fixed: 0, toBacklog: 0, skipped: 'empty_set' };
+      const owned = new Set(ownedL.map(String));
+      const local = new Set(localL.map(String));
+
+      const all = await this.all();
+      const toSave = [];
+      let fixed = 0, toBacklog = 0;
+
+      all.forEach(g => {
+        if (!g || g.appid == null) return;
+        if (g.wishlisted !== true) return;              // ①
+        if (g.source !== 'steam') return;               // ②
+        const k = String(g.appid);
+        if (owned.has(k)) return;                       // ③ 真的买了
+        if (local.has(k)) return;                       // ④ 本机确实读得到
+        if (g.totalMinutes > 0 || g.lastPlayedTs || g.achievements) return;   // ⑤
+        if (g.statusLocked || g.manualStatus || g.favorite || g.hidden || g.doneAt) return;   // ⑥
+
+        g.source = 'wishlist';
+        fixed++;
+        if (g.status !== STATUS.BACKLOG) {
+          g.status = STATUS.BACKLOG;
+          g.autoStatus = false;
+          toBacklog++;
+        }
+        g.updatedAt = Date.now();
+        toSave.push(g);
+      });
+
+      if (toSave.length) await this.saveMany(toSave);
+      return { fixed: fixed, toBacklog: toBacklog };
     },
 
     /**

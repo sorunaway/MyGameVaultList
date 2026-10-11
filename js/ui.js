@@ -39,7 +39,16 @@
     //    在筛选里明示个数（`filterToggles` 那个开关），同步完也会在状态行提一句在哪儿开。
     hideFamily: true,
     filterOpen: false,      // 总库筛选选项是否展开（纯界面状态，不持久化）
-    groupPerfect: false,    // 「已通关」区：是否按全成就/非全成就分两段
+    // 「已通关」区的分组方式：'none' / 'perfect'（全成就两段）/ 'year'（年表）。
+    // 🔴 **三态互斥**，不是三个独立开关 —— 两个分组维度同时开会变成"年份 → 全成就"
+    //    两层嵌套，段头堆两层反而看不清。
+    // 🔴 默认 'year'：这一区的用法本来就是"按年回顾通关了什么"，进来就该看见年代线。
+    groupMode: 'year',
+    // 年表里被折叠起来的年份（{ 2025: true }）。
+    // ⚠️ **只在内存里**（与 filterOpen 同口径）：折叠是"临时想少看一段"的动作。
+    //    存下来的话，重启后那一年整段不见，而"我的通关记录少了一年"是最难
+    //    往"上次点过折叠"上想的一类问题。
+    collapsedYears: {},
     selectMode: false,      // 批量选择模式（暂停区里清理"不想再玩了"用）
     selected: {},           // 已选中的游戏 id（当 Set 用：{ id: true }）
     noteTargetId: null,
@@ -97,7 +106,7 @@
     filterBadge: $('#filterBadge'),
     filterPanel: $('#filterPanel'),
     sortSeg:     $('#sortSeg'),
-    groupPerfectBtn: $('#groupPerfectBtn'),
+    groupSeg:    $('#groupSeg'),
     selectModeBtn:   $('#selectModeBtn'),
     selbar:      $('#selbar'),
     selbarCount: $('#selbarCount'),
@@ -142,6 +151,8 @@
     syncFileHint:$('#syncFileHint'),
     syncFileEm:  $('#syncFileEm'),
     syncStatus:  $('#syncStatus'),
+    syncStatusText:$('#syncStatusText'),
+    syncLive:    $('#syncLive'),
     syncDiff:    $('#syncDiff'),
     syncLocalSec:$('#syncLocalSec'),
     syncLocalInfo:$('#syncLocalInfo'),
@@ -332,7 +343,7 @@
   /**
    * 生成网格 HTML。支持两种分组，可同时生效：
    *  - 总表（我的游戏单）：游戏在前，工具/软件排底部独立一段
-   *  - 已通关区：按 全成就 / 未全成就 分两段
+   *  - 已通关区：按 年份（年表，默认）/ 全成就 分段
    */
   function gridHtml(list, cardOpts) {
     // --- 总库：游戏 / 工具软件 分段 ---
@@ -356,23 +367,313 @@
       return html;
     }
 
-    // --- 已通关区：全成就 / 未全成就 分段 ---
-    if (state.groupPerfect && state.view === S.COMPLETED) {
-      const perfect = list.filter(g => DS.isPerfect(g));
-      const rest = list.filter(g => !DS.isPerfect(g));
-      let html = '';
-      if (perfect.length) {
-        html += groupHeadHtml('🏆', '全成就', perfect.length, 'gh-perfect');
-        html += perfect.map(g => cardHtml(g, cardOpts)).join('');
+    // --- 已通关区：年表（默认）/ 全成就 分段 ---
+    if (state.view === S.COMPLETED) {
+      if (state.groupMode === 'year') return yearGridHtml(list, cardOpts);
+      if (state.groupMode === 'perfect') {
+        const perfect = list.filter(g => DS.isPerfect(g));
+        const rest = list.filter(g => !DS.isPerfect(g));
+        let html = '';
+        if (perfect.length) {
+          html += groupHeadHtml('🏆', '全成就', perfect.length, 'gh-perfect');
+          html += perfect.map(g => cardHtml(g, cardOpts)).join('');
+        }
+        if (rest.length) {
+          html += groupHeadHtml('◈', '未全成就', rest.length, 'gh-rest');
+          html += rest.map(g => cardHtml(g, cardOpts)).join('');
+        }
+        return html;
       }
-      if (rest.length) {
-        html += groupHeadHtml('◈', '未全成就', rest.length, 'gh-rest');
-        html += rest.map(g => cardHtml(g, cardOpts)).join('');
-      }
-      return html;
     }
 
     return list.map(g => cardHtml(g, cardOpts)).join('');
+  }
+
+  /**
+   * 年表：按**通关年份**分段，段头可点击收起/展开（像「我的电脑」里那几组）。
+   *
+   * 拖放落点是**整段**（含卡片区），不只那条段头 —— 见 `bindYearDrop` / `yearDropTarget`。
+   *
+   * 段序：年份**降序**（今年在最上面），「年份未定」永远排最后。
+   *
+   * ⚠️ 段内顺序 = **当前排序按钮**（默认「最近游玩」）。分组与排序是两个维度，
+   *    这样「年份 + 名称」也能用（当年鉴目录一页页翻）。
+   *    🔴 代价是"全局最近游玩的最前那款不一定在第一屏" —— 它落在自己那一年里。
+   *    这正是年表要的效果，不是 bug。
+   */
+  function yearGridHtml(list, cardOpts) {
+    const buckets = new Map();      // year(number) -> games[]；键 `null` = 年份未定
+    list.forEach(g => {
+      const y = DS.doneYearOf(g);
+      const k = (y == null) ? null : y;
+      if (!buckets.has(k)) buckets.set(k, []);
+      buckets.get(k).push(g);
+    });
+
+    let html = '';
+    [...buckets.keys()]
+      .filter(k => k != null)
+      .sort((a, b) => b - a)
+      .forEach(y => { html += yearSectionHtml(y, buckets.get(y), cardOpts); });
+    // 「年份未定」垫底：它是个待办清单（等你拖到某年），放最上面会挡住主角
+    if (buckets.has(null)) html += yearSectionHtml(null, buckets.get(null), cardOpts);
+    return html;
+  }
+
+  /**
+   * 一个年份段：段头（可点收起/展开）+ 卡片。**整段都是拖放落点**。
+   * 收起的段**整个不渲染卡片**（不是靠 CSS 藏）—— 段一多时 DOM 小得多，
+   * 也让"收起来了"与"真的没有货"在 DOM 上就分得开。
+   */
+  function yearSectionHtml(year, games, cardOpts) {
+    const unknowny = (year == null);
+    const collapsed = !unknowny && !!state.collapsedYears[year];
+    const label = unknowny ? '年份未定' : (year + ' 年');
+    return (
+      '<button type="button" class="grouphead gh-year' + (unknowny ? ' gh-year-unknown' : '') +
+        '" data-year="' + (unknowny ? 'unknown' : year) + '"' +
+        ' aria-expanded="' + (collapsed ? 'false' : 'true') + '"' +
+        ' title="' + esc(unknowny
+          ? '这些游戏还没有通关年份 —— 把卡片拖到某一年那一块里即可归入'
+          : '点一下收起 / 展开这一年的游戏；也可以把卡片拖到这一块里，把它改到 ' + year + ' 年') + '">' +
+        '<span class="gh-caret">▾</span>' +
+        '<span class="gh-label">' + esc(label) + '</span>' +
+        '<span class="gh-count">' + games.length + ' 款</span>' +
+      '</button>' +
+      (collapsed ? '' : games.map(g => cardHtml(g, cardOpts)).join(''))
+    );
+  }
+
+  /**
+   * 年表段头：点击收起 / 展开。
+   *
+   * 🔴 **必须在每次 render 里重新挂**，不能放进 bindEvents —— segment 的按钮是
+   *    index.html 里的静态节点（挂一次就够），而这些段头是 `innerHTML` 生成的，
+   *    一重绘就换了一批新元素（和下面"绑定卡片点击"是同一个道理）。
+   *
+   * 折叠后重绘走 `render()`，不是局部替换 —— 段头要显示款数、还要和筛选/排序
+   * 联动，局部替换等于把同一份逻辑写两遍（迟早分叉）。
+   *
+   * ⚠️ 拖放**不在这里**：落点挂在 `el.grid` 上（见 `bindYearDrop`），因为用户不会去
+   *    瞄准那条 28px 的细段头 —— 落在这一年的卡片区也该算数。
+   */
+  function bindYearHeads() {
+    if (state.view !== S.COMPLETED || state.groupMode !== 'year') return;
+
+    el.grid.querySelectorAll('.gh-year').forEach(head => {
+      const raw = head.dataset.year;
+      const year = raw === 'unknown' ? null : Number(raw);
+      head.addEventListener('click', () => {
+        if (year == null) return;                     // 「年份未定」段不折叠
+        if (state.collapsedYears[year]) delete state.collapsedYears[year];
+        else state.collapsedYears[year] = true;
+        render();
+      });
+    });
+
+    // 卡片可拖：**只在年表里开**。别的视图没有落点 —— 让它拖得起来却放不下，
+    // 只会让人以为"拖一下能改状态"（那是拖放另一套语义，本项目没做）。
+    el.grid.querySelectorAll('.card').forEach(c => {
+      c.draggable = true;
+      c.addEventListener('dragstart', (e) => {
+        if (e.dataTransfer) {
+          e.dataTransfer.setData('text/plain', c.dataset.id);
+          e.dataTransfer.effectAllowed = 'move';
+        }
+        c.classList.add('dragging');
+      });
+      c.addEventListener('dragend', () => c.classList.remove('dragging'));
+    });
+  }
+
+  /**
+   * 按指针 Y 找目标年份段头：取 `top <= clientY` 的**最后一个**。
+   * 段头按 DOM 顺序自上而下排，所以碰到第一个不满足的就能停。
+   * 指针在第一个段头之上（grid 顶部那点 padding）→ 算第一段，不是"无目标"。
+   *
+   * 🔴 为什么按 Y 现算、而不是"指针压在哪张卡上"：卡片是拖动的**源**，
+   *    用户想表达的是"放到哪一年那一块"，不是"放到哪张卡上"。
+   *    也正是因此落点不能只认段头 —— 卡片区占了这一段的 95% 面积。
+   */
+  function yearDropTarget(clientY) {
+    const heads = [...el.grid.querySelectorAll('.gh-year')];
+    if (!heads.length) return null;
+    let hit = null;
+    for (const h of heads) {
+      if (h.getBoundingClientRect().top <= clientY + 2) hit = h;
+      else break;
+    }
+    return hit || heads[0];
+  }
+
+  function clearYearHover() {
+    el.grid.querySelectorAll('.gh-year.dragover')
+          .forEach(h => h.classList.remove('dragover'));
+  }
+
+  /* ── 拖动时的边缘自动滚动（2026-09-30）──────────────────────────────────
+     要解决的问题：卡片在很长的年表中间，用户想把卡片放到**视口外**的年份段，
+     可鼠标左键正捏着卡片，没法往下翻页 —— 上面的段头够不着。
+
+     根因：HTML5 自定义拖动，Chromium **不会**帮你滚内部滚动容器。
+     实测（`_probe_autoscroll.py`，真 exe / WebView2，指针贴边**停住不动** 3 秒）：
+       · 底边 / 顶边各停 3 秒，`.content` 的 scrollTop 恒为 0 → 默认一点都不滚；
+       · 同一时刻 requestAnimationFrame 照跑 60fps（+180 帧 / 3 秒）→ 拿它驱动循环；
+       · wheel 事件在拖动会话里**收不到**（计数恒 0）→ 滚轮那条路指望不上。
+
+     🔴 关键：`dragover` **只在指针移动时**触发。用户"捏住不动"时一个事件都没有，
+        所以循环必须**自己**按最后记住的坐标持续滚，不能等事件来推。
+   */
+
+  const AS_ZONE = 72;   // 感应带高度（px）：指针进到离边缘这么近就开始滚
+  const AS_MAX  = 22;   // 贴边时每帧滚多少（px）→ 60fps ≈ 1320px/s
+
+  /**
+   * 本帧该滚多少像素：**纯函数**（负 = 向上滚、0 = 不滚），不碰 DOM。
+   * 带内线性渐变：越贴边滚得越快；指针跑到容器外时按最近那一侧满速。
+   * 抽成纯函数是为了让 `_t_year.html` 能直接断言这几档，不必真去拖一次。
+   */
+  function autoScrollStep(clientY, box) {
+    if (!box) return 0;
+    const dTop = clientY - box.top;          // 距上边（指针在容器上方时为负）
+    const dBot = box.bottom - clientY;       // 距下边
+    if (dTop < AS_ZONE && dTop <= dBot) {
+      return -Math.ceil(AS_MAX * Math.min(1, (AS_ZONE - dTop) / AS_ZONE));
+    }
+    if (dBot < AS_ZONE) {
+      return Math.ceil(AS_MAX * Math.min(1, (AS_ZONE - dBot) / AS_ZONE));
+    }
+    return 0;
+  }
+
+  /**
+   * 该滚谁：从列表往上找**最近的可滚动祖先**。
+   * 🔴 不能滚 `window` —— 这个应用的滚动容器是 `.content`（flex 布局，body 本身不滚），
+   *    滚 window 会一点反应都没有。也不写死 `.content`：将来布局换成别的容器，
+   *    这里会自动跟着走，不会静默失效。
+   */
+  function scrollHost() {
+    for (let p = el.grid.parentElement; p; p = p.parentElement) {
+      const oy = getComputedStyle(p).overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && p.scrollHeight > p.clientHeight) return p;
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+
+  let asRaf = 0;         // rAF 句柄（0 = 循环没在跑）
+  let asLastY = 0;       // 最后一次 dragover 的 clientY（滚动靠它，不靠事件）
+  let asHost = null;     // 拖动期间固定下来的滚动容器
+  let asRolling = false; // 当前是否真的在滚（只为切那条边缘指示线）
+
+  function setRolling(on) {
+    if (on === asRolling) return;            // 只在**变化时**动 class，免得每帧抖布局
+    asRolling = on;
+    const box = el.grid.closest('.content');
+    if (box) box.classList.toggle('autoscrolling', on);
+  }
+
+  function asTick() {
+    if (!asHost) { asRaf = 0; return; }
+    const r = asHost.getBoundingClientRect();
+    const dy = autoScrollStep(asLastY, { top: r.top, bottom: r.bottom });
+    setRolling(!!dy);
+    if (dy) {
+      const before = asHost.scrollTop;
+      asHost.scrollTop = before + dy;
+      // 🔴 滚动**不产生 dragover**：指针没动、页面在滚，高亮不会自己跟过来。
+      //    不主动重算，高亮就会死盯在原来那一段上，看着像"落点没跟着走"。
+      if (asHost.scrollTop !== before) refreshYearHover();
+    }
+    asRaf = requestAnimationFrame(asTick);
+  }
+
+  function asStart(y) {
+    asLastY = y;
+    if (asRaf) return;                       // 已在跑：更新坐标就够了
+    asHost = scrollHost();
+    asRaf = requestAnimationFrame(asTick);
+  }
+
+  function asStop() {
+    if (asRaf) { cancelAnimationFrame(asRaf); asRaf = 0; }
+    asHost = null;
+    setRolling(false);
+  }
+
+  /** 按"最近一次指针坐标"重算落点高亮（事件里、自动滚动之后，都用它）。 */
+  function refreshYearHover() {
+    const hit = yearDropTarget(asLastY);
+    el.grid.querySelectorAll('.gh-year.dragover').forEach(h => {
+      if (h !== hit) h.classList.remove('dragover');
+    });
+    if (hit) hit.classList.add('dragover');
+  }
+
+  // 外露给测试页 / 探针（仿 `GVCoverFit` 那个先例）：纯函数可以直接断言，
+  // 不必真去拖一次 —— 「拖动」是这项目最难在无头环境里复现的动作。
+  window.GVAutoScroll = {
+    zone: AS_ZONE, max: AS_MAX, step: autoScrollStep,
+    host: scrollHost, running: () => !!asRaf,
+  };
+
+  /**
+   * 年表拖放落点：**整段**（不是那条细段头），而且监听挂在 `document` 上。
+   *
+   * 🔴 为什么不是挂在 `el.grid`（2026-09-30 改）：
+   *    · 落点要覆盖**整个可视区域** —— 用户拖到内容区顶上那条、或页面最底下那片留白
+   *      松手，都该算数。`yearDropTarget` 会把"比第一个段头还高"的位置算成第一段，
+   *      正好就是"拖到最上面 = 归到最近那一年"的直觉。
+   *    · 自动滚动要靠 `dragover` 读指针坐标，而指针移到列表外那圈留白时，
+   *      `el.grid` 上收不到事件 → 滚动会当场断掉。
+   *    兜底：非年表视图、或拖进来的不是本页卡片，两边都 return，不会有副作用。
+   *
+   * 三个刻意的细节：
+   *   · `dragover` 必须 `preventDefault()`，否则浏览器根本不认为这里是落点，
+   *     `drop` 一次都不会触发（拖放里最经典的那个"没反应"）。
+   *   · 高亮只留一个：每轮都清掉别的段头（段头多时不会留下一串残影）。
+   *   · 收尾绑 `dragend`，**不用 `dragleave`**：拖动被 Esc 取消、拖到窗口外松手、
+   *     正常 drop，三种结束方式都会走 `dragend`，一处收得住；而 `dragleave` 会在
+   *     指针从某个子元素缝隙滑过时乱清高亮，反而闪。
+   */
+  function bindYearDrop() {
+    const inYearView = () =>
+      state.view === S.COMPLETED && state.groupMode === 'year';
+
+    // 捕获阶段：先把落点身份定下来（preventDefault 之后浏览器才认这里有 drop）
+    document.addEventListener('dragover', (e) => {
+      if (!inYearView() || !e.dataTransfer) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      asLastY = e.clientY;
+      asStart(e.clientY);                    // 指针贴着上下边缘时开始持续滚
+      refreshYearHover();
+    }, true);
+
+    document.addEventListener('drop', async (e) => {
+      if (!inYearView()) return;
+      e.preventDefault();
+      asLastY = e.clientY;                   // 松手位置才算落点：最后一次 dragover 可能在别处
+      const hit = yearDropTarget(asLastY);
+      asStop();
+      clearYearHover();
+      if (!hit) return;
+      const id = e.dataTransfer ? e.dataTransfer.getData('text/plain') : '';
+      const g = (state.games || []).find(x => x.id === id);
+      if (!g) return;                    // 拖的不是本页的卡（例如从外面拖个文件进来）
+      const raw = hit.dataset.year;
+      const year = raw === 'unknown' ? null : Number(raw);
+      const y = (year == null) ? DS.DONE_UNKNOWN : year;
+      if (!DS.setDoneYear(g, y)) return;
+      g.updatedAt = Date.now();
+      await DS.save(g);
+      await reload();
+      render();
+      note('「' + g.title + '」已归到' + (year == null ? '「年份未定」' : ' ' + year + ' 年'),
+           year == null ? 'warn' : 'ok');
+    });
+
+    // 收尾：drop 之后、Esc 取消、拖出窗口 —— 全走 dragend
+    document.addEventListener('dragend', () => { asStop(); clearYearHover(); });
   }
 
   function gamesInView() {
@@ -752,9 +1053,11 @@
   //    就掉进「已通关」这类次级区块里，反而更难回到主界面。
   const UI_KEY = 'gv_ui_v1';
 
-  /** 会被记住的选项 —— 与下面 `filterToggles()` 一一对应，外加减少了排序与全成就分组 */
-  const UI_BOOL_KEYS = ['hideTools', 'hideCompleted', 'hideAbandoned', 'hideFamily',
-                        'groupPerfect'];
+  /** 会被记住的选项 —— 与下面 `filterToggles()` 一一对应，外加记下了排序与分组方式 */
+  const UI_BOOL_KEYS = ['hideTools', 'hideCompleted', 'hideAbandoned', 'hideFamily'];
+
+  /** 「已通关」区分组方式的白名单（和排序一样必须校验：存档可能是旧版本写的） */
+  const GROUP_MODES = ['none', 'perfect', 'year'];
 
   function loadUiPrefs() {
     let saved = null;
@@ -778,11 +1081,16 @@
     // 排序要落在白名单里：旧版本可能存过一个后来被删掉的排序键，
     // 直接用会让 `sortGames` 走进没有分支的 default（列表顺序会变得莫名其妙）。
     if (SORTS.indexOf(saved.sort) >= 0) state.sort = saved.sort;
+    // 分组方式：白名单 + **旧存档兼容**。老版本存的是布尔 `groupPerfect`，
+    // 见到它按「全成就」认 —— 少了这一句，升级后这一项会静默掉回默认值，
+    // 而症状是"我明明选过全成就分组，它自己变成别的了"。
+    if (GROUP_MODES.indexOf(saved.groupMode) >= 0) state.groupMode = saved.groupMode;
+    else if (saved.groupPerfect === true) state.groupMode = 'perfect';
     return true;
   }
 
   function saveUiPrefs() {
-    const snap = { sort: state.sort };
+    const snap = { sort: state.sort, groupMode: state.groupMode };
     UI_BOOL_KEYS.forEach(k => { snap[k] = !!state[k]; });
     try { window.localStorage.setItem(UI_KEY, JSON.stringify(snap)); }
     catch (e) { /* 存不下就算了 —— 界面开关丢了不影响任何数据 */ }
@@ -995,6 +1303,14 @@
     // 比例对不上的由 GVCoverFit 挂 pad 类铺模糊底（见 js/coverfit.js）
     const img = g.header
       ? '<img src="' + esc(g.header) + '" alt="" loading="lazy" ' +
+        // 🔴 必须显式 `draggable="false"`：`<img>` 默认就是可拖的，而卡片约 90% 的面积
+        //    被封面占着 → 用户按在封面上下手时，浏览器把**图片**当拖动源（起的是"拖图片"）。
+        //    Chromium 里卡片的 `dragstart` 靠冒泡勉强还能到，看着像能用；
+        //    **WebView2（桌面版 exe）里图片拖动被宿主接管，页内拖动会话当场断掉** ——
+        //    从封面起拖只有 `dragstart@IMG` 一条，之后没有 dragover、没有 drop，
+        //    用户看到的就是"拖动功能没实现"（实测见 `_probe_drag.py`）。
+        //    ⚠️ 代价：封面不能再拖到桌面另存 —— 这个库不需要那个手势。
+        'draggable="false" ' +
         'onload="GVCoverFit.apply(this)" ' +
         // 🔴 加载失败时**只换掉这个 img 自己**（`this.outerHTML=`），**绝不能**写
         //    `this.parentNode.innerHTML=` —— `parentNode` 是 `.card-media`，那一下会把
@@ -1153,12 +1469,13 @@
         : ((pNow ? pNow.label : '') + ' 还没有数据源，暂时不能同步');
     }
 
-    // 分组开关：只在「已通关」区出现（其他地方分组没意义）
-    if (el.groupPerfectBtn) {
+    // 分组方式：只在「已通关」区出现（其他地方分组没意义）
+    if (el.groupSeg) {
       const canGroup = state.view === S.COMPLETED;
-      el.groupPerfectBtn.hidden = !canGroup;
-      el.groupPerfectBtn.classList.toggle('on', canGroup && state.groupPerfect);
-      el.groupPerfectBtn.textContent = state.groupPerfect ? '分组：全成就 ✓' : '分组：全成就';
+      el.groupSeg.hidden = !canGroup;
+      el.groupSeg.querySelectorAll('button').forEach(b => {
+        b.classList.toggle('on', canGroup && b.dataset.group === state.groupMode);
+      });
     }
 
     // 批量选择入口：只在「暂停区」出现
@@ -1179,6 +1496,9 @@
         openDrawer(c.dataset.id);
       });
     });
+
+    // 年表：段头点击 = 收起/展开（拖放落点不在这儿，见 bindYearDrop）
+    bindYearHeads();
 
     // 绑定快捷收藏
     el.grid.querySelectorAll('.card-quick').forEach(btn => {
@@ -1505,6 +1825,25 @@
         (g.statusLocked ? '🔒 状态已锁定' : '🔓 锁定状态') +
       '</button>';
 
+    // 通关年份 —— **只有「已通关」的款才有这一行**。
+    //   · 它就是年表分段的依据（见 store.js 的 touchDoneAt）；
+    //   · 拖放只在桌面端好使（触屏上 HTML5 拖放根本不触发），这里是**全平台**都能用的
+    //     入口，也是"给某一款精确定年"的地方；
+    //   · 清空 / 点「未定」= 落进「年份未定」段（拖回未定也是这个效果）。
+    const doneY = DS.doneYearOf(g);
+    const doneYearHtml = (g.status === S.COMPLETED)
+      ? ('<div class="d-doneyear">' +
+           '<span>通关年份</span>' +
+           '<input type="number" id="doneYearInput" inputmode="numeric" ' +
+                  'min="1970" max="2200" step="1" placeholder="未定" ' +
+                  'value="' + (doneY == null ? '' : doneY) + '">' +
+           '<button class="btn btn-ghost" id="doneYearNow">今年</button>' +
+           '<button class="btn btn-ghost" id="doneYearClear">未定</button>' +
+         '</div>' +
+         '<div class="d-autoexplain">「已通关」区按这个年份分段。改完按回车（或点到别处）生效；' +
+         '留空 = 落在「年份未定」段。</div>')
+      : '';
+
     // 自动归类的解释行
     let autoExplain = '';
     if (g.statusLocked) {
@@ -1527,8 +1866,10 @@
 
     return '' +
       '<div class="d-hero">' +
+        // 详情页大图同一个坑：`<img>` 默认可拖，不写这一行按在大图上拖动会拖走图片
         (g.header
-          ? '<img src="' + esc(g.header) + '" alt="" onload="GVCoverFit.apply(this)">'
+          ? '<img src="' + esc(g.header) + '" alt="" draggable="false" ' +
+            'onload="GVCoverFit.apply(this)">'
           : '') +
         '<div class="d-hero-title"><h2>' + esc(g.title) + '</h2></div>' +
       '</div>' +
@@ -1539,6 +1880,7 @@
         '</div>' +
         (autoExplain ? '<div class="d-autoexplain">' + esc(autoExplain) + '</div>' : '') +
         '<div class="d-lockrow">' + lockHtml + '</div>' +
+        doneYearHtml +
         perfectHtml +
         '<div class="d-stats">' + statsHtml + '</div>' +
         (lastRel ? '<div style="font-size:12px;color:var(--text-faint);margin:-9px 0 15px">最后启动：' +
@@ -1566,6 +1908,12 @@
         //（用户手动改完又启动过 -> lastPlayedTs 更新 -> 自动归类重新接管）
         g.statusManualAt = Math.floor(Date.now() / 1000);
         g.autoStatus = false;           // 手动设定后就不再是"自动归类"的产物
+        // 手动标「已通关」→ 顺手把通关年份定在**此刻**（"归入的那一刻"）。
+        // ⚠️ `touchDoneAt` 只在没有年份时才写：这一款以前通关过、被挪出去又挪回来，
+        //    年份保持原样 —— 需求原话是"非初次归入已通关，就不再自动检测归类年表"。
+        if (st === DS.STATUS.COMPLETED) {
+          DS.touchDoneAt(g, Math.floor(Date.now() / 1000));
+        }
         // 若它本来靠收藏夹（默认「已完结」）自动进了已通关，而用户手动挪走，
         // 记下迟滞标记：之后同步不再把它拉回已通关（除非 Steam 里移出该分类再重新加入）
         if (st !== DS.STATUS.COMPLETED && DS.inCompletedCollection(g)) {
@@ -1591,6 +1939,28 @@
         openDrawer(g.id);
       });
     }
+
+    // 通关年份：输入框（回车 / 失焦生效）+「今年」+「未定」三个入口，
+    // 全部落到同一个 `DS.setDoneYear`。改完重开抽屉 —— 年份是年表的分段依据，
+    // 不重绘的话抽屉上还是旧值，用户会以为没生效。
+    const setYearAndRedraw = async (year) => {
+      if (!DS.setDoneYear(g, year)) return;
+      g.updatedAt = Date.now();
+      await DS.save(g);
+      await reload();
+      openDrawer(g.id);
+    };
+    const yIn = el.drawerBody.querySelector('#doneYearInput');
+    if (yIn) {
+      yIn.addEventListener('change', () => {
+        const v = String(yIn.value || '').trim();
+        setYearAndRedraw(v === '' ? DS.DONE_UNKNOWN : Number(v));
+      });
+    }
+    const yNow = el.drawerBody.querySelector('#doneYearNow');
+    if (yNow) yNow.addEventListener('click', () => setYearAndRedraw(new Date().getFullYear()));
+    const yClear = el.drawerBody.querySelector('#doneYearClear');
+    if (yClear) yClear.addEventListener('click', () => setYearAndRedraw(DS.DONE_UNKNOWN));
 
     // 编辑记录
     const editBtn = el.drawerBody.querySelector('#editNoteBtn');
@@ -1920,9 +2290,10 @@
     el.syncFile.value = '';
     state.syncPayload = null;
     el.syncApply.disabled = true;
-    el.syncDiff.innerHTML = '';
 
-    if (state.desktop) {
+    const act = syncOpenAction(state.desktop, syncProg.running);
+
+    if (act !== 'file') {
       el.syncLocalSec.hidden = false;
       el.syncApply.hidden = true;      // 桌面版同步即刻生效，没有"待应用"这一步
       // 文件入口在桌面版是「导入备份」用的 —— 标签上也别再说"由 scripts/sync 生成"，
@@ -1930,8 +2301,25 @@
       el.syncFileEm.textContent = '（换机器时导入用）';
       el.syncFileHint.innerHTML =
         '换机器时用它导入以前备份的 JSON —— 导出入口在「设置 → 数据备份」。';
-      setSyncStatus('正在读取本机 Steam…', '');
       el.syncMask.hidden = false;
+      renderSyncLocalInfo();       // 先填「本机目录 / 账号 / Key」那几行，别闪一下空白
+      if (act === 'resume') {
+        // 🔴 同步**正在后台跑** —— 这里一个字都不许复位。
+        //    原来那两行是无条件执行的：清明细 + 状态行写回「正在读取本机 Steam…」。
+        //    于是"关掉再打开"看到的是**空明细 + 停在第一步**，而它其实早跑到第 ③ 步
+        //    甚至跑完了 —— 用户 2026-10-10 报的"关闭界面同步就中断了"就是这么来的
+        //    （其实没中断，是进度写在面板 DOM 里、跟面板一起被清掉了）。
+        //    现在进度在 `syncProg` 里，重开 = 把它摆回来；也**不再重复触发**一轮同步
+        //    （`syncDesktop` 开头有 syncBusy 闸，重复调用本来只会空转，
+        //     但显式分流更能说明意图）。
+        renderSyncProgress();
+        return;
+      }
+      // 'fresh'：不在跑 → 新一轮从空明细开始（原来那两行的正确位置）。
+      syncProg.rows = [];
+      syncProg.status = '正在准备同步…';
+      syncProg.statusCls = '';
+      renderSyncProgress();
       syncDesktop();                   // 故意不 await：面板先显示出来，别让点击看起来没反应
       return;
     }
@@ -1942,16 +2330,100 @@
     el.syncFileHint.innerHTML =
       '在项目目录运行 <code>python scripts/sync.py</code>，会生成 ' +
       '<code>data/steam_sync.json</code>，然后在这里选它载入。';
+    // 非桌面版（双击 index.html）走"选文件"这条路，进度不进 syncProg ——
+    // 但明细区要先清掉，免得残留上一次桌面版同步的行。
+    syncProg.rows = [];
+    renderSyncRows();
     setSyncStatus('选择一个由 scripts/sync 生成的 JSON 文件。', '');
     el.syncMask.hidden = false;
   }
 
-  function closeSyncModal() { el.syncMask.hidden = true; }
+  /**
+   * 打开同步面板该走哪条路 —— **纯函数**，三档都能直接断言（`_t_sync.html`）。
+   * 抽出来是因为中间那一档（`resume`）是本轮修复的核心语义：
+   * "正在跑 → 重开只摆回进度，不复位、不重跑"，而它很容易被后人改回无条件复位。
+   */
+  function syncOpenAction(desktop, running) {
+    if (!desktop) return 'file';       // 非桌面版：只能选文件
+    return running ? 'resume' : 'fresh';
+  }
+
+  function closeSyncModal() {
+    const wasRunning = syncProg.running;
+    el.syncMask.hidden = true;
+    // 关掉面板**不会**中断同步（进度在 syncProg 里、那条 await 链还在跑），
+    // 但界面上看不出来 —— 所以在关的这一下明说一句。
+    // ⚠️ 用 `silent`：这是"进度类提示，弹完就没意义"，不该占一条消息记录
+    //    （不然每次关面板都给用户加一个未读角标，而它说的不是结果）。
+    if (wasRunning) {
+      note('同步还在后台跑 —— 关掉这个窗口不会中断，跑完的结果会记进「消息」。', 'info', true);
+    }
+  }
+
+  /**
+   * 同步进度 —— **面板只是它的一个视图**（2026-10-10）。
+   *
+   * 🔴 为什么要有这个对象：原来进度**只写在面板 DOM 里**（状态行 + 明细行的
+   *    `innerHTML`），而 `openSyncModal()` 每次打开都无条件清明细、把状态行写回第一步
+   *    → 用户"关掉界面"再打开，看到的是空白明细 + 停在第一步，于是判定
+   *    "关闭这个界面，同步就中断了"（2026-10-10 反馈）。
+   *    实际那条 `await` 链一直在跑、数据照样写库 —— **"看起来断了" ≠ 真的断了**。
+   *    现在进度存这里，面板开关与它无关；重开面板 = 重新渲染它。
+   *
+   * `running` 同时是**三个可见指示**的唯一开关（面板里的转圈与「正在同步中…」行、
+   * 顶栏「同步」图标的转动）—— 用户提的"点了同步看不出来"就靠它。
+   */
+  let syncProg = { running: false, status: '', statusCls: '', rows: [] };
+
+  /** 状态行 + "正在跑"的可见指示。改文字/开关指示都走这里，别各处手动拼 className。 */
+  function renderSyncStatusLine() {
+    el.syncStatus.className = 'sync-status' + (syncProg.statusCls ? ' ' + syncProg.statusCls : '')
+      + (syncProg.running ? ' running' : '');
+    el.syncStatusText.textContent = syncProg.status;
+    el.syncLive.hidden = !syncProg.running;
+    // 顶栏按钮：面板关着（甚至没开过）时，那是**唯一**还看得见"正在跑"的位置。
+    // 只加类名、不新增按钮 —— 顶栏按钮清单被 _t_wipe.html 的 F1b 钉死。
+    el.btnSync.classList.toggle('is-syncing', syncProg.running);
+    el.btnSync.setAttribute('aria-busy', syncProg.running ? 'true' : 'false');
+    // 「重新同步」按钮跟着置灰（原来由 syncDesktop 自己管，收口到这里就不会漏）
+    el.syncLocalBtn.disabled = syncProg.running;
+  }
+
+  /** 明细行。单独一个函数：明细是"边攒边显示"的，状态行却每步都在变。 */
+  function renderSyncRows() {
+    el.syncDiff.innerHTML = syncProg.rows.map((row) =>
+      '<div class="dl"><span>' + esc(row[0]) + '</span><b>' + esc(row[1]) + '</b></div>'
+    ).join('');
+  }
+
+  /** 面板打开时把当前进度整体摆回去。 */
+  function renderSyncProgress() {
+    renderSyncStatusLine();
+    renderSyncRows();
+  }
 
   function setSyncStatus(text, cls) {
-    el.syncStatus.className = 'sync-status' + (cls ? ' ' + cls : '');
-    el.syncStatus.textContent = text;
+    syncProg.status = text;
+    syncProg.statusCls = cls || '';
+    renderSyncStatusLine();
   }
+
+  // 外露给回归页 / 探针（仿 `GVAutoScroll` 与 `GVCoverFit` 的先例）。
+  // 为什么需要：**桌面版那条路在无头浏览器里进不去**（`state.desktop` 由
+  // `/api/local/status` 探测决定，双击版恒为 false），而本轮修的正是桌面版的
+  // 「关面板不停同步 / 重开不复位 / 三个运行指示」。纯函数照旧直接断言，
+  // 渲染三件套则用 `setRunning` 驱动 —— 只有**真的调 ui.js 的实现**才算数，
+  // 测试页自己 `classList.add('running')` 只能验 CSS（那是 `_t_synclayout.html` 的活）。
+  window.GVSyncProg = {
+    action: syncOpenAction,
+    state: () => syncProg,
+    running: () => !!syncProg.running,
+    setRunning: (on) => { syncProg.running = !!on; renderSyncStatusLine(); },
+    setStatus: setSyncStatus,
+    render: renderSyncProgress,
+    open: openSyncModal,
+    close: closeSyncModal,
+  };
 
   let syncBusy = false;
 
@@ -2201,10 +2673,30 @@
   async function syncDesktop() {
     if (syncBusy) return;                 // 面板能连点，别叠起来跑
     syncBusy = true;
-    el.syncLocalBtn.disabled = true;
+    // 先把"正在跑"的指示亮起来（转圈 + 「正在同步中…」行 + 顶栏图标）
+    // —— 用户 2026-10-10 提的"点了同步看不出来"就是这里：原来只有一行会变的文字。
+    syncProg.running = true;
+    renderSyncStatusLine();
     renderSyncLocalInfo();
 
-    const rows = [];
+    // 明细行**边攒边显示**：把 push 收口成**唯一写入点**，push 一次就重绘一次。
+    // ⚠️ 为什么不在每个步骤后面手动调 `renderSyncRows()`：下面有十几个
+    //    `rows.push(...)` 调用点，漏掉任何一个那一行就**永远不显示**，而且以后
+    //    新增同步步骤还会继续漏（本周目已经出现过三次"能力写好了、某条路没接上"
+    //    的静默缺陷）。收口在这里，谁 push 都算数。
+    const rows = (function () {
+      const a = [];
+      a.push = function () {
+        const n = Array.prototype.push.apply(a, arguments);
+        syncProg.rows = a;
+        renderSyncRows();
+        return n;
+      };
+      return a;
+    })();
+    syncProg.rows = rows;
+    renderSyncRows();
+
     let localOk = false;
     let localBad = '';
     let newIds = [];
@@ -2231,6 +2723,11 @@
     let wishIds = [];
     let achOk = false, achBad = '', achReason = '';
     let achAsked = 0, achGot = 0, achLeft = 0, achRecollected = 0, achSkipped = false;
+    // ②.6 修回「被错标成已拥有的愿望单款」用的**权威集合**：①② 各自交上来的
+    // 全量 appid（账号侧 / 本机）。两个都拿不到就整条跳过 —— 半个集合会修错。
+    // （声明位置同上：收尾文案是在 `try/finally` **之后**读它们的。）
+    let localIds = null, onlineIds = null;
+    let fixFixed = 0, fixBack = 0;
 
     try {
       // ---- ① 本机（永远做）----
@@ -2239,6 +2736,8 @@
       try { r = await window.GVLocal.sync(); } catch (e) { r = null; }
       if (r && r.ok) {
         localOk = true;
+        // 本机读到的全量 appid —— ②.6 修回那一步的权威集合之一
+        if (r.appids && r.appids.length) localIds = r.appids;
         const st = r.stats || {};
         rows.push(['本机 Steam', (r.total || 0) + ' 款（辅助：收藏夹 / 本地封面 / 联网列不到的款）']);
         rows.push(['已安装 / 有名字 / 有封面 / 有时长',
@@ -2276,6 +2775,8 @@
         if (o && o.ok) {
           onlineOk = true;
           onlineTotal = o.total || 0;
+          // 账号侧全量 appid —— ②.6 修回那一步的另一个权威集合
+          if (o.appids && o.appids.length) onlineIds = o.appids;
           rows.push(['Steam 账号全量（联网·主）',
                      (o.total || 0) + ' 款（新增 ' + (o.added || 0) + '）']);
           if (o.newIds && o.newIds.length) newIds = o.newIds;
@@ -2350,6 +2851,37 @@
                  w.howToFix.map((s, i) => (i + 1) + '. ' + s).join('\n'),
                  wishReason === 'steam_key_rejected' ? 'err' : 'warn');
           }
+        }
+      }
+
+      // ---- ②.6 修回「被错标成已拥有」的愿望单款（一次性数据修复）----
+      //
+      // 🔴 见 `store.js` 的 `reclassifyWishlistOnly`。起因（2026-10-10 用户实测投诉）：
+      //    补资料那条路（`fillMeta`）以前是借 `mergeSteam` 写回的，而那个函数对已存在
+      //    的记录会**无条件** `old.source = 'steam'`（只保护 family）→ 愿望单里的款被
+      //    "转正"，角标变成「已拥有」。而愿望单接口**不给名字**，于是它们恰好是
+      //    `fillMeta` 补得最凶的一批（每次同步 240 个额度、每次启动再 45 个）。
+      //
+      //    源头已经在 2026-10-10 改成 `mergeMeta` 堵住了，但**库里已经被写坏的那批
+      //    不会自己长回来**（实测有一批被标错，其中一部分还从
+      //    「待游玩」掉进了「我的游戏单」）。所以每次同步收尾顺手纠正一遍。
+      //
+      // 位置：紧跟 ②.5 —— 那样 `wishlisted` 标记是刚写进去的、最新鲜的。
+      //
+      // 🔴 前提：①② 两半都得把权威集合交上来。**任缺一半就整条跳过** ——
+      //    只用"账号侧拥有"会误修本机玩过的（家庭共享那类），
+      //    只用"本机读到的"会误修买了没装过的。宁可不修，不可修错。
+      //    （`fix*` 那两个变量的声明在函数顶部 —— 理由见那里的注释。）
+      if (window.DataStore && window.DataStore.reclassifyWishlistOnly && localIds && onlineIds) {
+        try {
+          const fx = await window.DataStore.reclassifyWishlistOnly(
+            { ownedIds: onlineIds, localIds: localIds });
+          if (fx) { fixFixed = fx.fixed || 0; fixBack = fx.toBacklog || 0; }
+        } catch (e) { console.warn('修回愿望单来源失败（不影响本次同步）', e); }
+        if (fixFixed) {
+          rows.push(['修回被误标的愿望单款',
+            fixFixed + ' 款改回「未入库」' +
+            (fixBack ? '（其中 ' + fixBack + ' 款放回「待游玩」）' : '')]);
         }
       }
 
@@ -2493,12 +3025,17 @@
       setSyncStatus('同步出错：' + ((err && err.message) || err), 'err');
     } finally {
       syncBusy = false;
-      el.syncLocalBtn.disabled = false;
+      // 🔴 指示必须在这里落回"没在跑"，并且**当场重绘一次**：
+      //    收尾那几句 `setSyncStatus` 在 `try/finally` **之后**，
+      //    万一它中间抛了（比如 `reload()` 失败），不在这里关的话转圈会永远转下去
+      //    —— 而那条链是 async 且没有调用方 catch，异常被静默吞掉。
+      syncProg.running = false;
+      renderSyncStatusLine();
     }
 
-    el.syncDiff.innerHTML = rows.map((row) =>
-      '<div class="dl"><span>' + esc(row[0]) + '</span><b>' + esc(row[1]) + '</b></div>'
-    ).join('');
+    // 明细已经在每次 push 时就渲染过了；这里再摆一次是为了**顺序收尾**
+    // （万一以后有人不用 push 直接改数组，这行兜住）。
+    renderSyncRows();
 
     // 任一半成功都要刷新界面 —— **只成功联网那半时同样得刷**（换台机器、
     // 本机没装 Steam 就是这种情形：全量库照样拿得到）。③ 同理。
@@ -2584,6 +3121,14 @@
       // 几款游戏突然从「正在游玩」跳到「已通关」，不说一声他会以为归类坏了。
       if (achRecollected > 0) {
         note(achRecollected + ' 款拿了全成就，已自动归档到「已通关」。', 'ok');
+      }
+
+      // 被错标成「已拥有」的愿望单款修回来了 —— 这是一次性的数据订正，
+      // 用户当初就是为此来反馈的，所以要说一声（下次同步这个数就是 0，不再打扰）。
+      if (fixFixed > 0) {
+        note('有 ' + fixFixed + ' 款游戏还在你的愿望单里、你并没有买，' +
+             '（之前被错标成了「已拥有」，已改回「未入库」）' +
+             (fixBack ? '；其中 ' + fixBack + ' 款一并放回了「待游玩」。' : '。'), 'ok');
       }
 
       // 联网新进来的款本机没有封面，愿望单刚进来的**连名字都没有** ——
@@ -3438,8 +3983,10 @@
    * 本地版原来只有弹窗里的状态文字和 alert，没有统一的提示通道；
    * 走同一个模块之后，本地版和云端版的消息都落在同一份历史里。
    */
-  function note(msg, lv) {
-    if (window.GVLog) GVLog.toast(msg, null, lv);
+  function note(msg, lv, silent) {
+    // silent = 只弹不记历史：**进度类**提示（"同步还在后台跑…"）弹完就没意义，
+    // 记进去只会给用户多一个未读角标，而它说的不是结果。
+    if (window.GVLog) GVLog.toast(msg, null, lv, silent ? { silent: true } : undefined);
   }
 
   // ===== 数据加载 =====
@@ -3449,6 +3996,10 @@
 
   // ===== 事件绑定 =====
   function bindEvents() {
+    // 年表拖放：落点挂在 grid 上（**整段**都能落），所以只绑一次就够 ——
+    // 段头每轮 render 都是新元素，绑它们身上就得每轮重挂（见 bindYearDrop 的注释）。
+    bindYearDrop();
+
     // 总库筛选：点按钮展开/收起选项；点面板外、或按 Esc 收起
     if (el.filterBtn) {
       el.filterBtn.addEventListener('click', () => {
@@ -3473,12 +4024,14 @@
       });
     });
 
-    // 已通关区：全成就分组开关
-    if (el.groupPerfectBtn) {
-      el.groupPerfectBtn.addEventListener('click', () => {
-        state.groupPerfect = !state.groupPerfect;
-        saveUiPrefs();
-        render();
+    // 已通关区：分组方式（不分组 / 全成就 / 年份 —— 三态互斥）
+    if (el.groupSeg) {
+      el.groupSeg.querySelectorAll('button').forEach(b => {
+        b.addEventListener('click', () => {
+          state.groupMode = b.dataset.group;
+          saveUiPrefs();
+          render();
+        });
       });
     }
 
@@ -3683,6 +4236,15 @@
     // 探测结果本身就是一份 `/api/local/status`，直接留给设置面板用（省一次请求）
     desktopStatus = desktopMode ? desktop : null;
 
+    // ---- 同步进度的**初始态**也要从状态模型写回 DOM（2026-10-10）----
+    // 🔴 原来 `renderSyncStatusLine()` 只在「同步跑起来 / 收尾」时被调 —— 于是首屏
+    //    顶栏的 `aria-busy` **根本不存在**（`getAttribute('aria-busy')` 回 null），
+    //    打包后 E6 抓到了这个（`busy=None ≠ 'false'`）。
+    // ⚠️ 修法**不是在 index.html 里补一份 `aria-busy="false"` 当默认值** —— 那是第二份
+    //    真相，改了模型不改它就开始漂。这里一次性从 `syncProg` 铺出去，之后由
+    //    `setRunning` / `finally` 维持。
+    renderSyncStatusLine();
+
     // ---- 先恢复上次存下的界面选项，再让 URL 参数覆盖 ----
     // 🔴 顺序不能反：URL 参数是"这一次打开就要这样"的明确指令
     //    （也是自动化验收的唯一入口），必须优先于存档值。
@@ -3712,8 +4274,12 @@
       const qs = sp.get('sort');
       if (qs && SORTS.indexOf(qs) >= 0) state.sort = qs;
 
-      // ?group=1 —— 「已通关」区按全成就分组
-      if (sp.get('group') === '1') state.groupPerfect = true;
+      // ?group=year|perfect|none —— 「已通关」区分组方式。
+      // ⚠️ `1` 是旧写法（当时只有"全成就"这一个分组），保留兼容：
+      //    书签和旧的验收脚本都还带着它，改掉就等于让它们静默落到默认值上。
+      const qg = sp.get('group');
+      if (qg === '1' || qg === 'perfect') state.groupMode = 'perfect';
+      else if (GROUP_MODES.indexOf(qg) >= 0) state.groupMode = qg;
 
       // ?hidetools=1 / ?hidedone=1 / ?hidedrop=1 —— 总库的三个过滤开关
       if (sp.get('hidetools') === '1') state.hideTools = true;
@@ -3778,6 +4344,20 @@
     }
 
     await reload();
+
+    // 通关年份一次性回填（实现见 store.js 的 backfillDoneAt）。
+    // 🔴 必须放在**首屏渲染之前** —— 晚一步的话用户第一眼看到的年表会缺一截，
+    //    而再刷新一次又对了（"一会儿有一会儿没有"，是最没人愿意信的一类现象）。
+    // 幂等：第二次启动一条都不会写（判据见 touchDoneAt 的"已定格就跳过"）。
+    try {
+      const bf = await DS.backfillDoneAt();
+      if (bf && bf.filled) {
+        note('已为 ' + bf.filled + ' 款「已通关」推定通关年份' +
+             (bf.unknown
+               ? '（其中 ' + bf.unknown + ' 款没有可用的游玩时间，落在「年份未定」段，可拖到对应年份）'
+               : '') + '。', 'ok');
+      }
+    } catch (e) { console.warn('通关年份回填失败', e); }
 
     if (initialView) {
       // 用户明确指定了区块（或已收藏该链接）——即使为空也尊重

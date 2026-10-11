@@ -198,6 +198,10 @@
     return {
       ok: true,
       total: records.length,
+      // `appids` = 这次读到的**本机库全量 appid**，给「修回被错标的愿望单款」当
+      // 权威集合用（见 store.js `reclassifyWishlistOnly`）。本地文件读得到 =
+      // 这台机器上确实有它 —— 光凭愿望单身份不够，所以这一半也少不得。
+      appids: records.map(function (r) { return r.appid; }),
       account: data.account || null,
       stats: data.stats || {},
       added: res.added, updated: res.updated,
@@ -302,6 +306,15 @@
       if (fetched[k]) return;                  // 问过了
       var g = byId[k];
       if (!g) return;                          // 不在库里的不问
+      // 🔴 **别的平台不问。** `/api/steam/store` 查的是 Steam 商店，它给的答案只对
+      //    默认平台那条记录有效。不挡的话有**两个**后果，都在 2026-10-10 实测到：
+      //      ① `mergeMeta` 按 (平台, appid) 定位 → EPIC 记录天然落不进来（这一半已由
+      //         那边兜住）；② 但**这一层还在白问**：为一个 EPIC 的 appid 去问 Steam 商店，
+      //         白耗一批额度（`META_BATCH` 15 个名额里被占掉）。
+      //    真正的重复卡是改动前的 `mergeSteam` 造的（它按裸 appid 在**默认平台**索引里找，
+      //    EPIC 记录不在索引里 → 当成新记录又建一条），这里一并把它堵死。
+      var P = window.GVPlatforms;
+      if (P && P.of(g) !== P.DEFAULT_ID) return;
       // 🔴 「名字和封面都有就跳过」这条守卫**不能拿掉** —— 它是给全库几百款省请求的
       //    （每次启动补一批，没有它每轮都会为整个库重发请求）。
       //
@@ -366,7 +379,14 @@
       });
 
       if (recs.length) {
-        try { await window.DataStore.mergeSteam(recs); }
+        // 🔴🔴 **必须走 `mergeMeta`，绝不许退回 `mergeSteam`。**
+        //    这条路径只知道"这款在商店里叫什么、哪年出的"，**一点拥有凭证都没有**；
+        //    而 `mergeSteam` 对已存在的记录会无条件 `old.source = 'steam'`
+        //    （只保护 family）→ 愿望单里的款会被顺手"转正"成「已拥有」。
+        //    2026-10-10 用户实测投诉的就是这个：库里多出一批假「已拥有」，
+        //    全部来自这里（愿望单接口不给名字 → 它们正是本函数补得最凶的一批）。
+        //    细节见 store.js `mergeMeta` 的说明。
+        try { await window.DataStore.mergeMeta(recs); }
         catch (e) { console.warn('写回商店信息失败（进度照记）', e); }
       }
       writeFetched(fetched);   // 每批都落盘：中途关掉也不丢进度
@@ -465,6 +485,9 @@
       ok: true,
       total: recs.length,
       newIds: newIds,
+      // `appids` = 这次账号侧全量库的 appid（**权威**的"我确实买了"名单）。
+      // 给「修回被错标的愿望单款」用 —— 见 store.js `reclassifyWishlistOnly`。
+      appids: recs.map(function (r) { return r.appid; }),
       added: res.added, updated: res.updated,
       recollected: res.recollected, locked: res.locked, abandoned: res.abandoned,
       stale: !!d.stale,

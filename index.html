@@ -107,8 +107,15 @@
         </button>
       </div>
       <div class="viewhead-right">
-        <button class="ghosttoggle" id="groupPerfectBtn" hidden
-                title="按是否全成就分成两段显示">分组：全成就</button>
+        <!-- 「已通关」区的分组方式（三态互斥）：年份 = 年表（默认）。
+             排序按钮不动 —— 分组与排序是两个维度，年份段内的顺序仍跟着排序走。
+             原来这里只有一个「分组：全成就」开关，扩成三态是因为再加一个独立开关，
+             两个分组维度同时开就变成"年份 → 全成就"两层嵌套。 -->
+        <div class="segmented" id="groupSeg" hidden>
+          <button data-group="none">不分组</button>
+          <button data-group="perfect">全成就</button>
+          <button data-group="year" class="on">年份</button>
+        </div>
         <button class="ghosttoggle" id="selectModeBtn" hidden
                 title="进入批量选择，一次把多款游戏移入放弃区">批量选择</button>
         <div class="segmented" id="sortSeg">
@@ -228,7 +235,20 @@
       </button>
     </div>
     <div class="modal-body">
-      <div class="sync-status" id="syncStatus"></div>
+      <!-- 状态行：会变的**步骤**文字（"正在读取本机 Steam…"→"正在问 Steam 要全量库…"…）。
+           转圈只在 `.running` 时出现 —— 用户 2026-10-10 反馈"点了同步其实已经在跑，
+           但看不出来"：原来只有这一行会变的字，静止时和跑完没有区别。
+           ⚠️ 文字必须包一层 span：`setSyncStatus` 改的是它的 textContent，
+           直接写状态行的 textContent 会把转圈那个元素抹掉。 -->
+      <div class="sync-status" id="syncStatus">
+        <span class="sync-spin" aria-hidden="true"></span>
+        <span class="sync-status-txt" id="syncStatusText"></span>
+      </div>
+      <!-- 「正在同步中」那一行：**跑的时候才出现**，文案不变。
+           顺带回答同一个疑问的另一半 —— 关掉这个窗口到底会不会中断同步。 -->
+      <div class="sync-live" id="syncLive" hidden>
+        正在同步中…　可以关掉这个窗口，同步会在后台继续跑完
+      </div>
       <div class="sync-diff" id="syncDiff"></div>
 
       <!-- ===== 桌面版主路径：一键同步本机 =====
