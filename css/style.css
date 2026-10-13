@@ -1335,6 +1335,30 @@ svg.ico.wipe-ico, .wipe-title .ico { width: 16px; height: 16px; }
 .field input::placeholder, .field textarea::placeholder { color: var(--text-faint); }
 .field select option { background: var(--bg-elev); }
 
+/* ===== 字段级报错态：收藏夹名重复（2026-10-13）=====
+   红框 = "这两个（或几个）格子里填了同一个收藏夹，不能保存"；
+   小黄三角 + 一行字 = 同一件事的解释（`.field-warn`，文字由 JS 填）。
+
+   🔴 红框**必须连 `:focus` 一起写**：不然用户点进那个框准备改的时候，
+     上面 `input:focus { border-color: var(--accent) }` 会把它变回黄边 ——
+     看起来像"错误已经没了"，其实还在。 */
+.field.is-dup input,
+.field.is-dup input:focus { border-color: #f85149; }
+
+.field-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  /* 黄 = 这套主题里 "warn" 的既有语义（`.set-status.is-warn` 也是它）；
+     红留给"不能保存"这个更重的意思（输入框边框）。 */
+  color: var(--accent);
+}
+.field-warn .ico { width: 14px; height: 14px; margin-top: 1px; }
+.field-warn span { min-width: 0; overflow-wrap: anywhere; }
+
 /* ======================================================================
    手动添加 · 商店搜索候选（#mSuggest）
    ----------------------------------------------------------------------

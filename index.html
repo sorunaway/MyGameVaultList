@@ -305,24 +305,88 @@
       <p class="set-hint">
         Steam 收藏夹是<b>你自己在 Steam 里建的</b>，名字随心。
         这里告诉应用：<b>哪个收藏夹代表什么</b>。
-        留空或恢复默认时为「已完结」/「已隐藏」（Steam 自带的那两个）。
+        留空或恢复默认时为「已完结」/「待游玩」/「已放弃」/「已隐藏」
+        （这四个默认名里<b>只有「已隐藏」是 Steam 自带的</b>，其余三个都是我们起的名字，
+        不一定和你的习惯一致 —— 改成你自己的即可）。
       </p>
 
       <label class="field">
         <span>归入「已通关」的收藏夹 <em>（可填多个，用逗号隔开）</em></span>
         <input id="setCompleted" type="text" list="setCollList"
                placeholder="已完结" autocomplete="off">
+        <!-- 重名警告位（2026-10-13 新增，逻辑在 ui.js 的 validateCollectionFields）。
+             ⚠️ 放在 <label> 内部是为了紧贴它那个输入框，间距直接用 .field 的 gap 6px ——
+             和上面那排商店候选（.sg-list）同一个路数。默认 hidden，由 JS 开关：
+             框里出现**与其它格重名**的收藏夹时，输入框变红 + 这行亮起小黄三角。
+             文字由 JS 填（要带上重名的那几个收藏夹名，静态写不了）。 -->
+        <p class="field-warn" id="setCompletedWarn" hidden>
+          <svg viewBox="0 0 24 24" class="ico"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01"/></svg>
+          <span></span>
+        </p>
       </label>
+      <p class="set-hint">
+        此收藏夹内的游戏会<b>自动归档到「已通关」列表</b>。
+      </p>
+
+      <!-- 「待游玩」= 想玩但还没开始。⚠️ 它**只对从没启动过的款生效**（行为层面）：
+           放在「正在游玩」/「暂停区」的判断之后，所以一款你在玩的游戏被拖进
+           这个收藏夹也不会被拽出「正在游玩」。
+           ⚠️ 界面上按用户要求只留「自动归档到「待游玩」列表」一句 ——
+           上面那层细节（只接没启动过的）**不再写在界面上**；
+           代码行为一个字没变，**别照着界面文案去改 suggestStatus**。 -->
+      <label class="field">
+        <span>归入「待游玩」的收藏夹 <em>（可填多个，用逗号隔开）</em></span>
+        <input id="setBacklog" type="text" list="setCollList"
+               placeholder="待游玩" autocomplete="off">
+        <p class="field-warn" id="setBacklogWarn" hidden>
+          <svg viewBox="0 0 24 24" class="ico"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01"/></svg>
+          <span></span>
+        </p>
+      </label>
+      <p class="set-hint">
+        此收藏夹内的游戏会<b>自动归档到「待游玩」列表</b>。
+      </p>
+
+      <!-- 「已放弃」= 不打算再玩了。⚠️ 它跟「待游玩」正好**相反**（行为层面）：
+           不看玩没玩过、多久没碰 —— 收藏夹里写着就是放弃。
+           ⚠️ 界面上按用户要求只留「不打算再玩 + 移出即放回」一句 ——
+           上面那层对照关系**不再写在界面上**；
+           代码行为一个字没变，**别照着界面文案去改 suggestStatus**。 -->
+      <label class="field">
+        <span>视为「已放弃」的收藏夹 <em>（可填多个，用逗号隔开）</em></span>
+        <input id="setAbandoned" type="text" list="setCollList"
+               placeholder="已放弃" autocomplete="off">
+        <p class="field-warn" id="setAbandonedWarn" hidden>
+          <svg viewBox="0 0 24 24" class="ico"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01"/></svg>
+          <span></span>
+        </p>
+      </label>
+      <p class="set-hint">
+        此收藏夹表示玩家<b>不打算再继续玩</b>的游戏，会自动同步至「放弃区」；
+        如果某游戏从「已放弃」收藏夹内移出，下次同步就会自动归类到其他区列表
+        （手动在程序内放入放弃区的不变）。
+      </p>
 
       <label class="field">
         <span>视为「已隐藏」的收藏夹 <em>（可填多个，用逗号隔开）</em></span>
         <input id="setHidden" type="text" list="setCollList"
                placeholder="已隐藏" autocomplete="off">
+        <p class="field-warn" id="setHiddenWarn" hidden>
+          <svg viewBox="0 0 24 24" class="ico"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01"/></svg>
+          <span></span>
+        </p>
       </label>
+      <p class="set-hint">
+        程序会<b>忽略</b>「已隐藏」收藏夹里的游戏与工具 —— 它们不参与任何状态归类，
+        也不会出现在各个区块和统计里（想找它们，在总库勾上「显示非游戏」）。
+      </p>
       <datalist id="setCollList"></datalist>
 
       <div class="set-colls" id="setColls" hidden></div>
-      <div class="set-hint">改完点保存，已同步的数据会当场重算一遍归类。</div>
+      <div class="set-hint">
+        改完点保存，已同步的数据会当场重算一遍归类。
+        上面这些收藏夹名点一下就填进<b>当前光标所在的输入框</b>。
+      </div>
 
       <!-- ===== 桌面版专属：Steam 装在哪 =====
            只在前端探测到「我在桌面版里」时才显示（#setSteamSec.hidden 由 ui.js 控制）——

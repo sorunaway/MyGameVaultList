@@ -165,8 +165,15 @@
     setClose:    $('#setClose'),
     setSave:     $('#setSave'),
     setReset:    $('#setReset'),
-    setCompleted:$('#setCompleted'),
-    setHidden:   $('#setHidden'),
+    setCompleted: $('#setCompleted'),
+    setBacklog:   $('#setBacklog'),
+    setAbandoned: $('#setAbandoned'),
+    setHidden:    $('#setHidden'),
+    // 四格各自的重名警告位（见 validateCollectionFields）
+    setCompletedWarn: $('#setCompletedWarn'),
+    setBacklogWarn:   $('#setBacklogWarn'),
+    setAbandonedWarn: $('#setAbandonedWarn'),
+    setHiddenWarn:    $('#setHiddenWarn'),
     setCollList: $('#setCollList'),
     setColls:    $('#setColls'),
 
@@ -1236,7 +1243,12 @@
     if (g.statusLocked) {
       autoFlag = '<span class="cflag cflag-lock" title="状态已锁定，不参与自动归类">🔒 锁定</span>';
     } else if (g.status === S.ABANDONED) {
-      autoFlag = '<span class="cflag cflag-drop" title="已放弃：手动终态，同步时不会被改动">🗑️ 已放弃</span>';
+      // 放弃区现在有**两个**入口，角标得说实话 —— 说成"手动终态"会让
+      // 自动进来的那批用户以为只能手动挪（其实是把款移出收藏夹就会放回去）
+      const dropTip = g.abandonedBy === 'collection'
+        ? '已放弃：来自「已放弃」收藏夹 —— 把这游戏移出那个收藏夹，下次同步就会自动放回去'
+        : '已放弃：手动标记的终态，同步时不会被改动';
+      autoFlag = '<span class="cflag cflag-drop" title="' + esc(dropTip) + '">🗑️ 已放弃</span>';
     } else if (g.autoStatus && (g.status === S.PLAYING || g.status === S.PAUSED)) {
       const d = DS.daysSincePlayed(g);
       const tip = d >= 0
@@ -1512,6 +1524,7 @@
         g.manualStatus = g.status;
         g.statusManualAt = Math.floor(Date.now() / 1000);
         g.autoStatus = false;
+        syncAbandonMarks(g, g.status);   // 同上，放弃区那两个标记也要跟着走
         // 从「已通关」被挪走时同样记迟滞标记，避免下次同步被拉回
         if (toBacklog && DS.inCompletedCollection(g)) g.dismissedCollection = true;
         g.updatedAt = Date.now();
@@ -1582,6 +1595,29 @@
     render();
   }
 
+  /**
+   * 用户手动改了状态之后，把「放弃区」的两个来源标记同步好。
+   *
+   * 🔴 这两个标记是「自动放进放弃区的款能不能出来」的**唯一**依据，
+   *    三处手动入口（卡片快捷按钮 / 详情面板状态按钮 / 暂停区批量移入）
+   *    **每一处都得调**。漏一处就出一个静默毛病：要么"挪走了下次同步又被塞
+   *    回去"，要么"永远卡在放弃区，把它移出收藏夹也放不出来"—— 两者都不报错。
+   *
+   * @param {object} g        记录（就地改）
+   * @param {string} toStatus 用户手动改成的状态
+   */
+  function syncAbandonMarks(g, toStatus) {
+    // 手动结果永远不是"收藏夹自动放进去的"。清掉它，这一款就按**手动**语义走：
+    // 改回放弃区 = 真终态；改成别的状态 = 不再被自动规则拽回去（见下面那半）。
+    g.abandonedBy = '';
+    // 靠「已放弃」收藏夹自动进来的款，用户手动挪走 -> 记下迟滞标记：
+    // 只要款还留在那个收藏夹里，同步就不再把它塞回去。
+    // （把款移出收藏夹再放回来 = 标记作废，重新自动生效）
+    if (toStatus !== S.ABANDONED && DS.inAbandonedCollection(g)) {
+      g.abandonDismissed = true;
+    }
+  }
+
   /** 把选中的游戏批量移入「放弃区」 */
   async function dropSelected() {
     const ids = Object.keys(state.selected);
@@ -1599,6 +1635,8 @@
       g.manualStatus = S.ABANDONED;
       g.statusManualAt = now;
       g.autoStatus = false;
+      // 这一条是**手动**挪进去的 -> 真终态（不会因为收藏夹变动被放出来）
+      syncAbandonMarks(g, S.ABANDONED);
       g.updatedAt = Date.now();
       touched.push(g);
     });
@@ -1621,7 +1659,9 @@
    *
    * ⚠️ 「正在游玩 / 暂停区」的自动归类**依赖 `lastPlayed`**：没有它的平台上
    *    "会自动出现在这里"不是"暂时没有"，是**永远不会**。所以换一句真话。
-   * ⚠️ 「放弃区」那句不用换 —— 它走的是**状态**（手动挪进去），任何平台都成立。
+   * ⚠️ 「放弃区」那句的**前半**（手动挪进来）任何平台都成立；2026-10-13 起它多了
+   *    一个**自动**入口（「已放弃」收藏夹 → 放弃区），那半只有拿得到收藏夹的
+   *    平台才有 —— 所以那句按能力分了两版。
    */
   function emptyHintFor(st) {
     const p = PF.get(state.platform) || {};
@@ -1650,7 +1690,13 @@
           ? '全成就、或收藏夹（默认「已完结」，可在「设置」里改）里的游戏会自动进来，也可以手动标记「已通关」。'
           : '这个平台既拿不到成就、也没有收藏夹 —— 点开卡片手动标记「已通关」。';
       case S.ABANDONED:
-        return '这里是主动否掉的游戏。在「暂停区」点「批量选择」，或点开卡片改状态，都能把它挪进来。';
+        // 2026-10-13 起放弃区多了一个**自动**入口（「已放弃」收藏夹）。那半只有
+        // 拿得到收藏夹的平台才有，所以跟着 `achievements` 一起判 ——
+        // 和上面「已通关」那条同样的口径（两边都是"收藏夹 + 成就"这一组能力）。
+        return caps('achievements')
+          ? '这里是主动否掉的游戏。在「暂停区」点「批量选择」、点开卡片改状态，' +
+            '或者把游戏放进「已放弃」收藏夹（默认名，可在「设置」里改），都能让它落到这里。'
+          : '这里是主动否掉的游戏。在「暂停区」点「批量选择」，或点开卡片改状态，都能把它挪进来。';
       default:
         return nothingToDo
           ? '这个平台暂时还没有可用的数据来源。'
@@ -1951,8 +1997,12 @@
     if (g.statusLocked) {
       autoExplain = '状态已锁定，同步时不会参与自动归类（「已通关」也不重算）。';
     } else if (g.status === S.ABANDONED) {
-      autoExplain = '已放弃：这是手动终态，同步时不会被启动日期或收藏夹改动。' +
-                    '想重新捡起来，点上面的状态按钮挪走即可。';
+      // 两个入口的"怎么出来"完全不同，说错了用户会白折腾
+      autoExplain = g.abandonedBy === 'collection'
+        ? '已放弃：它现在在「已放弃」收藏夹里 —— 把这游戏移出那个收藏夹，' +
+          '下次同步就会自动放它回按日期归类的区块。也可以直接点上面的状态按钮。'
+        : '已放弃：手动标记的终态，同步时不会被启动日期或收藏夹改动。' +
+          '想重新捡起来，点上面的状态按钮挪走即可。';
     } else if (DS.isStale(g)) {
       autoExplain = '距上次启动已 ' + Math.floor(DS.daysSincePlayed(g)) +
                     ' 天 —— 如果确定不会再玩了，可以把它移入「放弃区」。';
@@ -2010,6 +2060,8 @@
         //（用户手动改完又启动过 -> lastPlayedTs 更新 -> 自动归类重新接管）
         g.statusManualAt = Math.floor(Date.now() / 1000);
         g.autoStatus = false;           // 手动设定后就不再是"自动归类"的产物
+        // 「放弃区」的来源标记跟着手动结果走（见 syncAbandonMarks）
+        syncAbandonMarks(g, st);
         // 手动标「已通关」→ 顺手把通关年份定在**此刻**（"归入的那一刻"）。
         // ⚠️ `touchDoneAt` 只在没有年份时才写：这一款以前通关过、被挪出去又挪回来，
         //    年份保持原样 —— 需求原话是"非初次归入已通关，就不再自动检测归类年表"。
@@ -3583,8 +3635,13 @@
   async function openSettings() {
     const p = DS.getPrefs();
     el.setCompleted.value = p.completedCollections.join('，');
+    el.setBacklog.value   = p.backlogCollections.join('，');
+    el.setAbandoned.value = p.abandonedCollections.join('，');
     el.setHidden.value    = p.hiddenCollections.join('，');
     renderCollectionCandidates();
+    // 每次打开都重算一次：上一次留下的红框 / 小黄三角不该带进这一次
+    // （数据里的偏好本身可能就是你上次没能保存成功的那个冲突态）
+    validateCollectionFields();
 
     // ⚠️ 顺序：先让面板亮出来，再去问服务端。
     //    反过来（await 完再显示）在网络慢时会表现为"点了设置没反应"。
@@ -3666,7 +3723,7 @@
     // 想清干净的人以为没清干净，怕误删的人以为连账号一起删了。
     el.wipeKeep.innerHTML =
       '不会动：<code>Steam 账号与 API Key</code>、<code>Steam 安装目录</code>、' +
-      '「哪个收藏夹算已通关」的设置、消息记录 —— 这些要单独在上面几节里改。<br>' +
+      '「哪个收藏夹算什么」的设置、消息记录 —— 这些要单独在上面几节里改。<br>' +
       '手滑了的话：上面「数据备份 → 从文件导入」可以把之前导出的 JSON 导回来。';
 
     resetWipeAck();
@@ -4080,6 +4137,28 @@
     }).catch(e => console.warn('后台补全商店信息失败（不影响使用）', e));
   }
 
+  // 那排圆片（"你在 Steam 里的收藏夹"）点一下要填进**哪一格** ——
+  // 跟着"最后聚焦过的那个输入框"走，默认「已通关」。
+  // ⚠️ 默认值刻意保持不变：老用户不动焦点、直接点圆片，行为和以前一模一样；
+  //    想填别的格就先点一下那一格的光标位置。
+  const COLL_CHIP_LABELS = { completed: '已通关', backlog: '待游玩',
+                             abandoned: '已放弃', hidden: '已隐藏' };
+  let collChipTarget = 'completed';
+
+  function collFieldInput(kind) {
+    if (kind === 'backlog')   return el.setBacklog;
+    if (kind === 'abandoned') return el.setAbandoned;
+    if (kind === 'hidden')    return el.setHidden;
+    return el.setCompleted;
+  }
+
+  /** 记下"圆片该填给谁"，顺便把圆片那行的说明文字刷新掉（否则用户不知道填哪去了） */
+  function setChipTarget(kind) {
+    if (!COLL_CHIP_LABELS[kind] || kind === collChipTarget) return;
+    collChipTarget = kind;
+    renderCollectionCandidates();
+  }
+
   function renderCollectionCandidates() {
     const names = DS.collectionsInData(state.games);
 
@@ -4093,28 +4172,108 @@
     }
     el.setColls.hidden = false;
     el.setColls.innerHTML =
-      '<span class="set-colls-label">你在 Steam 里的收藏夹：</span>' +
+      '<span class="set-colls-label">你在 Steam 里的收藏夹（点一下填进「' +
+      esc(COLL_CHIP_LABELS[collChipTarget]) + '」）：</span>' +
       names.map(n => '<button type="button" class="set-chip" data-coll="' +
                      esc(n) + '">' + esc(n) + '</button>').join('');
   }
 
-  /** 点一个小圆片 -> 把它加进「归入已通关」那格（要删就在输入框里删） */
+  /** 点一个小圆片 -> 把它加进**当前那一格**（要删就在输入框里删） */
   function onCollectionChipClick(e) {
     const btn = e.target && e.target.closest ? e.target.closest('.set-chip') : null;
     if (!btn) return;
     const name = btn.getAttribute('data-coll') || '';
     if (!name) return;
-    const cur = splitNames(el.setCompleted.value);
+    const box = collFieldInput(collChipTarget);
+    const cur = splitNames(box.value);
     if (cur.indexOf(name) < 0) cur.push(name);
-    el.setCompleted.value = cur.join('，');
-    el.setCompleted.focus();
+    box.value = cur.join('，');
+    // ⚠️ 小圆片是**第二条写入路径**（不是用户敲的）—— 不在这里再校验一次的话，
+    //    点圆片造成的重名会悄悄溜过实时检查，直到点保存才被拦。
+    validateCollectionFields();
+    box.focus();
+  }
+
+  // ===== 四格重名校验（2026-10-13）=====
+  //
+  // 用户：「我尝试了在设置里给每一格都设置了相同的几个文件夹，这个时候程序的归类就乱了」。
+  // 根因：四格之间**没有互斥**。一款游戏同时命中多格时，`suggestStatus` 按优先级
+  // （已隐藏 > 已通关 > 已放弃 > 待游玩）随便挑一个 —— 用户看到的就是"分类乱了"，
+  // 而且**零提示**。
+  //
+  // 这里做两件事，缺一不可：
+  //   ① **边打边测**：打完就红框 + 小黄三角，当场知道自己填重了；
+  //   ② **保存时拦下**：真到点保存那一下再判一次，有重名就**不写偏好、不关面板**。
+  // 只做 ② 的话用户要挨到点保存才知道；只做 ① 的话，哪天多一条写入路径
+  // （比如新加的入口、脚本注入）脏数据照样进得去。
+  //
+  // 🔴 判据**不是**"框里打了什么"，而是 `DS.duplicateCollections` 算出来的
+  //    "保存后真正生效的值"（空框 = 默认名）。理由见 store.js 里那个函数的注释 ——
+  //    一句话：用户清空一格并不等于消掉冲突，默认名还顶在那儿。
+  //    两处（实时 / 保存）**共用同一个函数**，绝不各算一套（会漂）。
+
+  const COLL_FIELDS = ['completed', 'backlog', 'abandoned', 'hidden'];
+
+  function collWarnEl(kind) {
+    return { completed: el.setCompletedWarn, backlog: el.setBacklogWarn,
+             abandoned: el.setAbandonedWarn, hidden: el.setHiddenWarn }[kind];
+  }
+
+  /** 四格当前的值，原样交给 store 判 —— 界面不自己算重名 */
+  function collectionFieldValues() {
+    return {
+      completedCollections: el.setCompleted.value,
+      backlogCollections:   el.setBacklog.value,
+      abandonedCollections: el.setAbandoned.value,
+      hiddenCollections:    el.setHidden.value
+    };
+  }
+
+  /**
+   * 重算重名状态并刷新红框 / 小黄三角。返回 `DS.duplicateCollections` 的结果，
+   * 调用方拿它判"能不能保存"（别自己再算一遍）。
+   */
+  function validateCollectionFields() {
+    const dup = DS.duplicateCollections(collectionFieldValues());
+    COLL_FIELDS.forEach(kind => {
+      const box  = collFieldInput(kind);
+      const warn = collWarnEl(kind);
+      const names = dup[kind] || [];
+      const field = box && box.closest ? box.closest('.field') : null;
+      if (field) field.classList.toggle('is-dup', names.length > 0);
+      if (!warn) return;
+      if (!names.length) { warn.hidden = true; return; }
+      // ⚠️ 留空那一格是"按默认名"命中的，不写清楚用户会盯着一个空框发懵
+      const isBlank = !splitNames(box.value).length;
+      warn.querySelector('span').textContent =
+        '不可用重复收藏夹：' + names.join('、') +
+        (isBlank ? '（本项留空 = 默认名）' : '');
+      warn.hidden = false;
+    });
+    return dup;
+  }
+
+  /** 有重名时把面板滚到第一个出问题的框并聚焦（返回它；没冲突返回 null） */
+  function focusFirstDupField(dup) {
+    const kind = COLL_FIELDS.filter(k => (dup[k] || []).length)[0];
+    if (!kind) return null;
+    const box = collFieldInput(kind);
+    if (!box) return null;
+    // 面板是 .modal-body 在滚（不是 window）→ 交给 scrollIntoView 自己找容器
+    if (box.scrollIntoView) box.scrollIntoView({ block: 'center' });
+    box.focus();
+    return box;
   }
 
   /** 「恢复默认」只把输入框填回出厂值，点保存才真正生效 —— 不做半截应用 */
   function resetSettingsForm() {
     const d = DS.defaultPrefs();
     el.setCompleted.value = d.completedCollections.join('，');
+    el.setBacklog.value   = d.backlogCollections.join('，');
+    el.setAbandoned.value = d.abandonedCollections.join('，');
     el.setHidden.value    = d.hiddenCollections.join('，');
+    // 出厂四格互不重名，这里调一次是为了**抹掉填默认值之前留下的红框**
+    validateCollectionFields();
     note('已填回默认值，点「保存」后生效', 'warn');
   }
 
@@ -4129,6 +4288,26 @@
    * 再重新读一次本机库 —— 换了目录却不重读，用户改完只会看到一模一样的数据。
    */
   async function saveSettings() {
+    // ---- ⓪ 收藏夹重名：**先判，再动任何东西** ----
+    // 排在「Steam 安装目录」之前，是因为重名时**一次保存都不该发生** ——
+    // 包括往 desktop.json 里写目录（那是用户的真实配置，不该被这次失败连累）。
+    // 判据与实时校验走**同一个函数**，不各算一套。
+    const dup = validateCollectionFields();
+    const dupKinds = COLL_FIELDS.filter(k => (dup[k] || []).length);
+    if (dupKinds.length) {
+      // 按收藏夹名归并着报：`「已完结」同时归入已通关、待游玩`
+      const byName = {};
+      dupKinds.forEach(k => (dup[k] || []).forEach(n => {
+        (byName[n] = byName[n] || []).push(COLL_CHIP_LABELS[k]);
+      }));
+      note('不可用重复收藏夹：' +
+           Object.keys(byName).map(n => '「' + n + '」同时归入' + byName[n].join('、'))
+                 .join('；') +
+           ' —— 一个收藏夹只能归一处，改好再保存。', 'err');
+      focusFirstDupField(dup);
+      return;                            // 🔴 不写偏好、不关面板
+    }
+
     // ---- ① Steam 安装目录（仅桌面版；校验通过才落盘）----
     // 比较前先归一化：`D:/Steam`、`D:\Steam\`、`d:\steam` 是同一个目录，
     // 不该因为写法不同就白跑一次保存 + 重新读库。
@@ -4156,6 +4335,8 @@
     // ---- ② 收藏夹偏好 ----
     DS.setPrefs({
       completedCollections: el.setCompleted.value,
+      backlogCollections:   el.setBacklog.value,
+      abandonedCollections: el.setAbandoned.value,
       hiddenCollections:    el.setHidden.value
     });
     closeSettings();
@@ -4335,6 +4516,25 @@
     });
     el.setCompleted.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') saveSettings();
+    });
+    el.setBacklog.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') saveSettings();
+    });
+    el.setAbandoned.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') saveSettings();
+    });
+    el.setHidden.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') saveSettings();
+    });
+    // 圆片填给哪一格，跟着"最后聚焦过的那个输入框"走（默认「已通关」）
+    el.setCompleted.addEventListener('focus', () => setChipTarget('completed'));
+    el.setBacklog.addEventListener('focus',   () => setChipTarget('backlog'));
+    el.setAbandoned.addEventListener('focus', () => setChipTarget('abandoned'));
+    el.setHidden.addEventListener('focus',    () => setChipTarget('hidden'));
+    // 重名实时校验（边打边测）。绑 `input` 而不是 `change`：后者要等失焦才响，
+    // 用户会以为"填完了没事"。见 validateCollectionFields 的注释。
+    [el.setCompleted, el.setBacklog, el.setAbandoned, el.setHidden].forEach((box) => {
+      box.addEventListener('input', () => validateCollectionFields());
     });
 
     // 设置里的「Steam 安装目录」（面板只在桌面版显示，但绑定无条件做 ——

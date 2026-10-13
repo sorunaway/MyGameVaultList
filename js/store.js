@@ -34,14 +34,23 @@
   // ===== Steam 收藏夹 -> 状态含义（名字由用户自己定）=====
   //
   // 收藏夹是每个人在 Steam 里自己建的、名字随心，所以**不能写死**：
-  // 默认只认 Steam 自带的那两个，其余由用户在「设置」里自己填。
+  // 默认那四个名字都是我们起的，其中只有「已隐藏」是 Steam 自带的（「已完结」也得玩家
+  // 自己在 Steam 里建）—— 用户在「设置」里可以随时改成自己习惯的名字。
   // 同步脚本会把收藏夹名原样写进 games[].collections，这里只负责"哪个名字算什么状态"。
   const PREFS_KEY = 'gv_prefs_v1';
 
   const DEFAULT_PREFS = {
-    completedCollections: ['已完结'],   // -> 归入「已通关」
+    completedCollections: ['已完结'],   // -> 归入「已通关」（终态，优先级最高）
+    backlogCollections:   ['待游玩'],   // -> 归入「待游玩」（只接"从没启动过"的款）
+    abandonedCollections: ['已放弃'],   // -> 直接进「放弃区」（**不看**玩没玩过）
     hiddenCollections:    ['已隐藏']    // -> 视为用户主动隐藏（优先级最高）
   };
+
+  // ⚠️ 这四个默认名里**只有「已隐藏」是 Steam 自带的** —— 2026-10-13 用户纠正：
+  //    「已完结」也是玩家自己在 Steam 里建的，不是内置分类（我原来把它也算成
+  //    Steam 自带的，界面上写错了）。用户本机没有对应的收藏夹时它天然不会命中、
+  //    什么也不会发生，所以给默认值是安全的。
+  //    用户本机没有这个收藏夹时它天然不会命中，什么也不会发生，所以给默认值是安全的。
 
   // 旧版本把「归入已通关」的收藏夹硬编码成这一个名字，老用户的数据就带着它。
   // 升级时若在数据里真的见到它，就沿用它，免得老用户整片「已通关」回退。
@@ -64,9 +73,13 @@
     if (prefs) return prefs;
     prefs = {
       completedCollections: DEFAULT_PREFS.completedCollections.slice(),
+      backlogCollections:   DEFAULT_PREFS.backlogCollections.slice(),
+      abandonedCollections: DEFAULT_PREFS.abandonedCollections.slice(),
       hiddenCollections:    DEFAULT_PREFS.hiddenCollections.slice(),
-      // 用户有没有亲手改过这两项 —— 决定要不要做老数据迁移
+      // 用户有没有亲手改过这四项 —— 决定要不要做老数据迁移
       completedTouched: false,
+      backlogTouched:   false,
+      abandonedTouched: false,
       hiddenTouched:    false
     };
     try {
@@ -74,11 +87,17 @@
       const saved = raw ? JSON.parse(raw) : null;
       if (saved && typeof saved === 'object') {
         const c = normalizeNames(saved.completedCollections);
+        const b = normalizeNames(saved.backlogCollections);
+        const a = normalizeNames(saved.abandonedCollections);
         const h = normalizeNames(saved.hiddenCollections);
         // 空列表按"没设过"处理 —— 存成空会让「已通关」永远没人进
         if (c.length) prefs.completedCollections = c;
+        if (b.length) prefs.backlogCollections = b;
+        if (a.length) prefs.abandonedCollections = a;
         if (h.length) prefs.hiddenCollections = h;
         prefs.completedTouched = !!saved.completedTouched;
+        prefs.backlogTouched   = !!saved.backlogTouched;
+        prefs.abandonedTouched = !!saved.abandonedTouched;
         prefs.hiddenTouched    = !!saved.hiddenTouched;
       }
     } catch (e) {
@@ -96,15 +115,19 @@
     const p = readPrefs();
     return {
       completedCollections: p.completedCollections.slice(),
+      backlogCollections:   p.backlogCollections.slice(),
+      abandonedCollections: p.abandonedCollections.slice(),
       hiddenCollections:    p.hiddenCollections.slice(),
       completedTouched:     p.completedTouched,
+      backlogTouched:       p.backlogTouched,
+      abandonedTouched:     p.abandonedTouched,
       hiddenTouched:        p.hiddenTouched
     };
   }
 
   /**
-   * 改偏好。两项都接受「数组」或「逗号分隔的字符串」。
-   * 传空 = 没填 = 保持原值（不存空列表，否则等于把自动归类关掉）。
+   * 改偏好。四项都接受「数组」或「逗号分隔的字符串」。
+   * 传空 = 没填 = 回到默认（不存空列表，否则等于把该条自动归类关掉）。
    */
   function setPrefs(patch) {
     const p = readPrefs();
@@ -112,6 +135,16 @@
       const v = normalizeNames(patch.completedCollections);
       p.completedCollections = v.length ? v : DEFAULT_PREFS.completedCollections.slice();
       p.completedTouched = true;
+    }
+    if (patch && patch.backlogCollections !== undefined) {
+      const v = normalizeNames(patch.backlogCollections);
+      p.backlogCollections = v.length ? v : DEFAULT_PREFS.backlogCollections.slice();
+      p.backlogTouched = true;
+    }
+    if (patch && patch.abandonedCollections !== undefined) {
+      const v = normalizeNames(patch.abandonedCollections);
+      p.abandonedCollections = v.length ? v : DEFAULT_PREFS.abandonedCollections.slice();
+      p.abandonedTouched = true;
     }
     if (patch && patch.hiddenCollections !== undefined) {
       const v = normalizeNames(patch.hiddenCollections);
@@ -126,8 +159,48 @@
   function defaultPrefs() {
     return {
       completedCollections: DEFAULT_PREFS.completedCollections.slice(),
+      backlogCollections:   DEFAULT_PREFS.backlogCollections.slice(),
+      abandonedCollections: DEFAULT_PREFS.abandonedCollections.slice(),
       hiddenCollections:    DEFAULT_PREFS.hiddenCollections.slice()
     };
+  }
+
+  /**
+   * 找出**四格之间**的重名收藏夹 —— 设置面板保存前的唯一判据（2026-10-13 用户提：
+   * 「我尝试了在设置里给每一格都设置了相同的几个文件夹，这个时候程序的归类就乱了」）。
+   *
+   * 返回 `{ completed: [名…], backlog: […], abandoned: […], hidden: […] }`，
+   * 只列**在该格真的触发冲突**的名字（即与其它某一格重名）；四格互不重名时返回 `{}`。
+   *
+   * 🔴 两处刻意的语义，改之前先想清楚：
+   *  1. **按"保存后会真正生效的值"算，空框 = 默认名**。`setPrefs` 对空串的语义是
+   *     "回到默认"（见上面的 `v.length ? v : DEFAULT_PREFS…`），所以用户**清空**一格
+   *     并不等于消掉冲突 —— 他删掉「已隐藏」，默认名「已隐藏」照样在那儿。
+   *     若按"框里打了什么"判，界面会放行一次**看着修好了、实际照旧**的保存。
+   *     代价是空框也可能被判重名 → 界面上的提示必须写清「留空 = 默认名」。
+   *  2. **同一格内写重复不算错** —— `normalizeNames` 本来就会去重（既有行为），
+   *     那不是用户要解决的问题，别在这里拦他。
+   *
+   * 入参可给 `{completedCollections: …}` 或直接给字符串（内部走 `normalizeNames`，
+   * 中英文逗号、顿号都认）。比较用**去空格后精确相等**，与 `inAnyCollection` 的
+   * `indexOf` 是同一把尺子 —— 判据不一致的话，界面说"没冲突"而归类却打架。
+   */
+  function duplicateCollections(vals) {
+    const raw = vals || {};
+    const KINDS = ['completed', 'backlog', 'abandoned', 'hidden'];
+    const eff = {};
+    KINDS.forEach(k => {
+      const given = normalizeNames(raw[k + 'Collections']);
+      // 空 = 没填 = 落到默认名。**与 setPrefs 完全一致**，别在这里另立一套规则。
+      eff[k] = given.length ? given : DEFAULT_PREFS[k + 'Collections'].slice();
+    });
+    const out = {};
+    KINDS.forEach(k => {
+      const dup = eff[k].filter(n =>
+        KINDS.some(o => o !== k && eff[o].indexOf(n) >= 0));
+      if (dup.length) out[k] = dup;
+    });
+    return out;
   }
 
   /** 数据里实际出现过的收藏夹名（给设置面板做候选，省得用户手敲） */
@@ -182,6 +255,40 @@
   /** 该游戏是否在「归入已通关」的收藏夹里（名字以设置里的为准） */
   function inCompletedCollection(game) {
     return inAnyCollection(game, readPrefs().completedCollections);
+  }
+
+  /**
+   * 该游戏是否在「归入待游玩」的收藏夹里（名字以设置里的为准）。
+   *
+   * ⚠️ 这个判断**只在 `suggestStatus` 的第 8 步用**，而且那一步的位置是刻意的：
+   *    它排在"启动日期分流"**之后** → 只有**从没启动过**的款才可能命中。
+   *    也就是说，即使你把一款正在玩的游戏拖进「待游玩」收藏夹，它也不会被
+   *    拽出「正在游玩」—— 那正是这条收藏夹的定义（**想玩但还没开始**）。
+   */
+  function inBacklogCollection(game) {
+    return inAnyCollection(game, readPrefs().backlogCollections);
+  }
+
+  /**
+   * 该游戏是否在「归入已放弃」的收藏夹里（名字以设置里的为准）。
+   *
+   * 🔴 跟「待游玩」那格的关键差别：这一格**不看**玩没玩过、多久没碰 ——
+   *    收藏夹里写着就是放弃。两格的分工就写在名字上：
+   *    「待游玩」= 想玩还没开始，「已放弃」= 不打算玩了。
+   */
+  function inAbandonedCollection(game) {
+    return inAnyCollection(game, readPrefs().abandonedCollections);
+  }
+
+  /**
+   * 该不该由「已放弃」收藏夹把它**自动**放进放弃区。
+   *
+   * ⚠️ `abandonDismissed` 是用户的手动否决：他在款**还留在**收藏夹里的情况下
+   *    手动把它挪出了放弃区 -> 就别再自动塞回去（否则每次都跟用户对着干）。
+   *    把款移出收藏夹再放回来，这个否决作废（见 mergeSteam 末尾那段收口）。
+   */
+  function wantsAbandon(game) {
+    return inAbandonedCollection(game) && !game.abandonDismissed;
   }
 
   /** 该游戏是否在「视为已隐藏」的收藏夹里（用户主动隐藏，优先级最高） */
@@ -504,6 +611,19 @@
       doneAt: 0,
       manualHidden: null,       // 手动设定过隐藏开关；非空则优先于自动判定
       dismissedCollection: false, // 用户主动把它从「已通关」挪走过，不再被收藏夹拉回
+      // ===== 「放弃区」的来源标记（2026-10-13 起：放弃区有**两个**入口）=====
+      //   ''            手动挪进去的 = **手动终态**，和锁定同级，同步一律不动
+      //   'collection'  由「已放弃」收藏夹**自动**放进去的 -> 把款移出那个收藏夹，
+      //                 下次同步就放它回自动规则（否则放弃区会变成死胡同）
+      // 🔴 `abandonedBy !== ''` 精确等于「status === ABANDONED 且在收藏夹里」，
+      //    这个不变量由 mergeSteam 末尾那段收口维护，别在别处另写一份。
+      // ⚠️ 和 doneAt 一样必须在这里给默认值：`makeGame` 是
+      //    `Object.assign(默认值, partial)`，少一行 = 备份导出 → 换机器导入时
+      //    这个标记静默丢失（自动进来的款会被当成手动终态，再也放不出来）。
+      abandonedBy: '',
+      // 用户手动把它从放弃区挪走过（款**还在**「已放弃」收藏夹里）—— 不再自动塞回去。
+      // 与 `dismissedCollection` 同构，同样必须进 makeGame 默认值。
+      abandonDismissed: false,
       hidden: false,            // 是否隐藏（工具/软件默认隐藏）
       // 玩家自己写的评测（从社区页抓的，见 `local-src.js` 的 fetchReview）—— **三态**：
       //   steamReviewAt === 0            从没抓过（详情面板显示「抓取」按钮）
@@ -605,36 +725,60 @@
    *
    * 优先级链（高 -> 低）：
    *   1. 锁定（statusLocked）     —— 在 mergeSteam 里拦截，不在此函数内处理
-   *   2. 放弃区（abandoned）      —— 同上，手动终态，本函数也**永远不返回**它
+   *   2. **手动**挪进的放弃区     —— 同上，手动终态，本函数也**永远不返回**它
    *   3. 「归入已通关」的收藏夹 —— 只要在这分类里，就是已通关（归档，不看日期）
    *                                （具体是哪个分类名，看用户的设置）
    *   4. 全成就                   —— 同上，已通关是终态
-   *   5. 启动日期（90 天阈值）    —— ≤90 天 = 正在游玩；>90 天 = 已暂停
-   *   6. 从未启动                 —— 停在总库，不参与日期归类
+   *   5. 「归入已放弃」的收藏夹 —— 放弃区（**不看**玩没玩过、多久没碰）
+   *   6. 启动日期（90 天阈值）    —— ≤90 天 = 正在游玩；>90 天 = 已暂停
+   *   7. 有近期时长但没启动时间戳 —— 同样算"在玩"（也算启动过的证据）
+   *   8. 「归入待游玩」的收藏夹 —— 待游玩（**只对"从没启动过"的款生效**）
+   *   9. 从未启动                 —— 停在总库，不参与日期归类
+   *
+   * 🔴 **第 5 条必须排在第 3/4 之后、第 6 之前**（2026-10-13）：
+   *    · 排在**已通关之后** → 一款同时在「已完结」和「已放弃」里时**通关赢**。
+   *      通关是终态（打完了就是打完了），放弃不是（移出收藏夹就能被放出来）。
+   *    · 排在**日期规则之前** → 跟「待游玩」正好相反：收藏夹里写着"已放弃"
+   *      就是放弃，不看它玩过多久、多久没碰。这正是这两格的分工。
+   *
+   * 🔴 **第 8 条必须排在第 6 条之后**（2026-10-13）。理由是这条收藏夹的定义：
+   *    「待游玩」= **想玩但还没开始**。放在日期规则之前的话，一款你正在玩的
+   *    游戏只要被拖进那个收藏夹，下一轮同步就会被拽出「正在游玩」——
+   *    那是在跟用户对着干。排在后面就天然只接"从没启动过"的款：
+   *    玩过的款在第 6 步就 return 了，根本走不到这里。
    *
    * 注意 1：hidden（工具隐藏）不在这里处理，隐藏优先级最高，
    *         在 mergeSteam 里用 isToolGame / inHiddenCollection 单独判定。
    * 注意 2：手动优先的细节（手动晚于启动则保留手动结果）也在 mergeSteam 里处理。
    */
   function suggestStatus(game) {
-    // 2. 用户指定的「通关」收藏夹 —— 优先级高于全成就判断
+    // 3. 用户指定的「通关」收藏夹 —— 优先级高于全成就判断
     if (inCompletedCollection(game)) return STATUS.COMPLETED;
 
-    // 3. 全成就 —— 已通关是归档终态，不再看启动日期
+    // 4. 全成就 —— 已通关是归档终态，不再看启动日期
     const ach = game.achievements;
     const allDone = !!(ach && ach.total > 0 && ach.earned >= ach.total);
     if (allDone) return STATUS.COMPLETED;
 
-    // 4. 按启动日期分流：近期玩过 -> 正在游玩，久未启动 -> 已暂停
+    // 5. 「归入已放弃」的收藏夹 —— 直接进放弃区（不看日期、不看玩没玩过）。
+    //    ⚠️ `wantsAbandon` 里含 `!abandonDismissed`：用户手动把它挪出放弃区过，
+    //       只要款还留在那个收藏夹里，就不再自动塞回去。
+    if (wantsAbandon(game)) return STATUS.ABANDONED;
+
+    // 6. 按启动日期分流：近期玩过 -> 正在游玩，久未启动 -> 已暂停
     const days = daysSincePlayed(game);
     if (days >= 0) {
       if (days <= RECENT_DAYS) return STATUS.PLAYING;
       return STATUS.PAUSED;
     }
 
-    // 5. 从未启动（也没有 recentMinutes）：停在总库，等用户自己决定
+    // 7. 有近期时长但没启动时间戳 —— 同样算"在玩"（也算启动过的证据）
     if (game.recentMinutes > 0) return STATUS.PLAYING;
 
+    // 8. 「归入待游玩」的收藏夹 —— 走到这里说明**从没启动过**，正是待玩清单接的人
+    if (inBacklogCollection(game)) return STATUS.BACKLOG;
+
+    // 9. 从未启动（也没有 recentMinutes）：停在总库，等用户自己决定
     return STATUS.LIBRARY;
   }
 
@@ -835,6 +979,9 @@
     isStale,
     isToolGame,
     inCompletedCollection,
+    inBacklogCollection,
+    inAbandonedCollection,
+    wantsAbandon,
     inHiddenCollection,
     adoptLegacyCollection,
 
@@ -843,6 +990,7 @@
     setPrefs,
     defaultPrefs,
     collectionsInData,
+    duplicateCollections,
     tsToDate,
     yearOf,
     // 通关年份（年表的依据）：字段语义与三条规则见上面的 `DONE_UNKNOWN` 那段
@@ -1209,20 +1357,26 @@
           // ===== 状态归类 =====
           // 优先级（高 -> 低）：
           //   1. 锁定（statusLocked）        -> 一律不动
-          //   2. 放弃区（abandoned）         -> 手动终态，一律不动
+          //   2. **手动**挪进的放弃区         -> 手动终态，一律不动
           //   3. 已通关（收藏夹 / 全成就）   -> 归档终态，不受日期影响
-          //   4. 手动改状态晚于上次启动      -> 尊重手动结果
-          //   5. 启动日期（90 天阈值）       -> 正在游玩 / 已暂停
-          //   6. 从未启动                    -> 停在总库
+          //   4. 收藏夹「已放弃」            -> 放弃区（**排在已通关之后** = 通关赢）
+          //   5. 手动改状态晚于上次启动      -> 尊重手动结果
+          //   6. 启动日期（90 天阈值）       -> 正在游玩 / 已暂停
+          //   7. 尚未启动                    -> 看「待游玩」收藏夹 / 停在总库
           if (old.statusLocked) {
             // 锁定的游戏：状态一动不动，连「已通关」也不重算
             locked++;
-          } else if (old.status === STATUS.ABANDONED) {
-            // 「放弃」是手动终态，和锁定同级：
+          } else if (old.status === STATUS.ABANDONED &&
+                     old.abandonedBy !== 'collection') {
+            // **手动**挪进放弃区的 = 手动终态，和锁定同级：
             // 「不打算再玩了」只有用户能判断，所以同步时一律不动 ——
             // 包括不被「通关」收藏夹 / 全成就拉回「已通关」，
             // 也不因为"后来又启动了一次"被日期规则挪去「正在游玩」。
             // 想让它回到别的状态，手动改一下即可（改完就不再是 abandoned）。
+            //
+            // ⚠️ 只有 `abandonedBy === 'collection'`（**收藏夹自动**放进去的）才继续
+            //    往下走 —— 那批是"可撤销"的：把款移出「已放弃」收藏夹，下次同步
+            //    就放它回自动规则（见下面那段「释放」分支）。
             old.autoStatus = false;
             abandoned++;
           } else {
@@ -1235,10 +1389,42 @@
             // 手动改状态是否晚于上次启动？（手动后没再启动过 -> 保留手动结果）
             const manualWins = !!old.manualStatus &&
                                (old.statusManualAt || 0) > (old.lastPlayedTs || 0);
+            // 「已放弃」收藏夹里有没有它 + 该不该自动判成放弃
+            // （用户手动挪走过就不再塞回去 —— 见 wantsAbandon）
+            const wantAbandon = wantsAbandon(old);
 
             if (manualWins) {
               // 手动优先：状态保持不动
               old.autoStatus = false;
+            } else if (wantAbandon && !shouldCompleted) {
+              // 🔴 收藏夹说"不玩了" -> 直接进放弃区。
+              //    · 排在**已通关之后**：同时命中「已完结」与「已放弃」时**通关赢**
+              //      —— 通关是终态，放弃不是。
+              //    · 排在**日期规则之前**：跟「待游玩」正好相反 —— 这一款
+              //      不管玩没玩过、多久没碰，都算放弃。
+              old.status = STATUS.ABANDONED;
+              old.autoStatus = false;
+              abandoned++;
+            } else if (!wantAbandon && old.status === STATUS.ABANDONED &&
+                       old.abandonedBy === 'collection') {
+              // **释放** —— 上一轮是收藏夹把它自动放进去的，这一轮它已经不在那个
+              //    收藏夹里（或用户已手动挪走过）-> 放它回自动规则。
+              //
+              // ⚠️ 这段**不是**"能出来"的承重实现（2026-10-13 用改坏法实测过，别照
+              //    旧注释理解）：把它整个删掉，`_t_collection.html` 仍然 60/0 全绿 ——
+              //    因为紧接着的兜底 `else`（下面那个"普通游戏：按启动日期自动分流"）
+              //    对 `status===ABANDONED` 这个前提做的事**逐字相同**（同样的
+              //    `suggestStatus` -> 赋值 -> 同样的 autoStatus 判据），而夹在中间那几条
+              //    `shouldCompleted/wasCompleted` 分支对"当前是放弃区"的款也都不成立。
+              //    真正承重的是上面那段「放弃区收口」写下的 `abandonedBy` 标记：
+              //    只把收口改坏（分支留着）-> P14l 精确变红，自动进来的款再也放不出来。
+              //
+              //    留着这一段是为了**不依赖那个巧合**：将来若有人在兜底 else 之前插入
+              //    新分支、或改动兜底的语义，释放行为会跟着静默变掉。这里显式写出来，
+              //    读的人一眼看到"移出即放回"是条独立规则，而不是兜底的副作用。
+              const s = suggestStatus(old);
+              old.status = s;
+              old.autoStatus = (s === STATUS.PLAYING || s === STATUS.PAUSED);
             } else if (shouldCompleted && !wasCompleted && !completedDismissed) {
               // 被收藏夹/全成就拉回「已通关」
               old.status = STATUS.COMPLETED;
@@ -1268,6 +1454,21 @@
                 old.autoStatus = (s === STATUS.PLAYING || s === STATUS.PAUSED);
               }
             }
+
+            // ===== 放弃区收口 =====
+            // 和上面 doneAt 那段同一个道理：只在这一处写，免得每条分支各写一遍
+            // （漏一处 = 那条路径进来的款永远卡在放弃区 / 或者被当成手动终态）。
+            //   · 最终是「放弃区」且它确实在「已放弃」收藏夹里 -> 打上来源标记。
+            //     🔴 这是整个功能里最要紧的一个不变量：少了这个标记，自动放进来的
+            //        款会被当成**手动终态**，把它移出收藏夹也放不出来 —— 死胡同。
+            //   · 最终不是放弃区 -> 标记清空（`abandonedBy` 只对放弃区有意义）。
+            if (old.status === STATUS.ABANDONED) {
+              if (inAbandonedCollection(old)) old.abandonedBy = 'collection';
+            } else {
+              old.abandonedBy = '';
+            }
+            // 离开收藏夹 = 上一轮那次「别再塞回去」作废：以后再放进去要重新生效
+            if (!inAbandonedCollection(old)) old.abandonDismissed = false;
           }
 
           // 通关年份：上面整个状态块里**所有**"判为已通关"的分支都从这里收口 ——
@@ -1319,6 +1520,14 @@
           if (!Array.isArray(g.collections)) g.collections = [];
           // 标记这条状态是不是自动规则产生的（供 UI 打「自动」角标）
           g.autoStatus = (g.status === STATUS.PLAYING || g.status === STATUS.PAUSED);
+          // 放弃区：新建时就判成放弃区的，标上来源 —— 少了它，这款会被当成
+          // 手动终态，以后把它移出「已放弃」收藏夹也放不出来。
+          // ⚠️ 只在"状态是这次算出来的"时标：备份文件带 `suggestedStatus` 进来时，
+          //    `src.abandonedBy` 已经被 makeGame 的 Object.assign 原样保留了，
+          //    覆盖它会把**手动**终态的款错标成可释放的。
+          if (!src.suggestedStatus && g.status === STATUS.ABANDONED) {
+            g.abandonedBy = 'collection';
+          }
           g.hidden = inHiddenCollection(g) || isToolGame(g);
           toSave.push(g);
           added++;
