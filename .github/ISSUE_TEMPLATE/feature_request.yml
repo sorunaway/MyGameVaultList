@@ -1,0 +1,46 @@
+name: 功能建议
+description: 想要某个能力 / 觉得某处不好用
+title: "[建议] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        欢迎提建议。先说**你想解决什么问题**比先说方案更有用 ——
+        有时候问题有更省事的解法，或者它其实已经能做了。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 现在遇到的不方便是什么？在什么场景下会碰到？
+      placeholder: 例如：库里有几百款，想一次把「玩过但没通关」的都标成暂停
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你想到的做法（可选）
+      description: 有具体想法就写，没有也没关系。
+    validations:
+      required: false
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: 现在是怎么绕过去的（可选）
+      description: 如果你现在有别的办法顶着用，写一下 —— 能帮我判断这件事有多要紧。
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 适用范围
+      options:
+        - label: 这个能力需要对 Steam 账号 / API Key 才能做
+          required: false
+        - label: 这个能力只有桌面版做得到（要读本机文件）
+          required: false

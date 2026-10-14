@@ -25,6 +25,11 @@
 !.gitignore
 !.env.example
 !README.md
+!LICENSE
+!CHANGELOG.md
+!CONTRIBUTING.md
+!.github/
+!docs/
 !index.html
 !manifest.webmanifest
 !assets/
@@ -33,6 +38,8 @@
 !server/
 !scripts/
 !desktop/
+# ⚠️ `_bak/` 故意**不**放行 —— 那是原 README 的回退副本（本地留档），
+#    跟 `_*` 那批一样只留在工作区。要放行它请先想清楚"备份文件进仓库"这件事值不值。
 # 说明：desktop/ 里只有启动器源码（desktop/main.py），不含任何个人数据。
 # 它是**桌面版**的入口，本机自用 / 出 exe 时用得到。
 # ⚠️ 这里原来还放行着 `!vendor/`（自托管的云 SDK）。线上版 2026-09-28 下线、

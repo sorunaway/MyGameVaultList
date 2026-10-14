@@ -1,0 +1,74 @@
+name: 问题反馈
+description: 报告一个能重现的问题（崩溃 / 显示错乱 / 数据不对 / 归类不对）
+title: "[问题] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！**「怎么重现」和「报错截图」这两项最关键** —— 缺了它们通常没法定位。
+
+        开之前请先翻一眼[常见问题与已知限制](https://github.com/sorunaway/MyGameVaultList/blob/main/docs/faq.md)，
+        有一批事是设计如此（愿望单要 Key、EPIC 没有最后游玩时间等）。
+
+  - type: dropdown
+    id: edition
+    attributes:
+      label: 你用的是哪一版
+      description: 这三条路读到的数据完全不同，不说清没法定位。
+      options:
+        - Releases 里下载的桌面版 exe（zip 解压出来的）
+        - 源码跑的桌面版（python desktop/main.py）
+        - 浏览器版（直接双击 index.html）
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / 下载日期
+      description: exe 的是从哪个 Release 下的；源码跑的话填一下提交号（git rev-parse --short HEAD）
+      placeholder: 例如 alpha / 2026-10-14 下的包 / 7f2a2ed
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 怎么重现
+      description: 从打开到出问题，一步一步写。能稳定重现最好。
+      placeholder: |
+        1. 打开应用
+        2. 点「设置」→ …
+        3. 看到 …
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 你期望看到什么 / 实际看到什么
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 报错截图或日志原文
+      description: |
+        桌面版那个黑窗口**别关** —— 启动失败、端口占用这类提示都打在它里面。
+        网页版可以在 F12 控制台里看红色报错。
+      placeholder: 直接把报错贴进来，或拖图片进来
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 确认
+      options:
+        - label: 我已经看过 docs/faq.md，这不是里面写明的「设计如此」
+          required: false
+        - label: 我没有在这条 issue 里贴出我的 Steam API Key / SteamID（贴了请立刻去吊销那支 Key）
+          required: true
