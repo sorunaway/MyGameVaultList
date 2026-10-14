@@ -1,9 +1,5 @@
-# MyGameVaultList · 我的游戏生涯
-
-> **名字的由来**：这个应用原来叫 `GameVault`，2026-09-29 改名为 **MyGameVaultList**。
-> ⚠️ **只有"给人看的名字"改了** —— 下面这些**一个都没动**，动了就等于把用户已有的数据丢掉：
-> 本地库名（IndexedDB 的 `gamevault`）、localStorage 键（`gamevault_games` / `gv_*`）、
-> 数据目录（`%LOCALAPPDATA%\MyGameVault`）、以及仓库目录名（`gamevault/`）。
+# MyGameVaultList · 我的游戏库清单
+（本人0编程基础，纯AI开发的自用小工具。之前本人一直用文档自己记录游戏历程和待玩列表，后来利用AI写了一个小工具帮忙我管理STEAM游戏游玩列表，和查看之前玩过的历程，自己感觉还挺好用的，就让AI分享到GIT了。以下全是AI写的，懒得编辑了）
 
 记录玩过的游戏、当前进度、以及接下来想玩的计划。
 Steam 库自动同步，进度和感想自己写。
