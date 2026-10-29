@@ -247,8 +247,14 @@ python _make_icon.py
 python scripts/pack_share_zip.py --verify
 ```
 
-产物 `../_build_desktop/share/MyGameVaultList-试用版-<日期-时分>.zip`（约 14.5 MB，微信/QQ 直接发得动）。
+产物 `../_build_desktop/share/MyGameVaultList_<版本号>.zip`（约 14.5 MB，微信/QQ 直接发得动）。
+版本号在 `scripts/pack_win.py` 的 `APP_VERSION`（**唯一来源**，`pack_share_zip.py` 直接引用它），
+现在出的是 `MyGameVaultList_0.0.2_alpha.zip`。
 包里是 `使用说明.txt`（放 **zip 根**上，解压第一眼就看见）+ `mygamevaultlist-desktop/` 整个目录。
+
+⚠️ 同名重出**不会覆盖**：旧包会被挪进 `../_trash_mygamevaultlist/share/` 存档。
+所以「同版本号改了什么」能拿旧包现场比对；但要发新一版给用户时，**记得改版本号**，
+否则收包人手上两个包都叫同一个名字，说不清哪个是最新的。
 
 🔴 **不能只发 exe** —— 反向对照实测：单独把 exe 拷出来会报
 `Failed to load Python DLL '...\_internal\python313.dll'` 然后退出（退出码 -1）。

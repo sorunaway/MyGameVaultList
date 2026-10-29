@@ -1722,6 +1722,45 @@
     state.drawerId = null;
   }
 
+  /** 写完库之后**必须**调它：重载数据 + 重绘主视图。
+   *
+   *  🔴 `reload()` 只换 `state.games`，**一个 DOM 节点都不碰**。少了 `render()`，
+   *     数据已经变了、卡片还停在旧区块 / 旧年份段里，而且**不报任何错**
+   *     （改年份、改状态、锁定、删除这四条写路径当初全都栽在这里）。
+   *     同一文件里 `applySync` / 卡片快捷收藏 / 年表拖放本来就有 `render()`，
+   *     唯独抽屉这条链漏了 —— 所以这不是"缺个刷新按钮"，是少了一次重绘。
+   */
+  async function redrawAfterWrite() {
+    await reload();
+    // 关于滚动位置（**别再加"记 scrollTop / 还原"那一套**）：
+    // `render()` 是 `el.grid.innerHTML` 整片重建，实测 Chrome / WebView2 在
+    // **容器高度不变时会自己保住 `.content` 的 scrollTop**（反证验过：把还原那两行
+    // 抽掉，`_t_year.html` 的 J6 依旧全绿 ⇒ 那两行不承重，留着只会误导后人以为必需）。
+    // 高度真变了（卡片数增减）时浏览器本来就会把 scrollTop 夹到新高度，还原也救不回来。
+    // ⚠️ 滚动容器是 `.content`，**不是** `window`（`window.scrollTop` 恒为 0，静默无效）。
+    // J6 留着当**行为守卫**：将来若有人把 render 改成替换整个容器 / 加 scroll-behavior，
+    // 它会红。
+    render();
+  }
+
+  /** 抽屉里的**所有**写操作都走这里：落库 → 重绘主视图 → 按 id 重开抽屉。
+   *
+   *  🔴 收成一个入口而不是每处各写一遍，是因为这个项目栽过「能力写好了，但没人调」
+   *     （愿望单 / 成就 / 评测都栽过，全零报错）。以后再往抽屉里加写操作，
+   *     只要它调这个函数就不会漏重绘；漏了的话 `_t_year.html` 的 J2 / J4 会红
+   *     （J2 = 改年份换段，J4 = 改状态换区 —— 两条不同的写路径，防止"只补一处"）。
+   *
+   *  ⚠️ 只做「保存后重开详情」。删除走 `redrawAfterWrite()` + `closeDrawer()`，
+   *     因为那条路要先 `DS.remove`，不能 `save`。
+   *
+   *  @param g 已改好字段、待落库的那条记录
+   */
+  async function commitDrawer(g) {
+    await DS.save(g);
+    await redrawAfterWrite();
+    openDrawer(g.id);      // 用 id 重开：reload 之后 state.games 里已经是新对象
+  }
+
   /**
    * 详情面板里「玩家评测」那一节。
    *
@@ -2076,9 +2115,10 @@
           g.dismissedCollection = false;
         }
         g.updatedAt = Date.now();
-        await DS.save(g);
-        await reload();
-        openDrawer(g.id);               // 重绘抽屉
+        // 🔴 走统一入口：改状态会换区块（甚至换年份段），**必须**重绘主视图。
+        //    以前这里是 `reload()` + `openDrawer()`（只重绘抽屉），于是卡片
+        //    留在原区块里，得先切到别的区再切回来才挪过去。
+        await commitDrawer(g);
       });
     });
 
@@ -2088,21 +2128,20 @@
       lockBtn.addEventListener('click', async () => {
         g.statusLocked = !g.statusLocked;
         g.updatedAt = Date.now();
-        await DS.save(g);
-        await reload();
-        openDrawer(g.id);
+        // 锁定状态画在卡片上（🔒），光重开抽屉看不见主视图的变化
+        await commitDrawer(g);
       });
     }
 
     // 通关年份：输入框（回车 / 失焦生效）+「今年」+「未定」三个入口，
-    // 全部落到同一个 `DS.setDoneYear`。改完重开抽屉 —— 年份是年表的分段依据，
-    // 不重绘的话抽屉上还是旧值，用户会以为没生效。
+    // 全部落到同一个 `DS.setDoneYear`。
+    // 🔴 年份是年表的分段依据 —— **主视图和抽屉两边都得重绘**：
+    //    抽屉上不重绘，用户看到的是旧年份、以为没生效；
+    //    主视图不重绘，卡片就赖在原来那一段里（这正是用户报的那个 bug）。
     const setYearAndRedraw = async (year) => {
       if (!DS.setDoneYear(g, year)) return;
       g.updatedAt = Date.now();
-      await DS.save(g);
-      await reload();
-      openDrawer(g.id);
+      await commitDrawer(g);
     };
     const yIn = el.drawerBody.querySelector('#doneYearInput');
     if (yIn) {
@@ -2150,7 +2189,10 @@
                  ? ('已抓取「' + g.title + '」的评价。')
                  : ('「' + g.title + '」这位玩家没有写过评测。'),
                r.state === 'ok' ? 'ok' : 'warn');
-          await reload();
+          // 评测正文只在抽屉里显示，但依旧走统一重绘 —— 保持「抽屉写操作都过同一条
+          // 出口」的一致性，也保证下面 openDrawer 读到的是 reload 之后的新数据。
+          // （这里不用 commitDrawer：`setReview` 没变化时**不落库**，不能无条件 save）
+          await redrawAfterWrite();
           openDrawer(g.id);
         } catch (e) {
           note('抓取失败：' + ((e && e.message) || e), 'err');
@@ -2172,8 +2214,11 @@
       delBtn.addEventListener('click', async () => {
         if (!confirm('确定要删除「' + g.title + '」吗？此操作不可撤销。')) return;
         await DS.remove(g.id);
+        // 🔴 顺序：先 reload + 重绘，**再**关抽屉。
+        //    以前是 `closeDrawer()` 之后只 `reload()`，删掉的那张卡还留在屏幕上
+        //    （点它还会把详情打开，虽然记录已经没了）—— 同一个"少一次重绘"的缺陷。
+        await redrawAfterWrite();
         closeDrawer();
-        await reload();
       });
     }
   }
@@ -2197,10 +2242,9 @@
     if (!g) return closeNoteEditor();
     g.myNote = el.noteText.value.trim();
     g.updatedAt = Date.now();
-    await DS.save(g);
+    // 先收起编辑器（它是独立遮罩 `el.noteMask`，盖在抽屉上面），再落库 + 重绘 + 重开详情
     closeNoteEditor();
-    await reload();
-    openDrawer(g.id);
+    await commitDrawer(g);
   }
 
   // ===== 手动添加 =====

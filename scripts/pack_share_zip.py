@@ -26,17 +26,24 @@ MyGameVaultList — 把出好的桌面版 exe 打成**可以直接发人**的 zi
 
 产物
 ----
-    ../_build_desktop/share/MyGameVaultList-试用版-YYYYMMDD-HHMM.zip
+    ../_build_desktop/share/MyGameVaultList_<版本号>.zip
         ├── 使用说明.txt                 ← 放**根**上，解压第一眼就看见
         └── mygamevaultlist-desktop/     ← 整个目录，缺一不可
             ├── mygamevaultlist-desktop.exe
             └── _internal/
+
+🔴 文件名里的版本号取自 `pack_win.APP_VERSION`（**唯一来源**，本文件不再抄一份）。
+  以前叫 `MyGameVaultList-试用版-<日期-时分>.zip`：日期戳能区分同一天的两版，
+  但看不出"这是哪个版本" —— 收包的人问"我手上是不是最新的"，只能靠猜。
+  现在版本号写在名字里；同名重出时**旧包不删**，挪进 `_trash_mygamevaultlist/share/`
+  存档（本项目对旧产物的规矩：换包归档，不直接删）。
 
 ⚠️ 产物一律在**项目外**（与 pack_win.py 同理）—— 免得被 git / 发布工具顺手上传。
 """
 
 import argparse
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -54,6 +61,8 @@ import pack_win  # noqa: E402  复用它的体检规则与产物路径
 #    而那看起来像"打包坏了"，其实是两个文件各写了一份字面量、改了一个没改另一个）。
 APP_DIRNAME = pack_win.APP_NAME
 README_NAME = "使用说明.txt"
+# 版本号的**唯一来源**是 pack_win.APP_VERSION（理由见那边的注释）。
+APP_VERSION = pack_win.APP_VERSION
 
 # 说明书里要写的本机路径（与 desktop/main.py 的 webview_data_dir() 同根）
 # 🔴 **改名时不要碰这一行**：它是**数据目录**，用户的桌面版库
@@ -67,6 +76,7 @@ def readme_text(built_on):
     return u"""\
 MyGameVaultList 桌面版 · 试用说明
 ============================================================
+版本　　：{version}
 打包日期：{built_on}
 
 一句话：把 Steam 库里「有哪些游戏、玩了多久、通关没有」整理成一面卡片墙，
@@ -154,7 +164,8 @@ MyGameVaultList 桌面版 · 试用说明
 · 没有首次启动向导：没装 Steam 时界面是空的，只有控制台里一行提示。
 · 控制台黑窗口暂时去不掉：那些提示都走它，去掉就什么都看不见了。
 · 界面配色 / 交互还在改，随便提意见。
-""".format(built_on=built_on, data_hint=DATA_HINT, app_dir=APP_DIRNAME)
+""".format(version=APP_VERSION, built_on=built_on,
+           data_hint=DATA_HINT, app_dir=APP_DIRNAME)
 
 
 # ---------------------------------------------------------------- 打包
@@ -296,13 +307,23 @@ def main():
 
     # ---- ② 压缩 ----
     os.makedirs(args.out, exist_ok=True)
-    # ⚠️ 带上**时分**：同一天可能要发两版（比如 2026-09-24 上午那版有缺陷、
-    #    下午修好重发）。只到日期的话两个包同名，用户分不清手上是哪个，
-    #    反馈就变成"我测的还是有问题"——查不下去。说明书里也同步带上时间。
-    stamp = time.strftime("%Y%m%d-%H%M")
+    # 文件名 = `MyGameVaultList_<版本号>.zip`（版本号只有 pack_win.APP_VERSION 一处来源）。
+    # 精确时间仍写进**说明书抬头**，用来对账"这个包是什么时候压的"。
     built_on = time.strftime("%Y-%m-%d %H:%M")
-    name = "MyGameVaultList-试用版-%s.zip" % stamp
+    name = "MyGameVaultList_%s.zip" % APP_VERSION
     out_path = os.path.join(args.out, name)
+
+    # ⚠️ 同名旧包**不删**，挪进 `_trash_mygamevaultlist/share/` 存档。
+    #    换成固定文件名以后，重出一版必然撞名；直接覆盖就等于把上一版弄丢了，
+    #    而"同一版本号下改了什么"恰恰是最容易说不清的事（留个旧包能现场比对）。
+    if os.path.exists(out_path):
+        arch_dir = os.path.join(pack_win.TRASH_ROOT, "share")
+        os.makedirs(arch_dir, exist_ok=True)
+        arch = os.path.join(
+            arch_dir, "%s-%s.zip"
+            % (os.path.splitext(name)[0], time.strftime("%Y%m%d-%H%M%S")))
+        shutil.move(out_path, arch)
+        print("同名旧包已存档：%s" % arch)
 
     # ⚠️ 先写临时名再 os.replace —— 覆盖同期旧包时，OS 上只需一次单文件替换，
     #    不会触发这个环境里的「批量删除保护」（见 pack_win.clean_previous 的说明）。

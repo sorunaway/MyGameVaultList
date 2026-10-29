@@ -8,7 +8,7 @@ MyGameVaultList — Windows 桌面版 exe 出包脚本（PyInstaller，白名单
 | 脚本 | 产物 | 用途 |
 |---|---|---|
 | 本文件 | `../_build_desktop/dist/mygamevaultlist-desktop/` | **中间产物**：本机自测 / 被下面那个脚本打进 zip |
-| `pack_share_zip.py` | `../_build_desktop/share/MyGameVaultList-试用版-<日期-时分>.zip` | **对外发的唯一形态** |
+| `pack_share_zip.py` | `../_build_desktop/share/MyGameVaultList_<版本号>.zip` | **对外发的唯一形态** |
 
 （这里原来还并排着一个 `pack_deploy.py` —— **线上**部署包，它的白名单**有意放行** `.env`，
 因为线上服务端要用它代表访问者查 Steam。线上版 2026-09-28 下线，脚本已删。
@@ -72,6 +72,16 @@ TRASH_ROOT = os.path.join(os.path.dirname(BASE_DIR), "_trash_mygamevaultlist")
 # staging 目录放系统临时区、且**每次新建**（理由见 copy_stage 的说明）
 
 APP_NAME = "mygamevaultlist-desktop"
+
+# 对外**版本号**（分享包文件名 + 说明书抬头）。
+# 🔴 与 `APP_NAME` 是**两件事，别合并**：
+#    · `APP_NAME` 是**目录名 / exe 名**，它决定了 `dist/<APP_NAME>/` 的路径，
+#      也是 `pack_share_zip` 里 `APP_DIRNAME` 的来源 —— 动它 = 分享包结构与
+#      收包人的使用习惯一起变，且 e2e 探针写死了这个路径。
+#    · `APP_VERSION` 只改**文件名**，纯粹是让人一眼看出手上是哪版。
+# 改版本号时：本行 + `CHANGELOG.md` 一节 +（发 Release 时）tag。
+APP_VERSION = "0.0.2_alpha"
+
 ENTRY = os.path.join(BASE_DIR, "desktop", "main.py")
 SERVER_DIR = os.path.join(BASE_DIR, "server")
 
