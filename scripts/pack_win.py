@@ -36,11 +36,16 @@ exe 里一旦夹带 `.env`，别人机器上就会用开发机那把 key 去查 
 
 用法
 ----
-    python scripts/pack_win.py                 # 出 onedir + 保留控制台（自用/排错）
+    python scripts/pack_win.py                 # 出 onedir + **无控制台**（默认，对外发就用这个）
+    python scripts/pack_win.py --console       # 带控制台（排错用：能看到启动提示 / 报错）
     python scripts/pack_win.py --onefile       # 出单文件
-    python scripts/pack_win.py --windowed      # 出无控制台（对外发）
     python scripts/pack_win.py --check         # 只体检已有产物，不重新构建
     python scripts/pack_win.py --keep-stage    # 保留 staging 目录（排错用）
+
+🔴 默认改成 `--windowed` 的理由：对外发是主用途，双击弹黑框才是常态痛点；
+   而「排错时想看输出」是需要主动选择的动作 —— 所以反过来，用 `--console` 显式要。
+   无控制台后的诊断通道：`%LOCALAPPDATA%\\MyGameVault\\logs\\desktop.log`
+   + 关键错误弹窗（见 `desktop/main.py` 的 `_install_streams` / `fatal`）。
 
 依赖（装到**隔离 venv**，别动系统 Python）
 ------------------------------------------
@@ -80,7 +85,7 @@ APP_NAME = "mygamevaultlist-desktop"
 #      收包人的使用习惯一起变，且 e2e 探针写死了这个路径。
 #    · `APP_VERSION` 只改**文件名**，纯粹是让人一眼看出手上是哪版。
 # 改版本号时：本行 + `CHANGELOG.md` 一节 +（发 Release 时）tag。
-APP_VERSION = "0.0.2_alpha"
+APP_VERSION = "0.0.3_alpha"
 
 ENTRY = os.path.join(BASE_DIR, "desktop", "main.py")
 SERVER_DIR = os.path.join(BASE_DIR, "server")
@@ -417,8 +422,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--onefile", action="store_true",
                     help="出单文件 exe（启动时要解压，慢几秒）")
+    ap.add_argument("--console", action="store_true",
+                    help="带控制台窗口（排错用；默认**不带**，双击只出主窗口）")
     ap.add_argument("--windowed", action="store_true",
-                    help="不带控制台窗口（对外发用；排错时别开，否则看不到启动提示）")
+                    help="（默认行为，保留兼容；不用再写）")
     ap.add_argument("--check", action="store_true",
                     help="只体检已有产物，不重新构建")
     ap.add_argument("--keep-stage", action="store_true",
@@ -479,7 +486,8 @@ def main():
     # ---- ③ 构建 ----
     log("")
     clean_previous(APP_NAME)
-    rc = build(stage_dir, args.onefile, args.windowed)
+    # 🔴 默认**不带**控制台（对外发是主用途）；要黑框排错就显式 `--console`
+    rc = build(stage_dir, args.onefile, not args.console)
     if rc != 0:
         log("\n!! PyInstaller 失败（退出码 %d）" % rc)
         return rc

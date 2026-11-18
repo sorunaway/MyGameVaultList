@@ -27,6 +27,30 @@ python server/app.py          # 端口由环境变量 PORT 决定，默认 3000
 
 ---
 
+## 启动：只有主窗口，没有黑框
+
+对外发的 exe 是 PyInstaller `--windowed`（`pack_win.py` **默认**就是，不用额外加参数），
+所以双击后**只有一个应用窗口**，不会先弹一个黑色的控制台。
+
+排错要看的两样东西：
+
+| 东西 | 在哪 | 里面有什么 |
+|---|---|---|
+| 日志 | `%LOCALAPPDATA%\MyGameVault\logs\desktop.log` | 启动横幅、本机地址、Steam 目录与账号、报错原文 |
+| 弹窗 | 需要你动手时才会弹 | 端口被别的程序占用、窗口起不来（并附带降级说明） |
+
+日志超过 2 MB 会滚成 `desktop.log.1`，只留一份旧的。
+
+```bash
+python desktop/main.py              # 开发期：控制台 + 日志文件，两路都写
+python scripts/pack_win.py --console    # 想要黑框排错，就重新出一个带控制台的 exe
+```
+
+> ⚠️ 排错时别只看控制台：`python desktop/main.py` 的输出**同时**写进上面那个日志，
+> 而无控制台 exe 只有日志可看 —— 两边格式一致，按同一个文件排查就行。
+
+---
+
 ## 桌面版为什么固定用 47615 端口（很重要）
 
 桌面版（`desktop/main.py`）只监听本机回环，端口固定为 **47615**：

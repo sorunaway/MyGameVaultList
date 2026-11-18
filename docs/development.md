@@ -258,12 +258,13 @@ python scripts/pack_share_zip.py --verify
 
 🔴 **不能只发 exe** —— 反向对照实测：单独把 exe 拷出来会报
 `Failed to load Python DLL '...\_internal\python313.dll'` 然后退出（退出码 -1）。
-（那行系统错误文本本身还是乱码的，所以说明书里写的是「看到 `Failed to load Python DLL`
-就是这个原因」，而不是照抄系统原文。）
+⚠️ 2026-11-18 起出的是无控制台 exe，**这行报错不再显示给用户** —— 他看到的就是
+「双击什么都不会发生」，所以说明书改写成描述这一幕，压缩包自检的断言也跟着换了判据。
 
 那份说明书替你讲了收包人最容易卡住的四件事，每条都是实测出来的：
 SmartScreen 要点「更多信息 → 仍要运行」；exe 不能单独拖出来；**首屏是空的要点「同步」**
-（数据来自他本机 Steam）；数据存在他本机 `%LOCALAPPDATA%\MyGameVault`、出问题先别关那个黑窗。
+（数据来自他本机 Steam）；数据存在他本机 `%LOCALAPPDATA%\MyGameVault`、
+出问题看同目录下的 `logs\desktop.log`（无控制台出包后，这是唯一排错通道）。
 
 脚本干三件事：压之前**复用 `pack_win` 的体检规则**再查一遍（规则不重抄一份，
 免得两套分叉成「出包拦住了、发的时候放过去了」）→ 压完**从 zip 里读回来**验结构 / 夹带 /
@@ -277,9 +278,32 @@ SmartScreen 要点「更多信息 → 仍要运行」；exe 不能单独拖出�
 ⚠️ 这个数字**每加一个功能就会涨**（每轮都给 e2e 补一条对应的检查）——
 判据只看 `FAIL=0`，别拿旧数字对账。
 
+### 出包：默认无控制台
+
+`python scripts/pack_win.py` **默认就带 `--windowed`**（双击只出主窗口，没有黑框）。
+想看到启动提示 / 报错就显式 `--console` 重新出一个。
+
+代价是 `print()` 没人看得见，所以有两条兜底（见 `desktop/main.py`）：
+
+| 通道 | 位置 | 管什么 |
+|---|---|---|
+| 日志文件 | `%LOCALAPPDATA%\MyGameVault\logs\desktop.log`（超 2 MB 滚动成 `.1`） | 全部输出（启动横幅、Steam 账号、报错原文） |
+| 弹窗 | `fatal()` → `MessageBoxW` | 只给「用户必须动手」的：端口被占用、窗口起不来 |
+
+🔴 `_install_streams()` 必须留在**模块最前面**：无控制台的 exe 在拿不到 stdout 句柄时
+`sys.stdout` 是 `None`，第一句 `print()` 就 `AttributeError` 把进程打死（表现是"双击没反应"）。
+🔴 自动化验收要设 `GV_NO_DIALOG=1`，否则会卡在等待点击弹窗上。
+
+这条也是验过的，不是推测 —— `_probe_dialog.py`（顺手写的一次性探针）：
+
+```bash
+python _probe_dialog.py                  # 期望：桌面出现弹窗 + 日志里有 [FATAL]（2 PASS）
+python _probe_dialog.py --expect-silent  # 反证：GV_NO_DIALOG=1 时**不**弹，日志照样有
+```
+
+它用 `DETACHED_PROCESS` 起 exe —— 那样进程**没有任何控制台句柄**，正是用户双击的情形；
+从 bash 里 `&` 起会继承父终端的 stdout，测不出真实场景。
+
 ### 还没做的
 
-- **无控制台版**（`--windowed`）还没出，而且**自用测试阶段不该出**：找不到 Steam、
-  端口被占用（退出码 3）这些提示都走控制台输出，去掉控制台就什么都看不见了 ——
-  而那些提示正是排错要看的东西。要对外发得先给这些错误补弹窗兜底。
 - 首次启动的设置向导。

@@ -25,6 +25,18 @@ MyGameVaultList —— Windows 桌面版启动器（离线）。
    这条管住 WebView2 自己那套存储。<br>
    冻结（出 exe）后还有一条同源的：**资源根用 `sys._MEIPASS`**，不是 `__file__` 上跳两层。
 
+## 🔴 对外发的包是**无控制台**的（`pack_win.py` 默认 `--windowed`）
+
+那种 exe 没有黑框，代价是 `print()` 没人看得见 —— 于是：
+
+  · 所有输出由 `_Tee` 同时写进 `%LOCALAPPDATA%\\MyGameVault\\logs\\desktop.log`；
+  · 「用户必须动手」的错误（端口被占用 / 窗口起不来）另外弹 MessageBox；
+  · 排错时想要黑框：`python scripts/pack_win.py --console` 重新出一个。
+
+🔴 别把 `_install_streams()` 挪进 `main()` —— 它必须早于 `import app`：
+windowed 下没有有效 stdout 句柄时 `sys.stdout is None`，**第一句 print 就会
+AttributeError 把进程打死**（表现是"双击没反应"，连窗口都不出）。
+
 ## 🔴🔴 为什么端口必须固定（别改回 `port=0`）
 
 浏览器存储（localStorage / IndexedDB）是按**源**隔离的，而**源里含端口**：
@@ -57,6 +69,132 @@ import threading
 import time
 import urllib.request
 import webbrowser
+
+
+# ============================================================ 日志 / 流兜底
+#
+# 🔴 为什么这段必须在**模块最前面**（比 import app 还早）
+#
+# 对外发的那一版 exe 是 PyInstaller `--windowed`（无控制台）。这种 exe 在
+# **拿不到有效 stdout 句柄**时，`sys.stdout` / `sys.stderr` 会是 `None` ——
+# 之后任何一句 `print()` 都抛
+#
+#     AttributeError: 'NoneType' object has no attribute 'write'
+#
+# 进程当场死掉，用户看到的是"双击没反应"（连窗口都不出）。所以顺序是：
+#   ① 先把两个流换成一个**绝不为 None** 的对象（哪怕日志文件打不开也不崩）；
+#   ② 顺手把内容落到日志文件 —— 无控制台以后，这是唯一的排错通道。
+#
+# ⚠️ 反过来也成立：`python desktop/main.py`（开发期）仍然有控制台，
+#    这时 Tee 会**两路都写**，控制台观感与改动前完全一致。
+
+LOG_NAME = "desktop.log"
+LOG_MAX_BYTES = 2 * 1024 * 1024        # 超过就滚动成 desktop.log.1（只留一份）
+
+
+def app_home():
+    """本程序的用户数据根目录（日志 / WebView2 存储 / 备份都挂在这下面）。
+
+    默认 `%LOCALAPPDATA%\\MyGameVault`，`GV_DESKTOP_HOME` 可整体改（测试 / 中文路径用）。
+    🔴 这是**存储身份**的一部分：改名 = 用户手上的库和凭证"消失"。别动。
+    """
+    home = os.environ.get("GV_DESKTOP_HOME") or ""
+    if not home:
+        home = os.path.join(os.environ.get("LOCALAPPDATA")
+                            or os.path.expanduser("~"), "MyGameVault")
+    return home
+
+
+def log_path():
+    return os.path.join(app_home(), "logs", LOG_NAME)
+
+
+class _Tee(object):
+    """把写入**同时**送到原流与日志文件；任一路断了不影响另一路。
+
+    这样 `main.py` 里几十处 `print()` 一句都不用改，就能在无控制台时照样留痕。
+    """
+
+    encoding = "utf-8"
+    errors = "replace"
+
+    def __init__(self, stream, fh):
+        self._stream = stream
+        self._fh = fh
+
+    def write(self, s):
+        n = 0
+        if self._stream is not None:
+            try:
+                n = self._stream.write(s) or 0
+                # ⚠️ 必须立刻 flush：stdout 被重定向到文件 / 管道时是**块缓冲**，
+                #    不 flush 的话 `> out.txt` 里会一直是空的（排错时最容易被骗）。
+                self._stream.flush()
+            except Exception:
+                pass
+        if self._fh is not None:
+            try:
+                self._fh.write(s)
+                self._fh.flush()          # 行缓冲 + 显式 flush：崩了也不丢最后几行
+            except Exception:
+                pass
+        return n or len(s)
+
+    def flush(self):
+        for x in (self._stream, self._fh):
+            try:
+                if x is not None:
+                    x.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+
+def _install_streams():
+    """装上 Tee，返回日志路径（打不开则返回 None —— 但流仍会被兜住，不会崩）。"""
+    path = log_path()
+    fh = None
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            if os.path.getsize(path) > LOG_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass                          # 第一次跑：文件还不存在
+        fh = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
+        fh.write("\n===== %s 启动 =====\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        fh = None                         # 权限 / 磁盘满：退回"只写控制台"
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
+    return path if fh is not None else None
+
+
+LOG_FILE = _install_streams()
+
+
+def fatal(title, msg):
+    """**用户必须知道 / 必须动手**的错误的唯一出口：写日志 + 弹窗。
+
+    🔴 只在无控制台出包后才真正生效 —— 那种情况 print 没人看得见，
+    所以「端口被占用」这类需要用户去关别的程序的提示，必须能弹到脸上。
+    🔴 `GV_NO_DIALOG=1` 时不弹（自动化验收用；否则脚本会卡在等待点击上）。
+    """
+    print("[FATAL] %s —— %s" % (title, msg))
+    if os.environ.get("GV_NO_DIALOG"):
+        return
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        # MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND：主窗口还没起来，得置顶
+        ctypes.windll.user32.MessageBoxW(
+            None, msg, "MyGameVaultList — %s" % title, 0x10 | 0x40000 | 0x10000)
+    except Exception:
+        pass
+
 
 # 🔴 资源根目录：开发期与**冻结（PyInstaller）后**算法不同，不能合并。
 #
@@ -199,11 +337,7 @@ def webview_data_dir():
       · `private_mode=False` → 允许落盘（否则同在固定目录里也照样丢）；
       · `storage_path=<固定目录>` → 目录固定（否则每次随机 = 每次都换一份存储）。
     """
-    home = os.environ.get("GV_DESKTOP_HOME") or ""
-    if not home:
-        home = os.path.join(os.environ.get("LOCALAPPDATA")
-                            or os.path.expanduser("~"), "MyGameVault")
-    return os.path.join(home, "webview")
+    return os.path.join(app_home(), "webview")
 
 
 def open_window(url):
@@ -213,6 +347,10 @@ def open_window(url):
     except ImportError:
         print("未装 pywebview —— 降级为系统浏览器打开（功能一样，只是没有独立窗口）。")
         print("想用独立窗口：pip install pywebview")
+        fatal("没有窗口组件",
+              "这台机器上找不到窗口组件（pywebview），已改用系统浏览器打开。\n"
+              "功能完全一样，只是没有独立窗口。\n\n"
+              "如果是分享包：请把压缩包整个重新解压后再试（exe 不能单独拿）。")
         webbrowser.open(url)
         block_forever()
         return
@@ -237,6 +375,10 @@ def open_window(url):
         webview.start(private_mode=False, storage_path=data_dir)
     except Exception as e:
         print("窗口启动失败（%r）—— 降级为系统浏览器打开。" % (e,))
+        fatal("窗口没能打开",
+              "内置窗口启动失败了，已改用系统浏览器打开（功能一样）。\n\n%s\n\n"
+              "常见原因：系统缺 WebView2 运行时（Win11 自带，Win10 装过 Edge 的也有）。\n"
+              "详细日志：%s" % (e, LOG_FILE or log_path()))
         webbrowser.open(url)
         block_forever()
 
@@ -258,12 +400,21 @@ def main(argv=None):
         print("确实需要换：python desktop/main.py --port=<另一个端口>")
         print("（换了以后数据要从头同步一遍；旧的并没有被删，换回端口就还在。）")
         print("=" * 56)
+        # 无控制台出包后，上面这段没人看得见 —— 必须弹到脸上
+        fatal("端口被别的程序占用了",
+              "端口 %d 被别的程序占用了，程序没能启动。\n\n"
+              "这个端口不能随便换：浏览器按「端口」隔离本机数据，\n"
+              "换端口 = 换一份存储 = 之前保存的库 / 状态 / 感想会看不见。\n\n"
+              "请先关掉占用 %d 的程序，再重新打开。\n\n"
+              "%s" % (port, port, e))
         return 3
 
     print("=" * 56)
     print("MyGameVaultList · 桌面版（离线）")
     print("本机地址：%s" % url)
     print("监听范围：仅本机回环（127.0.0.1）—— 局域网内别的机器连不上")
+    if LOG_FILE:
+        print("日志文件：%s" % LOG_FILE)
     if attached:
         print("已在运行：端口上已有本程序的一个实例，直接连上它（共用同一份本机数据）")
     print("=" * 56)
